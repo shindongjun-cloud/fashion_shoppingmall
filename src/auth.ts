@@ -12,6 +12,7 @@ import { PrismaAdapter } from "@auth/prisma-adapter";
 import { prisma } from "@/lib/prisma";
 import { ensureCustomerForUser, isRejoinBlocked, recordLogin } from "@/lib/customer";
 import { maskIp } from "@/lib/crypto";
+import { withLoginPolicy } from "@/lib/auth-session";
 
 // 로그인 요청의 IP(마스킹)·브라우저 정보. 읽을 수 없는 환경이면 비움
 async function requestInfo() {
@@ -26,10 +27,12 @@ async function requestInfo() {
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   // 로그인 계정, 로그인 상태를 우리 데이터베이스(User, Account, Session 표)에 저장합니다.
-  adapter: PrismaAdapter(prisma),
+  // "로그인 상태 유지"를 체크하지 않으면 브라우저 종료·12시간 후 로그아웃 (lib/auth-session.ts)
+  adapter: withLoginPolicy(PrismaAdapter(prisma)),
   // GitHub 로그인. 키는 .env의 AUTH_GITHUB_ID, AUTH_GITHUB_SECRET에서 자동으로 읽습니다.
   providers: [GitHub],
   pages: {
+    signIn: "/login", // 로그인 상태 유지 체크박스가 있는 우리 로그인 화면
     error: "/login-blocked", // 로그인이 거부되면 이유를 보여 주는 페이지
   },
   callbacks: {

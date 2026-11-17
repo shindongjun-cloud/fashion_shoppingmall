@@ -23,6 +23,7 @@ export const VA_RESERVATION_GRACE_MS = 60 * 60 * 1000; // 가상계좌 재고 �
 export const STALE_IN_PROGRESS_MS = 2 * 60 * 1000; // 승인 중 상태가 이보다 오래되면 정기 작업이 확인
 export const CONFIRM_WINDOW_MS = 10 * 60 * 1000; // 토스 승인 가능 시간 (결제 인증 후 10분)
 export const STALE_CANCEL_MS = 60 * 1000;
+export const RECHECK_MIN_INTERVAL_MS = 5 * 1000; // 확인 중 화면에서 같은 결제를 토스에 다시 묻는 최소 간격
 export const WEBHOOK_MAX_ATTEMPTS = 5;
 export const API_LOG_RETENTION_DAYS = 365;
 const DAY = 24 * 60 * 60 * 1000;
@@ -112,6 +113,7 @@ export async function applyTossPayment(tx: Tx, paymentId: number, tp: TossPaymen
     vat: tp.vat ?? p.vat,
     taxFreeAmount: tp.taxFreeAmount ?? p.taxFreeAmount,
     isPartialCancelable: tp.isPartialCancelable ?? p.isPartialCancelable,
+    transferBankCode: tp.transfer?.bankCode ?? p.transferBankCode,
     receiptUrl: tp.receipt?.url && tp.receipt.url.startsWith("https://") ? tp.receipt.url : p.receiptUrl,
     lastTransactionKey: tp.lastTransactionKey ?? p.lastTransactionKey,
     requestedAt: parseTossDate(tp.requestedAt) ?? p.requestedAt,
@@ -454,6 +456,8 @@ export async function confirmOrderPayment(input: ConfirmInput, deps: PaymentDeps
   const same = await prisma.payment.findUnique({ where: { paymentKey } });
   if (same) {
     if (same.orderId !== order.id) return { kind: "FAILED", code: "INVALID_REQUEST" };
+    // 다른 요청(탭·연타)이 지금 승인 중이면 잠깐 기다렸다가 그 결과를 보여 줌 (바로 "확인 중" 화면으로 보내지 않음)
+    if (same.status === "IN_PROGRESS") return waitForOther(order.id, deps);
     return outcomeFromState(order.id);
   }
   if (order.status !== "PENDING") return outcomeFromState(order.id);
@@ -543,8 +547,20 @@ async function syncAndSettle(paymentId: number, tp: TossPayment, source: Payment
 
 /**
  * 토스에 결제 상태를 물어서 확정 (응답을 못 받았거나 "이미 처리됨"일 때)
- * 토스에서 아직 승인 전(IN_PROGRESS)이고 10분 안이면 같은 멱등키로 승인을 다시 요청 (두 번 승인되지 않음)
+ * 토스에서 아직 승인 전(IN_PROGRESS)이고 10분 안이면 승인을 다시 요청 (멱등키는 confirmKeyFor 참고)
  */
+/**
+ * 승인 재요청에 쓸 멱등키.
+ *  - 응답을 못 받은 경우(시간 초과·연결 실패): 같은 키 → 토스가 이미 처리했다면 그 결과를 그대로 받음
+ *  - 토스가 5xx 오류로 "응답한" 경우: 토스는 오류 응답도 멱등키에 저장해 같은 키로는 계속 같은 오류만 돌려줌
+ *    (실제 토스 테스트 서버에서 확인) → 새 키(기본키-r1, -r2 …). 직전에 토스 조회로 "승인 전"임을 확인했고,
+ *    한 결제 키는 토스에서 한 번만 승인되므로 새 키로 다시 요청해도 두 번 승인되지 않음
+ */
+async function confirmKeyFor(payment: Payment) {
+  const answered5xx = await prisma.paymentApiLog.count({ where: { paymentId: payment.id, operation: "CONFIRM", httpStatus: { gte: 500 } } });
+  return answered5xx === 0 ? payment.confirmIdempotencyKey! : `${payment.confirmIdempotencyKey}-r${answered5xx}`;
+}
+
 async function recheckWithToss(paymentId: number, source: PaymentStatusSource, deps: PaymentDeps, allowRetryConfirm: boolean): Promise<ConfirmOutcome> {
   const now = deps.now();
   const payment = await prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
@@ -556,7 +572,7 @@ async function recheckWithToss(paymentId: number, source: PaymentStatusSource, d
       await withBusyRetry(() =>
         prisma.payment.updateMany({ where: { id: paymentId, status: "UNKNOWN" }, data: { status: "IN_PROGRESS", statusSource: source, statusChangedAt: now } }),
       );
-      const retried = await deps.toss.confirm({ paymentKey: payment.paymentKey!, orderId: payment.pgOrderId, amount: payment.amount }, payment.confirmIdempotencyKey!, { paymentId, orderId: payment.orderId });
+      const retried = await deps.toss.confirm({ paymentKey: payment.paymentKey!, orderId: payment.pgOrderId, amount: payment.amount }, await confirmKeyFor(payment), { paymentId, orderId: payment.orderId });
       return handleConfirmResult(paymentId, retried, source, deps, false);
     }
     if (tp.status === "IN_PROGRESS" || tp.status === "READY") {
@@ -671,11 +687,16 @@ export async function recordCheckoutFailure(
 }
 
 /** 결제를 진행하지 않기로 한 주문 정리 (가격 변경으로 중단, 결제창 띄우기 실패) */
-export async function abandonOrder(customerId: number, paymentOrderId: string, reason: "PRICE_CHANGED" | "PAYMENT_FAILED", now = new Date()) {
+export async function abandonOrder(customerId: number, paymentOrderId: string, reason: "PRICE_CHANGED" | "PAYMENT_FAILED", now = new Date(), windowCode?: string) {
   const order = await prisma.order.findUnique({ where: { paymentOrderId } });
   if (!order || order.customerId !== customerId || order.status !== "PENDING") return false;
   const live = await prisma.payment.count({ where: { orderId: order.id, status: { in: ["IN_PROGRESS", "UNKNOWN", "WAITING_FOR_DEPOSIT", "DONE", "PARTIAL_CANCELED"] } } });
   if (live > 0) return false;
+  // 결제창을 닫음(PC 팝업은 failUrl 대신 브라우저에서 오류로 끝남) → failUrl 경우와 똑같이 시도를 기록 (이탈 통계·CS 확인용)
+  if (reason === "PAYMENT_FAILED") {
+    const code = windowCode && FAIL_CODE.test(windowCode) ? windowCode : "PAY_PROCESS_ABORTED";
+    await recordAbortedAttempt(order, { paymentKey: null, failCode: code, failMessage: "결제창에서 결제를 마치지 않음", source: "WINDOW" }, now);
+  }
   await closeOrderIfNoLivePayment(order.id, "CANCELED", reason, now);
   return true;
 }
@@ -743,6 +764,12 @@ export async function requestPaymentCancel(paymentId: number, req: CancelRequest
 }
 
 /** 취소 요청을 토스에 보냄 (처음·재시도 공통. 같은 멱등키라 두 번 취소되지 않음) */
+/** 취소 멱등키: 토스가 5xx로 응답한 적이 있으면(그 오류가 키에 저장됨) 새 키. 재시도 전에 반드시 토스 조회로 미처리 확인 (retryOpenCancels) */
+async function cancelKeyFor(baseKey: string) {
+  const answered5xx = await prisma.paymentApiLog.count({ where: { operation: "CANCEL", httpStatus: { gte: 500 }, idempotencyKey: { startsWith: baseKey } } });
+  return answered5xx === 0 ? baseKey : `${baseKey}-r${answered5xx}`;
+}
+
 async function sendCancel(cancelId: number, deps: PaymentDeps): Promise<CancelOutcome> {
   const now = deps.now();
   const c = await prisma.paymentCancel.findUniqueOrThrow({ where: { id: cancelId }, include: { payment: true, refundAccount: true } });
@@ -762,7 +789,7 @@ async function sendCancel(cancelId: number, deps: PaymentDeps): Promise<CancelOu
         ? { refundReceiveAccount: { bank: ra.bankCode, accountNumber: decrypt(ra.accountNumberEnc), holderName: decrypt(ra.holderNameEnc) } }
         : {}),
     },
-    c.idempotencyKey,
+    await cancelKeyFor(c.idempotencyKey),
     { paymentId: payment.id, orderId: payment.orderId },
   );
 
@@ -1010,7 +1037,12 @@ export async function retryOpenCancels(deps: PaymentDeps = defaultPaymentDeps) {
   let n = 0;
   for (const c of open) {
     try {
-      await sendCancel(c.id, deps);
+      // ① 먼저 토스 조회: 이미 취소가 처리됐으면 그 취소로 완료 처리 (다시 요청하면 두 번 환불될 수 있음)
+      const synced = await syncFromToss(c.paymentId, "RECONCILE", deps);
+      if (!synced) continue; // 조회 실패 → 처리 여부를 모르므로 이번에는 다시 요청하지 않음 (다음 실행 때)
+      const fresh = await prisma.paymentCancel.findUniqueOrThrow({ where: { id: c.id } });
+      // ② 토스에 없을 때만 다시 요청 (응답이 없었으면 같은 키, 5xx 응답이 있었으면 새 키)
+      if (fresh.status === "REQUESTED" || fresh.status === "UNKNOWN") await sendCancel(c.id, deps);
       n++;
     } catch (e) {
       console.error(`[취소 재시도 실패] cancel ${c.id}`, e);
@@ -1042,7 +1074,10 @@ export async function refreshOrderPayment(customerId: number, orderId: number, d
   if (!order || order.customerId !== customerId) return { kind: "FAILED", code: "ORDER_NOT_FOUND" };
   const open = await prisma.payment.findFirst({ where: { orderId, status: { in: ["IN_PROGRESS", "UNKNOWN"] } }, orderBy: { attemptNo: "desc" } });
   // 방금 시작한 승인(IN_PROGRESS)은 처리 중인 요청이 있으므로 건드리지 않음
-  if (open && (open.status === "UNKNOWN" || deps.now().getTime() - open.statusChangedAt.getTime() > STALE_IN_PROGRESS_MS)) {
+  // 같은 결제를 5초 안에 다시 토스에 묻지 않음 (확인 중 화면이 3초마다 부르므로, 토스 연속 조회 제한 방지)
+  const lastCall = open ? await prisma.paymentApiLog.findFirst({ where: { paymentId: open.id }, orderBy: { id: "desc" }, select: { createdAt: true } }) : null;
+  const recentlyAsked = lastCall !== null && deps.now().getTime() - lastCall.createdAt.getTime() < RECHECK_MIN_INTERVAL_MS;
+  if (open && !recentlyAsked && (open.status === "UNKNOWN" || deps.now().getTime() - open.statusChangedAt.getTime() > STALE_IN_PROGRESS_MS)) {
     return recheckWithToss(open.id, "RECONCILE", deps, true);
   }
   return outcomeFromState(orderId);

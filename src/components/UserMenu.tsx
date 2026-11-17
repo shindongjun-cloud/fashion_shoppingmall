@@ -1,6 +1,8 @@
 import Image from "next/image";
 import Link from "next/link";
-import { auth, signIn, signOut } from "@/auth";
+import { cookies } from "next/headers";
+import { auth, signOut } from "@/auth";
+import { BROWSER_COOKIE } from "@/lib/auth-session";
 
 // 헤더 오른쪽: 로그인했으면 프로필 + 로그아웃, 아니면 로그인 버튼
 // 서버 컴포넌트라서 auth()로 로그인 정보를 바로 읽을 수 있습니다.
@@ -9,17 +11,10 @@ export default async function UserMenu() {
 
   if (!session?.user) {
     return (
-      // form의 action에 함수를 넣으면 "서버 액션"이 됩니다. 버튼을 누르면 서버에서 실행돼요.
-      <form
-        action={async () => {
-          "use server";
-          await signIn("github");
-        }}
-      >
-        <button className="rounded-lg bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700">
-          GitHub로 로그인
-        </button>
-      </form>
+      // 로그인 화면(로그인 상태 유지 체크박스)으로 이동
+      <Link href="/login" className="rounded-lg bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700">
+        로그인
+      </Link>
     );
   }
 
@@ -46,6 +41,7 @@ export default async function UserMenu() {
       <form
         action={async () => {
           "use server";
+          (await cookies()).delete(BROWSER_COOKIE); // 브라우저 세션 쿠키도 정리
           await signOut({ redirectTo: "/" });
         }}
       >

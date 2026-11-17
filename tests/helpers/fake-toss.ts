@@ -19,6 +19,8 @@ export class FakeToss {
   faults: Fault[] = [];
   calls: { op: Op; path: string; headers: Record<string, string>; body?: unknown }[] = [];
   applied = { confirm: 0, cancel: 0 };
+  /** 승인 응답을 늦춤 (실제 토스 승인은 0.5~1초 걸림 → 그 사이 두 번째 요청이 오는 상황 재현) */
+  confirmDelayMs = 0;
   private seq = 0;
   /** 인스턴스마다 다른 접두어: 실제 토스 키처럼 테스트 사이에서도 겹치지 않게 */
   private readonly prefix = Math.random().toString(36).slice(2, 8);
@@ -31,7 +33,7 @@ export class FakeToss {
   }
 
   /** 구매자가 결제창에서 인증까지 마친 상태 (successUrl로 오기 직전) */
-  authorize(o: { paymentKey?: string; orderId: string; amount: number; method?: "카드" | "가상계좌" | "간편결제"; dueDate?: Date; refundAccount?: boolean }) {
+  authorize(o: { paymentKey?: string; orderId: string; amount: number; method?: "카드" | "가상계좌" | "간편결제" | "계좌이체"; dueDate?: Date; refundAccount?: boolean }) {
     const paymentKey = o.paymentKey ?? `tpk_${++this.seq}_${Math.random().toString(36).slice(2, 10)}`;
     this.payments.set(paymentKey, {
       paymentKey,
@@ -114,6 +116,10 @@ export class FakeToss {
         p.approvedAt = kst(now);
         p.card = { issuerCode: "41", acquirerCode: "41", number: "43301234****123*", installmentPlanMonths: 0, isInterestFree: false, approveNo: "00000000", cardType: "신용", ownerType: "개인", acquireStatus: "READY", amount: p.totalAmount };
         if (p.method === "간편결제") p.easyPay = { provider: "토스페이", amount: 0, discountAmount: 0 };
+        if (p.method === "계좌이체") {
+          p.card = null;
+          p.transfer = { bankCode: "92", settlementStatus: "INCOMPLETED" }; // 실제 토스 테스트(퀵계좌이체) 응답과 같은 모양
+        }
       }
       p.lastTransactionKey = this.id("tx");
       p.receipt = { url: `https://dashboard.tosspayments.com/receipt/${p.paymentKey}` };
@@ -142,13 +148,19 @@ export class FakeToss {
   transport: Transport = async ({ method, path, headers, body }) => {
     const op: Op = method === "GET" ? "get" : path.endsWith("/confirm") ? "confirm" : "cancel";
     this.calls.push({ op, path, headers, body });
+    if (op === "confirm" && this.confirmDelayMs) await new Promise((res) => setTimeout(res, this.confirmDelayMs));
     const fault = this.faults.findIndex((f) => f.op === op);
     const f = fault >= 0 ? this.faults.splice(fault, 1)[0] : null;
     if (f?.type === "timeout-before") throw new TransportTimeoutError("가짜 시간 초과 (도착 전)");
-    if (f?.type === "error") return { status: f.status, body: { code: f.code, message: f.message ?? f.code } };
     // 멱등키: 같은 키면 처음 응답 그대로 (처리 안 함)
     const key = headers["Idempotency-Key"];
     const idemKey = key ? `${path}|${key}` : null;
+    if (f?.type === "error") {
+      // 실제 토스처럼 오류 응답도 멱등키에 저장됨 → 같은 키로 다시 보내면 같은 오류 (E2E에서 확인한 동작)
+      const res = { status: f.status, body: { code: f.code, message: f.message ?? f.code } };
+      if (idemKey && !this.idem.has(idemKey)) this.idem.set(idemKey, res);
+      return JSON.parse(JSON.stringify(this.idem.get(idemKey ?? "") ?? res));
+    }
     let res: TransportResponse;
     if (idemKey && this.idem.has(idemKey)) res = this.idem.get(idemKey)!;
     else {

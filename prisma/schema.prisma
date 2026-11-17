@@ -1253,6 +1253,7 @@ model Payment {
   taxFreeAmount         Int                 @default(0) // 면세 금액
   currency              String              @default("KRW")
   isPartialCancelable   Boolean? // 부분 취소 가능 여부 (토스가 알려 줌)
+  transferBankCode      String? // 계좌이체(퀵계좌이체 포함)로 결제한 은행 코드 (영수증·주문 내역 표시용)
   confirmIdempotencyKey String?             @unique // 승인 요청 멱등키: 다시 요청해도 두 번 승인되지 않음 (15일 유효)
   secretHash            String? // 웹훅 검증용 secret의 HMAC (원문은 저장하지 않음)
   receiptUrl            String? // 영수증 주소
@@ -1541,6 +1542,12 @@ model Session {
   expires      DateTime
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
+
+  // "로그인 상태 유지"를 체크하지 않은 로그인 (lib/auth-session.ts)
+  //  - absoluteExpiresAt: 이 시각(로그인 + 12시간)이 지나면 사용 중이어도 무조건 만료. 비어 있으면 상태 유지(30일, 사용할 때마다 연장)
+  //  - browserKeyHash   : 브라우저를 닫으면 사라지는 쿠키 값의 해시. 쿠키가 없거나 다르면 로그아웃으로 처리
+  absoluteExpiresAt DateTime?
+  browserKeyHash    String?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }

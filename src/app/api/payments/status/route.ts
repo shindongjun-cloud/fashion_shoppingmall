@@ -3,13 +3,14 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getCurrentCustomer } from "@/lib/current-customer";
 import { refreshOrderPayment } from "@/lib/payment";
+import { loginPath } from "@/lib/safe-redirect";
 
 export async function GET(request: NextRequest) {
   const goTo = (path: string) => NextResponse.redirect(new URL(path, request.url));
   const orderId = Number(request.nextUrl.searchParams.get("orderId"));
   const tries = Math.min(100, Math.max(0, Number(request.nextUrl.searchParams.get("try")) || 0));
   const customer = await getCurrentCustomer();
-  if (!customer) return goTo(`/api/auth/signin?callbackUrl=${encodeURIComponent(request.nextUrl.pathname + request.nextUrl.search)}`);
+  if (!customer) return goTo(loginPath(request.nextUrl.pathname + request.nextUrl.search));
   if (!Number.isInteger(orderId) || orderId < 1) return goTo("/checkout/fail?code=ORDER_NOT_FOUND");
 
   const result = await refreshOrderPayment(customer.id, orderId);

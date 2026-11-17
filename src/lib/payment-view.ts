@@ -23,6 +23,7 @@ export function toPaymentView(p: WithDetails): PaymentView {
   }
   if (p.easyPay) detail = detail ? `${p.easyPay.provider} (${detail})` : p.easyPay.provider;
   if (p.virtualAccount) detail = bankName(p.virtualAccount.bankCode);
+  if (p.method === "TRANSFER" && p.transferBankCode) detail = bankName(p.transferBankCode);
   return {
     status: p.status,
     methodLabel: p.method ? (PAYMENT_METHOD_LABEL[p.method] ?? p.method) : "결제",

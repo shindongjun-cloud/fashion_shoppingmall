@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentCustomer } from "@/lib/current-customer";
 import { formatDate } from "@/lib/format";
 import { cancelWithdrawalAction, requestWithdrawalAction } from "../actions";
+import { loginPath } from "@/lib/safe-redirect";
 
 export const dynamic = "force-dynamic";
 
@@ -20,7 +21,7 @@ const REASONS = [
 // 회원 탈퇴: 신청 → 7일 유예(철회 가능) → 개인정보 파기
 export default async function WithdrawPage({ searchParams }: PageProps<"/my/withdraw">) {
   const customer = await getCurrentCustomer();
-  if (!customer) redirect("/api/auth/signin?callbackUrl=/my/withdraw");
+  if (!customer) redirect(loginPath("/my/withdraw"));
   const { ok, error } = await searchParams;
   const open = await prisma.customerWithdrawal.findFirst({ where: { customerId: customer.id, completedAt: null, canceledAt: null } });
 

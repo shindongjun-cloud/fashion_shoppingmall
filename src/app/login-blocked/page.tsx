@@ -1,27 +1,13 @@
 import Link from "next/link";
 import { cookies } from "next/headers";
-import { signIn } from "@/auth";
+import { loginPath, safeReturnPath } from "@/lib/safe-redirect";
 
 // 로그인이 안 됐을 때 보여 주는 페이지
 //  - reason: 우리가 막은 경우 (auth.ts signIn 콜백) → 다시 시도해도 소용없으므로 "다시 로그인" 버튼 없음
 //  - error : Auth.js 자체 오류 (Configuration, AccessDenied 등) → 일시적일 수 있으니 "다시 로그인" 버튼 제공
 //
 // 다시 로그인하면 원래 가려던 페이지(예: /checkout)로 돌아가도록, Auth.js가 남긴 쿠키에서 주소를 읽습니다.
-// 다른 사이트로 보내는 데 악용되지 않게 우리 사이트 안의 경로만 허용합니다.
-function safeReturnPath(raw: string | undefined): string {
-  if (!raw) return "/";
-  try {
-    const url = new URL(raw, "http://local.invalid");
-    const path = url.pathname + url.search;
-    // 외부 주소(//evil.com 등), 로그인 관련 경로(무한 반복 방지)는 홈으로
-    if (raw.startsWith("//") || !path.startsWith("/") || path.startsWith("//")) return "/";
-    if (path.startsWith("/login-blocked") || path.startsWith("/api/auth")) return "/";
-    return path;
-  } catch {
-    return "/";
-  }
-}
-
+// 다른 사이트로 보내는 데 악용되지 않게 우리 사이트 안의 경로만 허용합니다 (lib/safe-redirect.ts).
 export default async function LoginBlockedPage({ searchParams }: PageProps<"/login-blocked">) {
   const { reason, error } = await searchParams;
   const blocked = reason === "suspended" || reason === "rejoin";
@@ -50,16 +36,9 @@ export default async function LoginBlockedPage({ searchParams }: PageProps<"/log
       {errorCode && <p className="mt-2 text-sm text-gray-400">오류 코드: {errorCode}</p>}
       <div className="mt-8 flex justify-center gap-3">
         {!blocked && (
-          <form
-            action={async () => {
-              "use server";
-              await signIn("github", { redirectTo: returnTo });
-            }}
-          >
-            <button className="rounded-lg bg-gray-900 px-6 py-3 font-medium text-white hover:bg-gray-700">
-              다시 로그인
-            </button>
-          </form>
+          <Link href={loginPath(returnTo)} className="rounded-lg bg-gray-900 px-6 py-3 font-medium text-white hover:bg-gray-700">
+            다시 로그인
+          </Link>
         )}
         <Link
           href="/"

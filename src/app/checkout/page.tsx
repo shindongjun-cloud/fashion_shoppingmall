@@ -6,6 +6,7 @@ import { getCurrentCustomer } from "@/lib/current-customer";
 import { listAddresses } from "@/lib/customer";
 import CheckoutView from "@/components/CheckoutView";
 import { getTossConfigProblem } from "@/lib/toss";
+import { loginPath } from "@/lib/safe-redirect";
 
 export const dynamic = "force-dynamic";
 
@@ -14,7 +15,7 @@ export default async function CheckoutPage() {
   const session = await auth();
   const customer = await getCurrentCustomer();
   if (!session?.user || !customer) {
-    redirect("/api/auth/signin?callbackUrl=/checkout");
+    redirect(loginPath("/checkout"));
   }
 
   // 정상(ACTIVE) 고객만 주문 가능 (DB 트리거 Order_customer_active도 막음)
@@ -73,6 +74,7 @@ export default async function CheckoutPage() {
         customerKey={customer.customerNo} // 토스가 구매자를 구분하는 값 (로그인 계정이 아닌 고객번호: 탈퇴 후에도 바뀌지 않음)
         customerName={session.user.name ?? undefined}
         customerEmail={session.user.email ?? undefined}
+        hasAddress={Boolean(shipTo)}
       />
     </>
   );

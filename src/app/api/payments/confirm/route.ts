@@ -5,6 +5,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { getCurrentCustomer } from "@/lib/current-customer";
 import { confirmOrderPayment } from "@/lib/payment";
 import { getTossConfigProblem } from "@/lib/toss";
+import { loginPath } from "@/lib/safe-redirect";
 
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
@@ -21,7 +22,7 @@ export async function GET(request: NextRequest) {
   if (!customer) {
     // 결제 도중 로그인이 만료됨 → 로그인한 뒤 이 주소로 돌아와서 승인을 이어서 진행 (토스 승인은 결제 후 10분 안에만 가능)
     const back = request.nextUrl.pathname + request.nextUrl.search;
-    return goTo(`/api/auth/signin?callbackUrl=${encodeURIComponent(back)}`);
+    return goTo(loginPath(back));
   }
 
   const result = await confirmOrderPayment({

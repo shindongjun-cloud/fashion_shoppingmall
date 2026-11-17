@@ -60,6 +60,7 @@ export type TossPayment = {
     amount: number;
   } | null;
   easyPay?: { provider: string; amount: number; discountAmount: number } | null;
+  transfer?: { bankCode: string; settlementStatus?: string } | null;
   virtualAccount?: {
     accountType?: string;
     accountNumber: string;
@@ -187,6 +188,10 @@ export function createTossApi(options: { transport?: Transport; secretKey?: () =
   const secretKey = options.secretKey ?? (() => process.env.TOSS_SECRET_KEY ?? "");
   const timeoutMs = options.timeoutMs ?? TOSS_TIMEOUT_MS;
   const shouldLog = options.log ?? true;
+  const testCodeFor = (op: PaymentApiOperation) => {
+    const value = process.env[op === "CONFIRM" ? "TOSS_TEST_CODE_CONFIRM" : op === "CANCEL" ? "TOSS_TEST_CODE_CANCEL" : "TOSS_TEST_CODE_GET"];
+    return value && /^[A-Z0-9_]{1,64}$/.test(value) ? value : null;
+  };
 
   async function call(
     operation: PaymentApiOperation,
@@ -203,6 +208,10 @@ export function createTossApi(options: { transport?: Transport; secretKey?: () =
       "Content-Type": "application/json",
     };
     if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+    // 테스트 전용: 토스가 지정한 오류를 일부러 돌려주게 함 (카드 거절 등 실패 화면 확인용).
+    // 테스트 키(test_)일 때만 붙이고, 토스도 라이브 환경에서는 이 헤더를 무시함. 예) TOSS_TEST_CODE_CONFIRM=INVALID_REJECT_CARD
+    const testCode = testCodeFor(operation);
+    if (testCode && secretKey().startsWith("test_")) headers["TossPayments-Test-Code"] = testCode;
 
     const started = Date.now();
     let result: TossResult;

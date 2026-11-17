@@ -6,6 +6,7 @@ import { getPaidAmountLast12Months, getProfileView, listAddresses } from "@/lib/
 import { formatDate, formatPrice } from "@/lib/format";
 import { FIT_SCALE } from "@/lib/product-labels";
 import { addAddressAction, deleteAddressAction, saveBodyAction, saveProfileAction, setDefaultAddressAction } from "./actions";
+import { loginPath } from "@/lib/safe-redirect";
 
 export const dynamic = "force-dynamic";
 
@@ -28,7 +29,7 @@ const button = "rounded-lg bg-gray-900 px-4 py-2 text-sm font-medium text-white 
 // 내 정보: 프로필(마스킹 표시) · 체형 · 배송지 · 등급 · 탈퇴
 export default async function MyPage({ searchParams }: PageProps<"/my">) {
   const customer = await getCurrentCustomer();
-  if (!customer) redirect("/api/auth/signin?callbackUrl=/my");
+  if (!customer) redirect(loginPath("/my"));
   const { ok, error } = await searchParams;
 
   const [profile, addresses, body, grade, nextGrade, yearAmount] = await Promise.all([

@@ -9,6 +9,7 @@ import { ensureCustomerForUser, getPaidAmountLast12Months, requestWithdrawal, Cu
 import { getAvailability, recordMovement } from "../src/lib/inventory";
 import { decrypt } from "../src/lib/crypto";
 import {
+  abandonOrder,
   cancelWaitingDepositOrder,
   closeStalePendingOrders,
   confirmOrderPayment,
@@ -17,6 +18,7 @@ import {
   parseTossDate,
   PaymentError,
   reconcileOpenPayments,
+  refreshOrderPayment,
   recordCheckoutFailure,
   receiveWebhook,
   requestPaymentCancel,
@@ -27,6 +29,7 @@ import {
 } from "../src/lib/payment";
 import { createTossApi, getTossConfigProblem, maskForLog } from "../src/lib/toss";
 import { FakeToss } from "./helpers/fake-toss";
+import { toPaymentView } from "../src/lib/payment-view";
 
 class Rollback extends Error {}
 const MIN = 60_000;
@@ -92,7 +95,7 @@ function makeDeps(fake: FakeToss, over: Partial<PaymentDeps> = {}): PaymentDeps 
   return { ...defaultPaymentDeps, toss: createTossApi({ transport: fake.transport, secretKey: () => "test_gsk_fake" }), waitForOtherMs: 3000, ...over };
 }
 /** 고객 + 결제 대기 주문 (실제 placeOrder) + 토스 결제창 인증까지 */
-async function checkout(fake: FakeToss, opts: { qty?: number; method?: "카드" | "가상계좌" | "간편결제"; dueDate?: Date; refundAccount?: boolean; customerId?: number } = {}) {
+async function checkout(fake: FakeToss, opts: { qty?: number; method?: "카드" | "가상계좌" | "간편결제" | "계좌이체"; dueDate?: Date; refundAccount?: boolean; customerId?: number } = {}) {
   await setAvailable(Math.max(5, (opts.qty ?? 1) + 2));
   const customerId = opts.customerId ?? (await newCustomer());
   const placed = await placeOrder(customerId, [{ skuId, quantity: opts.qty ?? 1 }]);
@@ -159,6 +162,15 @@ describe("카드·간편결제 승인", () => {
     assert.ok(await prisma.paymentCard.findUnique({ where: { paymentId: p.id } }));
   });
 
+  test("[E2E에서 발견] 계좌이체(퀵계좌이체): 결제 은행 코드 저장 → 화면에 은행 이름 표시", async () => {
+    const fake = new FakeToss();
+    const { order, input } = await checkout(fake, { method: "계좌이체" });
+    assert.equal((await confirmOrderPayment(input, makeDeps(fake))).kind, "PAID");
+    const p = await prisma.payment.findFirstOrThrow({ where: { orderId: order.id }, include: { card: true, easyPay: true, virtualAccount: true } });
+    assert.deepEqual([p.method, p.transferBankCode], ["TRANSFER", "92"]);
+    assert.equal(toPaymentView(p).detail, "토스뱅크");
+  });
+
   test("새로고침·뒤로 가기(같은 결제 키로 다시 옴): 토스를 다시 부르지 않고 완료 화면", async () => {
     const fake = new FakeToss();
     const { order, input } = await checkout(fake);
@@ -179,6 +191,19 @@ describe("카드·간편결제 승인", () => {
     assert.equal(fake.applied.confirm, 1);
     assert.equal((await paymentsOf(order.id)).length, 1);
     assert.equal((await orderOf(order.id)).status, "PAID");
+  });
+
+  test("[E2E에서 발견] 첫 요청이 토스 승인 중일 때 두 번째 요청이 오면 기다렸다가 완료 화면 (확인 중 화면으로 보내지 않음)", async () => {
+    const fake = new FakeToss();
+    fake.confirmDelayMs = 600;
+    const { order, input } = await checkout(fake);
+    const deps = makeDeps(fake);
+    const first = confirmOrderPayment(input, deps);
+    await new Promise((r) => setTimeout(r, 250)); // 첫 요청이 결제 행(IN_PROGRESS)을 만든 뒤
+    const second = await confirmOrderPayment(input, deps);
+    assert.deepEqual(second, { kind: "PAID", orderId: order.id });
+    assert.deepEqual(await first, { kind: "PAID", orderId: order.id });
+    assert.equal(fake.count("confirm"), 1);
   });
 
   test("금액 위조: 토스를 부르지 않음, 실패 기록(AMOUNT_MISMATCH), 주문 취소, 재고 해제", async () => {
@@ -283,6 +308,55 @@ describe("응답을 못 받았을 때 (실패로 단정하지 않음)", () => {
     // 500이 왔지만 실제로는 처리되지 않음 → 조회 결과 승인 전 → 재승인
     assert.equal((await confirmOrderPayment(input, makeDeps(fake))).kind, "PAID");
     assert.equal(fake.applied.confirm, 1);
+    // [E2E에서 발견] 토스는 500 응답도 멱등키에 저장 → 같은 키로는 계속 500. 재승인은 새 키(-r1)여야 성공
+    const keys = fake.calls.filter((c) => c.op === "confirm").map((c) => c.headers["Idempotency-Key"]);
+    assert.equal(keys.length, 2);
+    assert.equal(keys[1], `${keys[0]}-r1`);
+  });
+
+  test("[E2E에서 발견] 토스 오류 응답이 멱등키에 저장돼도: 확인 중 화면의 재확인으로 결국 완료 (5초 안 반복 조회는 생략)", async () => {
+    const fake = new FakeToss();
+    // 첫 승인 500, 바로 다시 한 번(새 키)도 500 → 결과 확인 중
+    fake.faults.push({ op: "confirm", type: "error", status: 500, code: "FAILED_PAYMENT_INTERNAL_SYSTEM_PROCESSING" });
+    fake.faults.push({ op: "confirm", type: "error", status: 500, code: "FAILED_PAYMENT_INTERNAL_SYSTEM_PROCESSING" });
+    const { order, input, customerId } = await checkout(fake);
+    assert.equal((await confirmOrderPayment(input, makeDeps(fake))).kind, "PROCESSING");
+    const callsBefore = fake.calls.length;
+    // 곧바로 다시 확인 → 5초가 안 지나 토스를 부르지 않음
+    assert.equal((await refreshOrderPayment(customerId, order.id, makeDeps(fake))).kind, "PROCESSING");
+    assert.equal(fake.calls.length, callsBefore, "5초 안에는 토스에 다시 묻지 않음");
+    // 6초 뒤 → 조회(승인 전) → 새 키(-r2)로 재승인 → 완료
+    const later = new Date(Date.now() + 6000);
+    assert.deepEqual(await refreshOrderPayment(customerId, order.id, makeDeps(fake, { now: () => later })), { kind: "PAID", orderId: order.id });
+    const keys = fake.calls.filter((c) => c.op === "confirm").map((c) => c.headers["Idempotency-Key"]);
+    assert.deepEqual(keys.map((k) => k.replace(keys[0], "K")), ["K", "K-r1", "K-r2"]);
+    assert.equal(fake.applied.confirm, 1);
+  });
+
+  test("[E2E에서 발견] 취소가 5xx로 응답됨 → 재시도 전 토스 조회. 이미 취소됐으면 다시 보내지 않음(두 번 환불 방지), 아니면 새 키로", async () => {
+    const fake = new FakeToss();
+    const { order, input } = await checkout(fake);
+    await confirmOrderPayment(input, makeDeps(fake));
+    const [p] = await paymentsOf(order.id);
+    fake.faults.push({ op: "cancel", type: "error", status: 500, code: "FAILED_INTERNAL_SYSTEM_PROCESSING" });
+    const r = await requestPaymentCancel(p.id, { amount: 1000, reasonCode: "ADMIN", reasonText: "부분 환불", requestedBy: "ADMIN" }, makeDeps(fake));
+    assert.equal(r.status, "UNKNOWN");
+    // (가) 토스에는 취소가 없음 → 새 키로 재요청 → 완료
+    await retryOpenCancels(makeDeps(fake, { now: () => new Date(Date.now() + 2 * MIN) }));
+    assert.equal((await prisma.paymentCancel.findUniqueOrThrow({ where: { id: r.cancelId! } })).status, "DONE");
+    const cancelKeys = fake.calls.filter((c) => c.op === "cancel").map((c) => c.headers["Idempotency-Key"]);
+    assert.equal(cancelKeys[1], `${cancelKeys[0]}-r1`);
+    assert.equal(fake.applied.cancel, 1);
+    // (나) 5xx였지만 실제로는 토스에서 취소가 처리된 경우 → 조회로 확인하고 다시 보내지 않음
+    fake.faults.push({ op: "cancel", type: "timeout-after" });
+    const r2 = await requestPaymentCancel(p.id, { amount: 2000, reasonCode: "ADMIN", reasonText: "부분 환불 2", requestedBy: "ADMIN" }, makeDeps(fake));
+    assert.equal(r2.status, "UNKNOWN");
+    const cancelCalls = fake.count("cancel");
+    await retryOpenCancels(makeDeps(fake, { now: () => new Date(Date.now() + 2 * MIN) }));
+    assert.equal(fake.count("cancel"), cancelCalls, "이미 처리된 취소는 다시 요청하지 않음");
+    assert.equal(fake.applied.cancel, 2);
+    assert.equal((await prisma.paymentCancel.findUniqueOrThrow({ where: { id: r2.cancelId! } })).status, "DONE");
+    assert.equal((await prisma.payment.findUniqueOrThrow({ where: { id: p.id } })).canceledAmount, 3000);
   });
 
   test("응답도 끊기고 조회도 실패 → '결제 확인 중' + 재고 유지 → 정기 작업(대사)이 확정", async () => {
@@ -372,7 +446,7 @@ describe("승인 후 주문 처리 실패 → 결제 취소(보상)", () => {
     assert.equal((await orderOf(order.id)).status, "CANCELED");
   });
 
-  test("보상 취소 응답이 끊김 → 취소 UNKNOWN → 정기 작업이 같은 멱등키로 재요청 → 한 번만 취소", async () => {
+  test("보상 취소 응답이 끊김(토스는 처리함) → 취소 UNKNOWN → 정기 작업이 토스 조회로 확인하고 다시 보내지 않음 → 한 번만 취소", async () => {
     const fake = new FakeToss();
     fake.faults.push({ op: "cancel", type: "timeout-after" });
     const { order, input } = await checkout(fake);
@@ -383,9 +457,23 @@ describe("승인 후 주문 처리 실패 → 결제 취소(보상)", () => {
     assert.equal((await orderOf(order.id)).status, "CANCEL_FAILED");
     assert.equal(await retryOpenCancels(makeDeps(fake, { now: () => new Date(Date.now() + 2 * MIN) })), 1);
     assert.equal(fake.applied.cancel, 1, "토스 취소는 정확히 1번");
-    const cancels = fake.calls.filter((x) => x.op === "cancel");
-    assert.equal(cancels[0].headers["Idempotency-Key"], cancels[1].headers["Idempotency-Key"]);
+    assert.equal(fake.count("cancel"), 1, "이미 처리된 취소는 다시 요청하지 않음");
     assert.equal((await prisma.paymentCancel.findUniqueOrThrow({ where: { id: c.id } })).status, "DONE");
+    assert.equal((await prisma.payment.findUniqueOrThrow({ where: { id: p.id } })).status, "CANCELED");
+    assert.equal((await orderOf(order.id)).status, "CANCELED");
+  });
+
+  test("보상 취소 응답이 끊김(토스에 도착 못 함) → 조회해 보니 취소 없음 → 같은 멱등키로 재요청 → 한 번만 취소", async () => {
+    const fake = new FakeToss();
+    fake.faults.push({ op: "cancel", type: "timeout-before" });
+    const { order, input } = await checkout(fake);
+    await confirmOrderPayment(input, makeDeps(fake, { finalizeOrder: failingFinalize }));
+    const [p] = await paymentsOf(order.id);
+    await retryOpenCancels(makeDeps(fake, { now: () => new Date(Date.now() + 2 * MIN) }));
+    const cancels = fake.calls.filter((x) => x.op === "cancel");
+    assert.equal(cancels.length, 2);
+    assert.equal(cancels[0].headers["Idempotency-Key"], cancels[1].headers["Idempotency-Key"], "응답이 없었으면 같은 키");
+    assert.equal(fake.applied.cancel, 1);
     assert.equal((await prisma.payment.findUniqueOrThrow({ where: { id: p.id } })).status, "CANCELED");
     assert.equal((await orderOf(order.id)).status, "CANCELED");
   });
@@ -627,6 +715,19 @@ describe("결제창 실패·이탈, 방치 주문", () => {
     assert.deepEqual([p.status, p.statusSource, p.failCode, p.paymentKey], ["ABORTED", "WINDOW", "PAY_PROCESS_CANCELED", null]);
     assert.equal((await orderOf(order.id)).status, "CANCELED");
     assert.equal((await reservationsOf(order.id))[0].status, "RELEASED");
+  });
+
+  test("[E2E에서 발견] PC 결제창을 닫음(브라우저에서 USER_CANCEL) → failUrl 경우와 같이 시도 기록 + 재고 해제 + 주문 취소", async () => {
+    const fake = new FakeToss();
+    const { order, customerId } = await checkout(fake);
+    assert.equal(await abandonOrder(customerId, order.paymentOrderId, "PAYMENT_FAILED", new Date(), "USER_CANCEL"), true);
+    const [p] = await paymentsOf(order.id);
+    assert.deepEqual([p.status, p.statusSource, p.failCode], ["ABORTED", "WINDOW", "USER_CANCEL"]);
+    assert.equal((await orderOf(order.id)).status, "CANCELED");
+    // 가격 변경으로 멈춘 경우는 결제창을 띄우지 않았으므로 시도 기록 없음
+    const again = await checkout(fake, { customerId });
+    assert.equal(await abandonOrder(customerId, again.order.paymentOrderId, "PRICE_CHANGED"), true);
+    assert.equal((await paymentsOf(again.order.id)).length, 0);
   });
 
   test("결제창 실패 코드가 이상하면 기본 코드로 (주소창 값 검증)", async () => {

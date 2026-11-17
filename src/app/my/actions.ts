@@ -6,6 +6,7 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import type { CustomerGender, Fit, WithdrawalReason } from "@/generated/prisma/client";
 import { getCurrentCustomer } from "@/lib/current-customer";
+import { loginPath } from "@/lib/safe-redirect";
 import {
   addAddress,
   cancelWithdrawal,
@@ -36,7 +37,7 @@ const optionalInt = (form: FormData, key: string) => {
 /** 로그인 고객으로 작업을 실행하고, 결과 문구와 함께 돌아갑니다 */
 async function run(back: string, okMessage: string, work: (customerId: number) => Promise<unknown>) {
   const customer = await getCurrentCustomer();
-  if (!customer) redirect(`/api/auth/signin?callbackUrl=${encodeURIComponent(back)}`);
+  if (!customer) redirect(loginPath(back));
   let target = `${back}?ok=${encodeURIComponent(okMessage)}`;
   try {
     await work(customer.id);

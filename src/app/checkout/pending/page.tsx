@@ -3,6 +3,7 @@ import { notFound, redirect } from "next/navigation";
 import { getCurrentCustomer } from "@/lib/current-customer";
 import { prisma } from "@/lib/prisma";
 import AutoRefresh from "@/components/AutoRefresh";
+import { loginPath } from "@/lib/safe-redirect";
 
 export const dynamic = "force-dynamic";
 
@@ -14,7 +15,7 @@ const MAX_TRIES = 20;
 export default async function PendingPage({ searchParams }: PageProps<"/checkout/pending">) {
   const { orderId, try: tryParam } = await searchParams;
   const customer = await getCurrentCustomer();
-  if (!customer) redirect("/api/auth/signin?callbackUrl=/orders");
+  if (!customer) redirect(loginPath("/orders"));
   const id = Number(orderId);
   if (!Number.isInteger(id)) notFound();
   const order = await prisma.order.findFirst({ where: { id, customerId: customer.id } });

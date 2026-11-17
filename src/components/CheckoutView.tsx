@@ -20,6 +20,8 @@ type Props = {
   customerKey: string;
   customerName?: string;
   customerEmail?: string;
+  /** 기본 배송지가 있는지 (없으면 결제 버튼을 막음) */
+  hasAddress: boolean;
 };
 
 export default function CheckoutView({
@@ -27,6 +29,7 @@ export default function CheckoutView({
   customerKey,
   customerName,
   customerEmail,
+  hasAddress,
 }: Props) {
   const { items } = useCart();
   const [widgets, setWidgets] = useState<TossPaymentsWidgets | null>(null);
@@ -102,10 +105,10 @@ export default function CheckoutView({
         failUrl: `${window.location.origin}/api/payments/fail`,
       });
     } catch (e) {
-      // 결제창을 닫았거나 약관 미동의 등 → 재고 예약을 바로 풂
-      await cancelPendingOrder(order.paymentOrderId, "PAYMENT_FAILED");
+      // 결제창을 닫았거나 약관 미동의 등 → 시도 기록 + 재고 예약을 바로 풂
       // SDK 오류 코드가 있으면 우리 문구로, 없으면 SDK 메시지 (예: 약관에 동의해 주세요)
       const code = (e as { code?: string }).code;
+      await cancelPendingOrder(order.paymentOrderId, "PAYMENT_FAILED", code);
       setError(
         code === "USER_CANCEL"
           ? "결제를 취소했어요. 다시 결제하려면 버튼을 눌러 주세요."
@@ -173,10 +176,10 @@ export default function CheckoutView({
 
       <button
         onClick={handlePay}
-        disabled={!widgets || paying}
+        disabled={!widgets || paying || !hasAddress}
         className="mt-6 w-full rounded-lg bg-blue-600 py-4 text-lg font-bold text-white hover:bg-blue-700 disabled:opacity-50"
       >
-        {paying ? "결제 진행 중..." : `${formatPrice(total)} 결제하기`}
+        {!hasAddress ? "배송지를 먼저 등록해 주세요" : paying ? "결제 진행 중..." : `${formatPrice(total)} 결제하기`}
       </button>
     </main>
   );

@@ -8,6 +8,7 @@ import { DEPOSIT_CANCEL_NOTICE, ORDER_STATUS_LABEL } from "@/lib/payment-labels"
 import { mainPayment, paymentInclude, toPaymentView } from "@/lib/payment-view";
 import PaymentSummary from "@/components/PaymentSummary";
 import { cancelDepositOrder } from "./actions";
+import { loginPath } from "@/lib/safe-redirect";
 
 export const dynamic = "force-dynamic";
 
@@ -21,7 +22,7 @@ export default async function OrdersPage({ searchParams }: PageProps<"/orders">)
   // 로그인 안 했으면 로그인 페이지로 보내고, 로그인 후 이 페이지로 돌아옵니다.
   const customer = await getCurrentCustomer();
   if (!customer) {
-    redirect("/api/auth/signin?callbackUrl=/orders");
+    redirect(loginPath("/orders"));
   }
 
   const orders = await prisma.order.findMany({

@@ -49,12 +49,12 @@ export default async function CompletePage({ searchParams }: PageProps<"/checkou
             <span>
               {item.styleName} ({item.colorName} / {item.sizeName}) × {item.quantity}
               {item.discountAmount > 0 && (
-                <span className="ml-2 text-xs text-red-600">
+                <span className="ml-2 whitespace-nowrap text-xs text-red-600">
                   {item.promotionName} −{formatPrice(item.discountAmount * item.quantity)}
                 </span>
               )}
             </span>
-            <span>{formatPrice(item.price * item.quantity)}</span>
+            <span className="shrink-0 whitespace-nowrap pl-3">{formatPrice(item.price * item.quantity)}</span>
           </li>
         ))}
         <li className="mt-2 flex justify-between border-t border-gray-200 pt-2 font-bold text-gray-900">
