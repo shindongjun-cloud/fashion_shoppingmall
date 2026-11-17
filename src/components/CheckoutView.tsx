@@ -8,21 +8,21 @@ import {
 } from "@tosspayments/tosspayments-sdk";
 import { useCart } from "@/context/CartContext";
 import { createOrder } from "@/app/checkout/actions";
-import type { Product } from "@/generated/prisma/client";
+import type { CartSku } from "@/lib/catalog";
 import { formatPrice } from "@/lib/format";
 
 // NEXT_PUBLIC_ 으로 시작하는 환경변수만 브라우저 코드에서 읽을 수 있어요. (클라이언트 키는 공개돼도 괜찮음)
 const clientKey = process.env.NEXT_PUBLIC_TOSS_CLIENT_KEY ?? "";
 
 type Props = {
-  products: Product[];
+  skus: CartSku[];
   customerKey: string;
   customerName?: string;
   customerEmail?: string;
 };
 
 export default function CheckoutView({
-  products,
+  skus,
   customerKey,
   customerName,
   customerEmail,
@@ -34,12 +34,12 @@ export default function CheckoutView({
   const startedRef = useRef(false);
 
   const lines = items.flatMap((item) => {
-    const product = products.find((p) => p.id === item.productId);
-    return product ? [{ ...item, product }] : [];
+    const sku = skus.find((s) => s.id === item.skuId);
+    return sku ? [{ ...item, sku }] : [];
   });
   // 화면 표시용 금액. 실제 결제 금액은 서버(createOrder)가 다시 계산합니다.
   const total = lines.reduce(
-    (sum, line) => sum + line.product.price * line.quantity,
+    (sum, line) => sum + line.sku.price * line.quantity,
     0,
   );
 
@@ -117,14 +117,18 @@ export default function CheckoutView({
 
       {/* 주문 상품 요약 */}
       <ul className="mt-6 divide-y divide-gray-200 rounded-xl border border-gray-200 bg-white">
-        {lines.map(({ product, quantity }) => (
-          <li key={product.id} className="flex items-center gap-3 p-4">
-            <span className="text-2xl">{product.emoji}</span>
+        {lines.map(({ sku, quantity }) => (
+          <li key={sku.id} className="flex items-center gap-3 p-4">
+            <span
+              className="h-4 w-4 shrink-0 rounded-full border border-gray-300"
+              style={{ backgroundColor: sku.colorHex }}
+            />
             <span className="flex-1 text-gray-900">
-              {product.name} × {quantity}
+              {sku.styleName}
+              <span className="text-sm text-gray-500"> ({sku.colorName} / {sku.sizeName})</span> × {quantity}
             </span>
             <span className="font-medium text-gray-900">
-              {formatPrice(product.price * quantity)}
+              {formatPrice(sku.price * quantity)}
             </span>
           </li>
         ))}

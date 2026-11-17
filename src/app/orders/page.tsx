@@ -18,7 +18,7 @@ export default async function OrdersPage() {
   // "내" 주문만 가져옵니다. (where: userId)
   const orders = await prisma.order.findMany({
     where: { userId },
-    include: { items: { include: { product: true } } },
+    include: { items: true }, // 상품 정보는 주문 항목의 스냅샷 컬럼에 있어서 상품 테이블을 조인하지 않습니다
     orderBy: { createdAt: "desc" },
   });
 
@@ -57,7 +57,7 @@ export default async function OrdersPage() {
               <ul className="mt-2 text-gray-800">
                 {order.items.map((item) => (
                   <li key={item.id}>
-                    {item.product.emoji} {item.product.name} × {item.quantity}
+                    {item.styleName} ({item.colorName} / {item.sizeName}) × {item.quantity}
                   </li>
                 ))}
               </ul>

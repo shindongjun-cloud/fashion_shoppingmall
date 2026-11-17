@@ -22,7 +22,7 @@ export default async function CompletePage({
   // 내 주문이고, 결제 완료된 주문만 보여줍니다.
   const order = await prisma.order.findFirst({
     where: { id, userId, status: "PAID" },
-    include: { items: { include: { product: true } } },
+    include: { items: true }, // 상품 정보는 주문 항목의 스냅샷 컬럼에 있어서 상품 테이블을 조인하지 않습니다
   });
   if (!order) {
     notFound();
@@ -41,7 +41,7 @@ export default async function CompletePage({
         {order.items.map((item) => (
           <li key={item.id} className="flex justify-between py-1 text-gray-800">
             <span>
-              {item.product.emoji} {item.product.name} × {item.quantity}
+              {item.styleName} ({item.colorName} / {item.sizeName}) × {item.quantity}
             </span>
             <span>{formatPrice(item.price * item.quantity)}</span>
           </li>

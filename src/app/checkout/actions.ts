@@ -6,6 +6,8 @@
 import { randomUUID } from "crypto";
 import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
+import { getCartSkus } from "@/lib/catalog";
+import { findQtyLimitViolation } from "@/lib/cart-rules";
 import type { CartItem } from "@/context/CartContext";
 
 type CreateOrderResult =
@@ -26,35 +28,51 @@ export async function createOrder(items: CartItem[]): Promise<CreateOrderResult>
     items.length <= 50 &&
     items.every(
       (item) =>
-        Number.isInteger(item.productId) &&
+        Number.isInteger(item.skuId) &&
         Number.isInteger(item.quantity) &&
         item.quantity >= 1 &&
         item.quantity <= 99,
     );
-  const productIds = valid ? items.map((item) => item.productId) : [];
-  if (!valid || new Set(productIds).size !== productIds.length) {
+  const skuIds = valid ? items.map((item) => item.skuId) : [];
+  if (!valid || new Set(skuIds).size !== skuIds.length) {
     return { error: "장바구니 정보가 올바르지 않아요." };
   }
 
-  const products = await prisma.product.findMany({
-    where: { id: { in: productIds } },
-  });
-  if (products.length !== productIds.length) {
+  const skus = await getCartSkus(skuIds);
+  if (skus.length !== skuIds.length) {
     return { error: "판매하지 않는 상품이 장바구니에 있어요." };
+  }
+
+  const orderItems = items.map((item) => ({
+    sku: skus.find((s) => s.id === item.skuId)!,
+    quantity: item.quantity,
+  }));
+
+  // 판매 상태와 재고 확인
+  // (재고를 실제로 줄이고 동시 주문을 막는 일은 3번 재고 단계에서 "재고 예약"으로 만듭니다)
+  for (const { sku, quantity } of orderItems) {
+    if (!sku.sellable) {
+      return { error: `${sku.styleName} (${sku.colorName}/${sku.sizeName})은 판매가 중지됐어요.` };
+    }
+    if (sku.stock < quantity) {
+      return { error: `${sku.styleName} (${sku.colorName}/${sku.sizeName}) 재고가 부족해요.` };
+    }
+  }
+
+  // 1회 주문 수량 제한 (한정 상품)
+  const overLimit = findQtyLimitViolation(orderItems);
+  if (overLimit) {
+    return { error: `${overLimit.styleName}은 1회 주문 시 ${overLimit.maxQtyPerOrder}개까지 살 수 있어요.` };
   }
 
   // ⚠️ 금액은 반드시 서버에서, DB에 있는 가격으로 계산합니다.
   //    (브라우저가 보낸 금액을 믿으면 100원짜리로 바꿔서 결제하는 조작이 가능해요)
-  const orderItems = items.map((item) => {
-    const product = products.find((p) => p.id === item.productId)!;
-    return { product, quantity: item.quantity };
-  });
   const amount = orderItems.reduce(
-    (sum, { product, quantity }) => sum + product.price * quantity,
+    (sum, { sku, quantity }) => sum + sku.price * quantity,
     0,
   );
 
-  const firstName = orderItems[0].product.name;
+  const firstName = orderItems[0].sku.styleName;
   const orderName =
     orderItems.length > 1
       ? `${firstName} 외 ${orderItems.length - 1}건`
@@ -70,10 +88,17 @@ export async function createOrder(items: CartItem[]): Promise<CreateOrderResult>
       totalPrice: amount,
       userId,
       items: {
-        create: orderItems.map(({ product, quantity }) => ({
-          productId: product.id,
+        // 주문 당시의 이름·컬러·사이즈·가격을 복사해 둡니다 (스냅샷)
+        create: orderItems.map(({ sku, quantity }) => ({
+          skuId: sku.id,
           quantity,
-          price: product.price, // 주문 당시 가격을 기록
+          price: sku.price,
+          styleCode: sku.styleCode,
+          skuCode: sku.skuCode,
+          styleName: sku.styleName,
+          colorName: sku.colorName,
+          sizeName: sku.sizeName,
+          imageUrl: sku.imageUrl,
         })),
       },
     },

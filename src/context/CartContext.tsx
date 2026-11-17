@@ -6,16 +6,16 @@
 import { createContext, useContext, useSyncExternalStore } from "react";
 
 export type CartItem = {
-  productId: number;
+  skuId: number;
   quantity: number;
 };
 
 type CartContextValue = {
   items: CartItem[];
   totalQuantity: number;
-  addItem: (productId: number, quantity?: number) => void;
-  updateQuantity: (productId: number, quantity: number) => void;
-  removeItem: (productId: number) => void;
+  addItem: (skuId: number, quantity?: number) => void;
+  updateQuantity: (skuId: number, quantity: number) => void;
+  removeItem: (skuId: number) => void;
   clearCart: () => void;
 };
 
@@ -23,8 +23,8 @@ type CartContextValue = {
 // 1) localStorage에 장바구니를 저장하고 읽는 "저장소"
 //    React 바깥의 데이터(localStorage)는 useSyncExternalStore로 읽는 것이 정석입니다.
 // ---------------------------------------------------------------
-// 3단계에서 상품 id가 숫자로 바뀌어서 저장 이름도 바꿨습니다 (예전 장바구니는 무시)
-const STORAGE_KEY = "my-shop-cart-v2";
+// 상품 구조가 SKU(컬러+사이즈) 단위로 바뀌어서 저장 이름도 바꿨습니다 (예전 장바구니는 무시)
+const STORAGE_KEY = "my-shop-cart-v3";
 const EMPTY: CartItem[] = [];
 
 const listeners = new Set<() => void>();
@@ -65,34 +65,34 @@ function subscribe(listener: () => void) {
 // 2) 장바구니를 바꾸는 함수들
 //    컴포넌트 바깥에 두어서 화면이 다시 그려져도 같은 함수가 유지됩니다.
 // ---------------------------------------------------------------
-function addItem(productId: number, quantity = 1) {
+function addItem(skuId: number, quantity = 1) {
   const current = readCart();
-  const existing = current.find((item) => item.productId === productId);
+  const existing = current.find((item) => item.skuId === skuId);
   if (existing) {
-    // 이미 담긴 상품이면 수량만 늘립니다
+    // 이미 담긴 SKU(같은 컬러·사이즈)면 수량만 늘립니다
     writeCart(
       current.map((item) =>
-        item.productId === productId
+        item.skuId === skuId
           ? { ...item, quantity: item.quantity + quantity }
           : item,
       ),
     );
   } else {
-    writeCart([...current, { productId, quantity }]);
+    writeCart([...current, { skuId, quantity }]);
   }
 }
 
-function updateQuantity(productId: number, quantity: number) {
+function updateQuantity(skuId: number, quantity: number) {
   if (quantity < 1) return; // 1개 미만으로는 줄이지 않음 (삭제는 removeItem)
   writeCart(
     readCart().map((item) =>
-      item.productId === productId ? { ...item, quantity } : item,
+      item.skuId === skuId ? { ...item, quantity } : item,
     ),
   );
 }
 
-function removeItem(productId: number) {
-  writeCart(readCart().filter((item) => item.productId !== productId));
+function removeItem(skuId: number) {
+  writeCart(readCart().filter((item) => item.skuId !== skuId));
 }
 
 function clearCart() {
