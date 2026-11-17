@@ -369,6 +369,15 @@ export async function requestWithdrawal(
   }
   if ((input.reasonText ?? "").length > 500) throw new CustomerError("사유는 500자 이내로 입력해 주세요.");
   // 결제가 끝나지 않은 주문이 있으면 탈퇴 불가 (배송 중 주문 확인은 ⑨ 배송 단계에서 추가)
+  // 입금 대기(가상계좌), 결제 결과 확인 중, 환불 확인 중인 주문이 있으면 정리된 뒤에 탈퇴 (돈이 걸려 있음)
+  const openMoney = await prisma.order.findFirst({
+    where: {
+      customerId,
+      OR: [{ status: { in: ["WAITING_DEPOSIT", "CANCEL_FAILED"] } }, { payments: { some: { status: { in: ["IN_PROGRESS", "UNKNOWN"] } } } }],
+    },
+  });
+  if (openMoney) throw new CustomerError("입금 대기·결제 확인 중·환불 확인 중인 주문이 있어요. 처리가 끝난 뒤 탈퇴해 주세요.");
+  // (더 구체적인 안내를 먼저: 입금 대기 주문도 재고를 잡고 있어서 아래 검사에 함께 걸림)
   const pending = await prisma.inventoryReservation.findFirst({ where: { order: { customerId }, status: "RESERVED" } });
   if (pending) throw new CustomerError("결제 대기 중인 주문이 있어요. 주문을 마치거나 취소한 뒤 탈퇴해 주세요.");
 
@@ -496,26 +505,37 @@ export async function markDormantCustomers(now = new Date()) {
 // 등급 재산정 (최근 12개월 결제 완료 금액)
 // ---------------------------------------------------------------
 /** 최근 12개월 결제 완료 금액 (등급 산정과 같은 기준) */
-export async function getPaidAmountLast12Months(customerId: number, now = new Date()) {
-  const result = await prisma.order.aggregate({
-    where: { customerId, status: "PAID", createdAt: { gte: new Date(now.getTime() - 365 * DAY), lt: now } },
-    _sum: { totalPrice: true },
+/** 순결제 금액 = 결제 금액 − 취소 금액. 결제 완료 시각(paidAt) 기준 기간 */
+async function netPaidByCustomer(db: Db, from: Date, to: Date, customerId?: number) {
+  const rows = await db.payment.groupBy({
+    by: ["orderId"],
+    where: {
+      status: { in: ["DONE", "PARTIAL_CANCELED"] },
+      order: { status: "PAID", paidAt: { gte: from, lt: to }, ...(customerId ? { customerId } : {}) },
+    },
+    _sum: { amount: true, canceledAmount: true },
   });
-  return result._sum.totalPrice ?? 0;
+  const orders = await db.order.findMany({ where: { id: { in: rows.map((r) => r.orderId) } }, select: { id: true, customerId: true } });
+  const result = new Map<number, number>();
+  for (const r of rows) {
+    const cid = orders.find((o) => o.id === r.orderId)!.customerId;
+    result.set(cid, (result.get(cid) ?? 0) + (r._sum.amount ?? 0) - (r._sum.canceledAmount ?? 0));
+  }
+  return result;
+}
+
+export async function getPaidAmountLast12Months(customerId: number, now = new Date()) {
+  return (await netPaidByCustomer(prisma, new Date(now.getTime() - 365 * DAY), now, customerId)).get(customerId) ?? 0;
 }
 
 export async function recalculateGrades(now = new Date(), db: Db = prisma) {
   const from = new Date(now.getTime() - 365 * DAY);
   const grades = await db.customerGrade.findMany({ where: { isActive: true }, orderBy: { minAmount: "desc" } });
   const customers = await db.customer.findMany({ where: { status: { not: "WITHDRAWN" } }, select: { id: true, gradeId: true } });
-  const sums = await db.order.groupBy({
-    by: ["customerId"],
-    where: { status: "PAID", createdAt: { gte: from, lt: now } },
-    _sum: { totalPrice: true },
-  });
+  const sums = await netPaidByCustomer(db, from, now); // 부분 취소한 금액은 빼고 계산
   let changed = 0;
   for (const c of customers) {
-    const amount = sums.find((s) => s.customerId === c.id)?._sum.totalPrice ?? 0;
+    const amount = sums.get(c.id) ?? 0;
     const target = grades.find((g) => g.minAmount <= amount);
     if (!target || target.id === c.gradeId) continue;
     // 이력을 먼저 남겨야 등급을 바꿀 수 있음 (트리거 Customer_grade_guard)

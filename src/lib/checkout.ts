@@ -1,12 +1,11 @@
-// 주문 생성 → 결제 승인 흐름 (서버 전용)
-// 서버 액션(app/checkout/actions.ts)과 결제 승인 라우트(app/api/payments/confirm)가 이 파일을 씁니다.
+// 주문 생성 (서버 전용). 결제 승인 이후는 lib/payment.ts
+// 서버 액션(app/checkout/actions.ts)이 이 파일을 씁니다.
 // 로그인 확인(auth)은 호출하는 쪽에서 하고, 여기서는 customerId(쇼핑몰 고객)를 받습니다. → 테스트에서 직접 호출할 수 있음
 import { randomUUID } from "crypto";
 import { prisma } from "@/lib/prisma";
 import { getCartSkus } from "@/lib/catalog";
 import { findQtyLimitViolation } from "@/lib/cart-rules";
-import { confirmOrder, ensureOrderReserved, InsufficientStockError, isBusyError, isConstraintError, releaseOrder, reserveOrder, withBusyRetry } from "@/lib/inventory";
-import { cancelPayment, confirmPayment } from "@/lib/toss";
+import { InsufficientStockError, isBusyError, isConstraintError, releaseOrder, reserveOrder, withBusyRetry } from "@/lib/inventory";
 
 export type PlaceOrderResult =
   | { paymentOrderId: string; orderName: string; amount: number }
@@ -57,10 +56,17 @@ export async function placeOrder(customerId: number, items: CartLine[], now = ne
   try {
     // 동시에 들어온 다른 주문과 DB 잠금이 충돌하면 다시 시도 (다시 하면 상대 예약을 보고 정상 처리 or 재고 부족)
     await withBusyRetry(() => prisma.$transaction(async (tx) => {
-      // 같은 고객의 이전 "결제 대기" 주문이 잡고 있던 재고는 풉니다.
+      // 같은 고객의 이전 "결제 대기" 주문은 재고를 풀고 취소합니다.
       // (결제하기를 여러 번 누르거나 결제창을 닫고 다시 시도하면 주문이 여러 개 생겨 재고를 계속 묶기 때문)
-      const previous = await tx.order.findMany({ where: { customerId, status: "PENDING" }, select: { id: true } });
-      for (const p of previous) await releaseOrder(tx, p.id, "SUPERSEDED", now);
+      // ⚠️ 다른 탭에서 결제 승인이 진행 중이거나 결과 확인 중인 주문은 건드리지 않음 (승인되면 재고가 필요)
+      const previous = await tx.order.findMany({
+        where: { customerId, status: "PENDING", payments: { none: { status: { in: ["IN_PROGRESS", "UNKNOWN"] } } } },
+        select: { id: true },
+      });
+      for (const p of previous) {
+        await releaseOrder(tx, p.id, "SUPERSEDED", now);
+        await tx.order.update({ where: { id: p.id }, data: { status: "CANCELED", canceledAt: now } });
+      }
 
       const order = await tx.order.create({
         data: {
@@ -107,87 +113,5 @@ export async function placeOrder(customerId: number, items: CartLine[], now = ne
   return { paymentOrderId, orderName, amount };
 }
 
-// ---------------------------------------------------------------
-// 2) 결제를 진행하지 않기로 한 주문의 재고 풀기 (가격 변경으로 중단, 결제창 실패)
-// ---------------------------------------------------------------
-export async function abandonOrder(customerId: number, paymentOrderId: string, reason: "PRICE_CHANGED" | "PAYMENT_FAILED") {
-  const order = await prisma.order.findUnique({ where: { paymentOrderId } });
-  if (!order || order.customerId !== customerId || order.status !== "PENDING") return false;
-  await releaseOrder(prisma, order.id, reason);
-  return true;
-}
-
-// ---------------------------------------------------------------
-// 3) 결제 승인
-//    ① 예약 확인(필요하면 다시 잡기) → ② 토스 승인 → ③ 주문 PAID + 예약 확정
-//    ③에서 실패하면 돈만 나가고 주문이 없는 상태가 되므로 토스 결제를 취소합니다(보상 처리).
-// ---------------------------------------------------------------
-export type PaymentDeps = {
-  confirmPayment: typeof confirmPayment;
-  cancelPayment: typeof cancelPayment;
-  /** ③ 단계. 테스트에서 실패를 흉내 낼 수 있도록 바꿔 끼울 수 있게 했습니다. */
-  finalize: (orderId: number, paymentKey: string, now: Date) => Promise<void>;
-  now: () => Date;
-};
-
-async function defaultFinalize(orderId: number, paymentKey: string, now: Date) {
-  // 잠금 충돌로 실패하면 결제가 취소(보상)되어 버리므로, 여기서는 꼭 다시 시도합니다.
-  await withBusyRetry(() =>
-    prisma.$transaction(async (tx) => {
-      await confirmOrder(tx, orderId, now); // 예약 확정 → 트리거가 판매 원장 생성, 실재고 감소
-      const order = await tx.order.update({ where: { id: orderId }, data: { status: "PAID", paymentKey } });
-      await tx.customer.update({ where: { id: order.customerId }, data: { lastOrderAt: now } }); // 휴면·등급 산정 참고
-    }),
-  );
-}
-
-export const defaultPaymentDeps: PaymentDeps = { confirmPayment, cancelPayment, finalize: defaultFinalize, now: () => new Date() };
-
-export type ConfirmResult = { ok: true; orderId: number } | { ok: false; message: string };
-
-export async function confirmOrderPayment(
-  input: { customerId: number; paymentOrderId: string; paymentKey: string; amount: number },
-  deps: PaymentDeps = defaultPaymentDeps,
-): Promise<ConfirmResult> {
-  const order = await prisma.order.findUnique({ where: { paymentOrderId: input.paymentOrderId } });
-  if (!order || order.customerId !== input.customerId) return { ok: false, message: "주문을 찾을 수 없어요." };
-  // 새로고침 등으로 다시 들어온 경우: 이미 완료된 주문 (토스에 다시 승인 요청하지 않음)
-  if (order.status === "PAID") return { ok: true, orderId: order.id };
-  if (order.status !== "PENDING") return { ok: false, message: "이미 취소된 주문이에요." };
-  // ⚠️ 결제된 금액이 서버가 계산한 주문 금액과 같은지 확인 (조작 방지)
-  if (input.amount !== order.totalPrice) return { ok: false, message: "결제 금액이 주문 금액과 달라요." };
-
-  // ① 승인 전에 재고 확인: 재고가 없으면 토스에 승인을 요청하지 않음 → 고객 돈이 나가지 않음
-  const reserved = await ensureOrderReserved(order.id, deps.now());
-  if (!reserved.ok) return { ok: false, message: reserved.message };
-
-  // ② 토스 결제 승인
-  const result = await deps.confirmPayment({ paymentKey: input.paymentKey, orderId: input.paymentOrderId, amount: order.totalPrice });
-  if (!result.ok) {
-    await releaseOrder(prisma, order.id, "PAYMENT_FAILED", deps.now());
-    return { ok: false, message: result.message };
-  }
-
-  // ③ 주문 완료 + 재고 확정
-  try {
-    await deps.finalize(order.id, input.paymentKey, deps.now());
-    return { ok: true, orderId: order.id };
-  } catch (error) {
-    // 돈은 나갔는데 주문을 완료하지 못함 → 결제 취소(보상)
-    console.error(`[결제 보상] 주문 ${order.id} 완료 처리 실패 → 결제 취소 시도`, error);
-    const cancel = await deps.cancelPayment({ paymentKey: input.paymentKey, cancelReason: "주문 처리 오류로 자동 취소" });
-    await releaseOrder(prisma, order.id, "COMPENSATED", deps.now());
-    await prisma.order.update({
-      where: { id: order.id },
-      // 취소에도 실패하면 사람이 확인해야 하므로 상태를 따로 남깁니다.
-      data: { status: cancel.ok ? "CANCELED" : "CANCEL_FAILED", paymentKey: input.paymentKey },
-    });
-    if (!cancel.ok) console.error(`[결제 보상 실패] 주문 ${order.id} 결제 취소 실패 — 수동 환불 필요`, cancel);
-    return {
-      ok: false,
-      message: cancel.ok
-        ? "주문을 완료하지 못해 결제를 자동으로 취소했어요. 다시 시도해 주세요."
-        : "주문 처리 중 문제가 생겼어요. 고객센터에서 확인 후 환불해 드릴게요.",
-    };
-  }
-}
+// 결제 승인·실패·취소는 lib/payment.ts (주문 생성 이후의 돈 흐름)
+export { abandonOrder, confirmOrderPayment, defaultPaymentDeps, type ConfirmOutcome, type PaymentDeps } from "@/lib/payment";

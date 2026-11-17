@@ -18,6 +18,8 @@ import {
   reserveOrder,
 } from "../src/lib/inventory";
 import { abandonOrder, confirmOrderPayment, defaultPaymentDeps, placeOrder, type PaymentDeps } from "../src/lib/checkout";
+import { createTossApi } from "../src/lib/toss";
+import { FakeToss } from "./helpers/fake-toss";
 import { ensureCustomerForUser } from "../src/lib/customer";
 
 class Rollback extends Error {}
@@ -260,6 +262,7 @@ describe("주문 생성 (placeOrder)", () => {
     const firstOrder = await prisma.order.findUniqueOrThrow({ where: { paymentOrderId: first.paymentOrderId }, include: { reservations: true } });
     assert.equal(firstOrder.reservations[0].status, "RELEASED");
     assert.equal(firstOrder.reservations[0].releaseReason, "SUPERSEDED");
+    assert.equal(firstOrder.status, "CANCELED", "대체된 주문은 취소 (주문 내역에 결제 대기로 남지 않음)");
   });
 
   test("재고가 부족하면 주문 자체가 만들어지지 않음", async () => {
@@ -291,135 +294,62 @@ describe("주문 생성 (placeOrder)", () => {
 });
 
 // ---------------------------------------------------------------
-describe("결제 승인 (confirmOrderPayment) — 토스는 가짜로 대체", () => {
+describe("결제 승인 직전 재고 확인 (confirmOrderPayment) — 토스는 가짜로 대체 (자세한 결제 테스트는 payment.test.ts)", () => {
   const CODE = "KN26F003-IV-M";
-  type Calls = { confirm: number; cancel: number };
 
-  function fakeDeps(over: Partial<PaymentDeps> = {}, calls: Calls = { confirm: 0, cancel: 0 }) {
-    const deps: PaymentDeps = {
-      ...defaultPaymentDeps,
-      confirmPayment: async () => {
-        calls.confirm++;
-        return { ok: true };
-      },
-      cancelPayment: async () => {
-        calls.cancel++;
-        return { ok: true };
-      },
-      ...over,
-    };
-    return { deps, calls };
-  }
-  async function newPendingOrder(qty = 1, now = new Date()) {
+  async function newPendingOrder(fake: FakeToss, qty = 1, now = new Date()) {
     // 같은 고객의 이전 주문 예약이 풀리지 않도록 테스트마다 새 고객 사용
     const owner = await newCustomer("결제테스트");
     const r = await placeOrder(owner, [{ skuId: sku(CODE), quantity: qty }], now);
     assert.ok(!("error" in r), JSON.stringify(r));
     const order = await prisma.order.findUniqueOrThrow({ where: { paymentOrderId: r.paymentOrderId } });
-    return { owner, order, input: { customerId: owner, paymentOrderId: r.paymentOrderId, paymentKey: `pk_${order.id}`, amount: order.totalPrice } };
+    const paymentKey = fake.authorize({ orderId: order.paymentOrderId, amount: order.totalPrice });
+    return { owner, order, input: { customerId: owner, paymentOrderId: r.paymentOrderId, paymentKey, amount: String(order.totalPrice) } };
   }
+  const deps = (fake: FakeToss): PaymentDeps => ({ ...defaultPaymentDeps, toss: createTossApi({ transport: fake.transport, secretKey: () => "test_gsk_fake" }) });
   const reservationsOf = (orderId: number) => prisma.inventoryReservation.findMany({ where: { orderId }, orderBy: { id: "asc" } });
 
   test("성공: 주문 PAID, 예약 확정, 판매 원장 생성, 실재고 감소", async () => {
     await setAvailable(CODE, 3);
-    const { order, input } = await newPendingOrder(1);
+    const fake = new FakeToss();
+    const { order, input } = await newPendingOrder(fake);
     const onHandBefore = (await balance(CODE)).onHand;
-    const { deps, calls } = fakeDeps();
-    const r = await confirmOrderPayment(input, deps);
-    assert.deepEqual(r, { ok: true, orderId: order.id });
-    assert.equal(calls.confirm, 1);
+    const r = await confirmOrderPayment(input, deps(fake));
+    assert.deepEqual(r, { kind: "PAID", orderId: order.id });
     assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).status, "PAID");
     assert.equal((await reservationsOf(order.id))[0].status, "CONFIRMED");
+    assert.equal(await prisma.inventoryLedger.count({ where: { refType: "ORDER", refId: String(order.id), type: "SALE" } }), 1);
     assert.equal((await balance(CODE)).onHand, onHandBefore - 1);
-  });
-
-  test("이미 결제된 주문을 다시 승인하면 토스를 다시 부르지 않음 (새로고침)", async () => {
-    await setAvailable(CODE, 3);
-    const { input } = await newPendingOrder(1);
-    await confirmOrderPayment(input, fakeDeps().deps);
-    const { deps, calls } = fakeDeps();
-    const r = await confirmOrderPayment(input, deps);
-    assert.equal(r.ok, true);
-    assert.equal(calls.confirm, 0);
-  });
-
-  test("금액이 다르면 토스 승인 요청 자체를 하지 않음", async () => {
-    await setAvailable(CODE, 3);
-    const { input } = await newPendingOrder(1);
-    const { deps, calls } = fakeDeps();
-    const r = await confirmOrderPayment({ ...input, amount: 100 }, deps);
-    assert.equal(r.ok, false);
-    assert.equal(calls.confirm, 0);
-  });
-
-  test("토스 승인 실패: 예약 해제(PAYMENT_FAILED), 주문은 결제 대기, 판매 원장 없음", async () => {
-    await setAvailable(CODE, 3);
-    const { order, input } = await newPendingOrder(1);
-    const { deps } = fakeDeps({ confirmPayment: async () => ({ ok: false, code: "REJECT_CARD_COMPANY", message: "카드사 거절" }) });
-    const r = await confirmOrderPayment(input, deps);
-    assert.deepEqual(r, { ok: false, message: "카드사 거절" });
-    const [res] = await reservationsOf(order.id);
-    assert.equal(res.status, "RELEASED");
-    assert.equal(res.releaseReason, "PAYMENT_FAILED");
-    assert.equal(await prisma.inventoryLedger.count({ where: { refType: "ORDER", refId: String(order.id) } }), 0);
-  });
-
-  test("승인 후 저장 실패 → 토스 결제 취소(보상), 주문 CANCELED, 예약 COMPENSATED, 실재고 그대로", async () => {
-    await setAvailable(CODE, 3);
-    const { order, input } = await newPendingOrder(1);
-    const onHandBefore = (await balance(CODE)).onHand;
-    const { deps, calls } = fakeDeps({ finalize: async () => { throw new Error("DB 저장 실패 흉내"); } });
-    const r = await confirmOrderPayment(input, deps);
-    assert.equal(r.ok, false);
-    assert.equal(calls.confirm, 1);
-    assert.equal(calls.cancel, 1, "결제 취소를 반드시 호출");
-    assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).status, "CANCELED");
-    assert.equal((await reservationsOf(order.id))[0].releaseReason, "COMPENSATED");
-    assert.equal((await balance(CODE)).onHand, onHandBefore);
-  });
-
-  test("보상(결제 취소)까지 실패하면 CANCEL_FAILED로 남겨 사람이 확인하게 함", async () => {
-    await setAvailable(CODE, 3);
-    const { order, input } = await newPendingOrder(1);
-    const { deps } = fakeDeps({
-      finalize: async () => { throw new Error("DB 저장 실패 흉내"); },
-      cancelPayment: async () => ({ ok: false, code: "NETWORK", message: "취소 실패 흉내" }),
-    });
-    const r = await confirmOrderPayment(input, deps);
-    assert.equal(r.ok, false);
-    assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).status, "CANCEL_FAILED");
   });
 
   test("예약이 만료됐어도 재고가 있으면 다시 잡고(RENEWED) 결제 성공", async () => {
     await setAvailable(CODE, 3);
-    const { order, input } = await newPendingOrder(1, new Date(Date.now() - 30 * MIN)); // 이미 만료된 예약
-    const { deps, calls } = fakeDeps();
-    const r = await confirmOrderPayment(input, deps);
-    assert.equal(r.ok, true, JSON.stringify(r));
-    assert.equal(calls.confirm, 1);
-    const statuses = (await reservationsOf(order.id)).map((x) => x.status);
-    assert.deepEqual(statuses, ["EXPIRED", "CONFIRMED"]);
+    const fake = new FakeToss();
+    const { order, input } = await newPendingOrder(fake, 1, new Date(Date.now() - 30 * MIN)); // 이미 만료된 예약
+    const r = await confirmOrderPayment(input, deps(fake));
+    assert.equal(r.kind, "PAID", JSON.stringify(r));
+    assert.deepEqual((await reservationsOf(order.id)).map((x) => x.status), ["EXPIRED", "CONFIRMED"]);
   });
 
   test("만료 1분 전 예약은 승인 전에 갱신 (승인 도중 만료 방지)", async () => {
     await setAvailable(CODE, 3);
-    const { order, input } = await newPendingOrder(1, new Date(Date.now() - 19 * MIN)); // 1분 남음
-    const r = await confirmOrderPayment(input, fakeDeps().deps);
-    assert.equal(r.ok, true, JSON.stringify(r));
-    const rs = await reservationsOf(order.id);
-    assert.deepEqual(rs.map((x) => [x.status, x.releaseReason]), [["RELEASED", "RENEWED"], ["CONFIRMED", null]]);
+    const fake = new FakeToss();
+    const { order, input } = await newPendingOrder(fake, 1, new Date(Date.now() - 19 * MIN)); // 1분 남음
+    const r = await confirmOrderPayment(input, deps(fake));
+    assert.equal(r.kind, "PAID", JSON.stringify(r));
+    assert.deepEqual((await reservationsOf(order.id)).map((x) => [x.status, x.releaseReason]), [["RELEASED", "RENEWED"], ["CONFIRMED", null]]);
   });
 
   test("예약이 만료됐고 그 사이 재고가 팔렸으면 토스 승인 없이 실패 (고객 돈이 나가지 않음)", async () => {
     await setAvailable(CODE, 1);
-    const { order, input } = await newPendingOrder(1, new Date(Date.now() - 30 * MIN));
+    const fake = new FakeToss();
+    const { order, input } = await newPendingOrder(fake, 1, new Date(Date.now() - 30 * MIN));
     // 다른 고객이 마지막 1개를 가져감 (만료된 예약을 정리하고 예약)
     const thief = await makeOrder([{ code: CODE, qty: 1 }]);
     await prisma.$transaction((tx) => reserveOrder(tx, thief.id, [{ skuId: sku(CODE), qty: 1 }]));
-    const { deps, calls } = fakeDeps();
-    const r = await confirmOrderPayment(input, deps);
-    assert.equal(r.ok, false);
-    assert.equal(calls.confirm, 0, "토스 승인을 부르면 안 됨");
+    const r = await confirmOrderPayment(input, deps(fake));
+    assert.equal(r.kind === "FAILED" && r.code, "OUT_OF_STOCK");
+    assert.equal(fake.count("confirm"), 0, "토스 승인을 부르면 안 됨");
     assert.ok((await reservationsOf(order.id)).every((x) => x.status !== "RESERVED"));
   });
 });

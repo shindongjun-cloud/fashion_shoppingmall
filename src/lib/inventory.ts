@@ -130,6 +130,8 @@ export async function reserveOrder(
   orderId: number,
   items: { skuId: number; qty: number }[],
   now = new Date(),
+  /** 만료 시각 (기본: 지금 + 20분). 가상계좌는 입금 기한까지 잡아 둡니다 */
+  expiresAt: Date = new Date(now.getTime() + RESERVATION_TTL_MINUTES * 60 * 1000),
 ) {
   const skuIds = items.map((i) => i.skuId);
   await releaseExpired(tx, now, skuIds); // 만료된 예약부터 정리해야 그 수량이 다시 팔 수 있게 됨
@@ -139,8 +141,6 @@ export async function reserveOrder(
     include: { location: { select: { priority: true } } },
     orderBy: [{ location: { priority: "asc" } }, { locationId: "asc" }],
   });
-  const expiresAt = new Date(now.getTime() + RESERVATION_TTL_MINUTES * 60 * 1000);
-
   for (const item of items) {
     const candidates = balances.filter((b) => b.skuId === item.skuId);
     const totalAvailable = candidates.reduce((n, b) => n + Math.max(0, b.onHand - b.reserved - b.safetyStock), 0);
@@ -173,23 +173,41 @@ export async function releaseOrder(db: Db, orderId: number, reason: ReleaseReaso
  * 결제 승인 "직전" 확인: 주문 수량만큼 유효한 예약이 있는지.
  * 만료됐거나 곧 만료되는 예약은 풀고 다시 잡습니다. 재고가 없으면 승인하면 안 됨 → { ok: false }
  */
+/**
+ * (트랜잭션 안에서) 주문 수량만큼 유효한 예약이 있게 맞춥니다. 재고가 없으면 InsufficientStockError.
+ *  - minRemainingMs: 남은 시간이 이보다 짧으면 새로 잡음 (토스 승인처럼 시간이 걸리는 작업 전)
+ *  - expiresAt: 새로 잡을 때의 만료 시각. 지정하면 기존 예약의 만료 시각이 이와 다를 때도 새로 잡음 (가상계좌 연장)
+ */
+export async function ensureReservedTx(
+  tx: Prisma.TransactionClient,
+  orderId: number,
+  now = new Date(),
+  options: { minRemainingMs?: number; expiresAt?: Date } = {},
+) {
+  const minRemaining = options.minRemainingMs ?? 0;
+  const items = await tx.orderItem.findMany({ where: { orderId }, select: { skuId: true, quantity: true } });
+  await releaseExpired(tx, now, items.map((i) => i.skuId));
+  const active = await tx.inventoryReservation.findMany({ where: { orderId, status: "RESERVED" } });
+
+  const ok = items.every((item) => {
+    const r = active.find((a) => a.skuId === item.skuId);
+    return (
+      r &&
+      r.qty === item.quantity &&
+      r.expiresAt.getTime() - now.getTime() > minRemaining &&
+      (!options.expiresAt || r.expiresAt.getTime() === options.expiresAt.getTime())
+    );
+  });
+  if (ok && active.length === items.length) return;
+
+  // 하나라도 문제가 있으면 남은 예약을 모두 풀고 처음부터 다시 잡습니다 (부분 갱신보다 단순하고 안전)
+  await releaseOrder(tx, orderId, "RENEWED", now);
+  await reserveOrder(tx, orderId, items.map((i) => ({ skuId: i.skuId, qty: i.quantity })), now, options.expiresAt);
+}
+
 export async function ensureOrderReserved(orderId: number, now = new Date()): Promise<{ ok: true } | { ok: false; message: string }> {
   try {
-    await withBusyRetry(() => prisma.$transaction(async (tx) => {
-      const items = await tx.orderItem.findMany({ where: { orderId }, select: { skuId: true, quantity: true, styleName: true } });
-      await releaseExpired(tx, now, items.map((i) => i.skuId));
-      const active = await tx.inventoryReservation.findMany({ where: { orderId, status: "RESERVED" } });
-
-      const ok = items.every((item) => {
-        const r = active.find((a) => a.skuId === item.skuId);
-        return r && r.qty === item.quantity && r.expiresAt.getTime() - now.getTime() >= RENEW_IF_LESS_THAN_MS;
-      });
-      if (ok) return;
-
-      // 하나라도 문제가 있으면 남은 예약을 모두 풀고 처음부터 다시 잡습니다 (부분 갱신보다 단순하고 안전)
-      await releaseOrder(tx, orderId, "RENEWED", now);
-      await reserveOrder(tx, orderId, items.map((i) => ({ skuId: i.skuId, qty: i.quantity })), now);
-    }));
+    await withBusyRetry(() => prisma.$transaction((tx) => ensureReservedTx(tx, orderId, now, { minRemainingMs: RENEW_IF_LESS_THAN_MS - 1 })));
     return { ok: true };
   } catch (e) {
     if (e instanceof InsufficientStockError) {

@@ -10,6 +10,7 @@ import { useCart } from "@/context/CartContext";
 import { cancelPendingOrder, createOrder } from "@/app/checkout/actions";
 import type { CartSku } from "@/lib/catalog";
 import { formatPrice } from "@/lib/format";
+import { isKnownFailCode, paymentFailMessage } from "@/lib/payment-labels";
 
 // NEXT_PUBLIC_ 으로 시작하는 환경변수만 브라우저 코드에서 읽을 수 있어요. (클라이언트 키는 공개돼도 괜찮음)
 const clientKey = process.env.NEXT_PUBLIC_TOSS_CLIENT_KEY ?? "";
@@ -103,7 +104,17 @@ export default function CheckoutView({
     } catch (e) {
       // 결제창을 닫았거나 약관 미동의 등 → 재고 예약을 바로 풂
       await cancelPendingOrder(order.paymentOrderId, "PAYMENT_FAILED");
-      setError(e instanceof Error ? e.message : "결제를 진행하지 못했어요.");
+      // SDK 오류 코드가 있으면 우리 문구로, 없으면 SDK 메시지 (예: 약관에 동의해 주세요)
+      const code = (e as { code?: string }).code;
+      setError(
+        code === "USER_CANCEL"
+          ? "결제를 취소했어요. 다시 결제하려면 버튼을 눌러 주세요."
+          : code && isKnownFailCode(code)
+            ? paymentFailMessage(code)
+            : e instanceof Error && e.message
+              ? e.message // SDK 안내 (예: 필수 약관에 동의해 주세요)
+              : paymentFailMessage(code),
+      );
       setPaying(false);
     }
   }

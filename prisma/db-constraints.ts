@@ -268,8 +268,163 @@ export function autoChecks(schemaText: string): CheckConstraint[] {
   return checks;
 }
 
+// ---------------------------------------------------------------
+// 결제·주문 CHECK
+// ---------------------------------------------------------------
+/** 토스 주문번호 규칙: 6~64자, 영문·숫자·-_= */
+const pgOrderIdOk = (col: string) => `length(${q(col)}) BETWEEN 6 AND 64 AND ${q(col)} NOT GLOB '*[^A-Za-z0-9_=-]*'`;
+const dates = (...cols: [string, boolean][]) => cols.map(([c, nullable]) => `(${nullable ? isoDateOrNull(c) : isoDate(c)})`).join(" AND ");
+const httpsOrNull = (col: string) => `${q(col)} IS NULL OR ${q(col)} GLOB 'https://?*'`;
+
+const PAYMENT_CHECKS: CheckConstraint[] = [
+  // ----- 주문
+  { table: "Order", name: "Order_total_ck", expr: int("totalPrice", ">= 1"), why: "주문 금액은 1원 이상의 정수 (0원 이하 판매 금지)" },
+  { table: "Order", name: "Order_payment_order_id_ck", expr: pgOrderIdOk("paymentOrderId"), why: "토스 주문번호 규칙 (6~64자, 영문·숫자·-_=). 어기면 결제창에서 INVALID_ORDER_ID" },
+  { table: "Order", name: "Order_name_ck", expr: `${notBlank("orderName")} AND length("orderName") <= 100`, why: "결제창 상품명 1~100자 (토스 제한)" },
+  {
+    table: "Order",
+    name: "Order_state_ck",
+    expr: [
+      `("status" IN ('PENDING', 'WAITING_DEPOSIT') AND "paidAt" IS NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'PAID' AND "paidAt" IS NOT NULL AND "canceledAt" IS NULL)`,
+      `("status" IN ('CANCELED', 'EXPIRED') AND "canceledAt" IS NOT NULL)`,
+      `("status" = 'CANCEL_FAILED')`,
+    ].join(" OR "),
+    why: "결제 완료면 결제 시각, 취소·만료면 취소 시각 필수. 결제 전에는 둘 다 비어 있음",
+  },
+  { table: "Order", name: "Order_dates_ck", expr: dates(["createdAt", false], ["paidAt", true], ["canceledAt", true]), why: "날짜 형식" },
+
+  // ----- 결제
+  {
+    table: "Payment",
+    name: "Payment_amounts_ck",
+    expr: [
+      int("amount", ">= 1"),
+      int("canceledAmount", ">= 0"),
+      `"canceledAmount" <= "amount"`,
+      `typeof("balanceAmount") = 'integer' AND "balanceAmount" = "amount" - "canceledAmount"`,
+      int("taxFreeAmount", ">= 0"),
+      `"taxFreeAmount" <= "amount"`,
+      `(${intOrNull("suppliedAmount", ">= 0")})`,
+      `(${intOrNull("vat", ">= 0")})`,
+    ].join(" AND "),
+    why: "금액은 정수, 결제 금액 1원 이상, 취소 합계 ≤ 결제 금액, 잔액 = 결제 금액 − 취소 합계",
+  },
+  { table: "Payment", name: "Payment_currency_ck", expr: `"currency" = 'KRW'`, why: "원화만 (해외 결제는 지원하지 않음)" },
+  { table: "Payment", name: "Payment_attempt_ck", expr: int("attemptNo", ">= 1"), why: "시도 번호는 1부터" },
+  {
+    table: "Payment",
+    name: "Payment_keys_ck",
+    expr: [
+      `("paymentKey" IS NULL OR length("paymentKey") BETWEEN 1 AND 200)`,
+      pgOrderIdOk("pgOrderId"),
+      `("confirmIdempotencyKey" IS NULL OR length("confirmIdempotencyKey") BETWEEN 1 AND 300)`,
+      `(${hashOrNull("secretHash")})`,
+      `(${httpsOrNull("receiptUrl")})`,
+      `("failMessage" IS NULL OR length("failMessage") <= 510)`,
+    ].join(" AND "),
+    why: "토스 규격 길이 (결제 키 200자, 주문번호 6~64자, 멱등키 300자), secret은 해시로만, 영수증은 https",
+  },
+  {
+    table: "Payment",
+    name: "Payment_state_ck",
+    expr: [
+      `("status" IN ('IN_PROGRESS', 'UNKNOWN') AND "paymentKey" IS NOT NULL AND "confirmIdempotencyKey" IS NOT NULL AND "canceledAmount" = 0 AND "failCode" IS NULL AND "approvedAt" IS NULL)`,
+      `("status" = 'WAITING_FOR_DEPOSIT' AND "paymentKey" IS NOT NULL AND "method" = 'VIRTUAL_ACCOUNT' AND "canceledAmount" = 0 AND "failCode" IS NULL AND "approvedAt" IS NULL)`,
+      `("status" = 'DONE' AND "paymentKey" IS NOT NULL AND "approvedAt" IS NOT NULL AND "canceledAmount" = 0 AND "failCode" IS NULL)`,
+      `("status" = 'PARTIAL_CANCELED' AND "paymentKey" IS NOT NULL AND "approvedAt" IS NOT NULL AND "canceledAmount" > 0 AND "canceledAmount" < "amount")`,
+      `("status" = 'CANCELED' AND "paymentKey" IS NOT NULL AND "canceledAmount" = "amount" AND "canceledAt" IS NOT NULL)`,
+      `("status" = 'ABORTED' AND "failCode" IS NOT NULL AND "failedAt" IS NOT NULL AND "canceledAmount" = 0 AND "approvedAt" IS NULL)`,
+      `("status" = 'EXPIRED' AND "expiredAt" IS NOT NULL AND "canceledAmount" = 0 AND "approvedAt" IS NULL)`,
+    ].join(" OR "),
+    why: "상태별 필수 칸: 완료는 승인 시각, 실패는 실패 코드·시각, 만료는 만료 시각, 취소는 취소 금액 = 결제 금액, 입금 대기는 가상계좌만",
+  },
+  {
+    table: "Payment",
+    name: "Payment_dates_ck",
+    expr: dates(["requestedAt", true], ["approvedAt", true], ["failedAt", true], ["canceledAt", true], ["expiredAt", true], ["syncedAt", true], ["statusChangedAt", false], ["createdAt", false]),
+    why: "날짜 형식",
+  },
+
+  { table: "PaymentCard", name: "PaymentCard_values_ck", expr: [notBlank("issuerCode"), notBlank("approveNo"), `"numberMasked" GLOB '*[*]*' AND length("numberMasked") <= 20`, int("installmentPlanMonths", "BETWEEN 0 AND 60"), int("amount", ">= 0")].join(" AND "), why: "카드번호는 가린 값(*)만, 할부 0~60개월, 금액 0 이상" },
+  { table: "PaymentEasyPay", name: "PaymentEasyPay_values_ck", expr: `${notBlank("provider")} AND ${int("amount", ">= 0")} AND ${int("discountAmount", ">= 0")}`, why: "간편결제사 필수, 금액·할인 0 이상" },
+  { table: "PaymentVirtualAccount", name: "PaymentVirtualAccount_values_ck", expr: `${notBlank("bankCode")} AND "accountNumberEnc" GLOB 'v[0-9]*:?*:?*:?*' AND (${encOrNull("customerNameEnc")})`, why: "가상계좌 번호·입금자명은 암호문으로만" },
+  { table: "PaymentVirtualAccount", name: "PaymentVirtualAccount_dates_ck", expr: dates(["dueDate", false], ["depositedAt", true]), why: "날짜 형식 (입금 기한 비교가 깨지지 않게)" },
+  {
+    table: "PaymentRefundAccount",
+    name: "PaymentRefundAccount_values_ck",
+    expr: [
+      notBlank("bankCode"),
+      `"accountNumberMasked" GLOB '*[*]*' AND "holderNameMasked" GLOB '*[*]*'`,
+      `(${encOrNull("accountNumberEnc")}) AND (${encOrNull("holderNameEnc")})`,
+      `("accountNumberEnc" IS NULL) = ("holderNameEnc" IS NULL) AND ("accountNumberEnc" IS NULL) = ("wipedAt" IS NOT NULL)`,
+    ].join(" AND "),
+    why: "환불 계좌는 암호문 + 가린 값, 파기하면 암호문 둘 다 지우고 파기 시각 기록",
+  },
+  { table: "PaymentRefundAccount", name: "PaymentRefundAccount_dates_ck", expr: dates(["createdAt", false], ["wipedAt", true]), why: "날짜 형식" },
+
+  {
+    table: "PaymentCancel",
+    name: "PaymentCancel_values_ck",
+    expr: [
+      int("cancelAmount", ">= 1"),
+      int("taxFreeAmount", ">= 0"),
+      `"taxFreeAmount" <= "cancelAmount"`,
+      `(${intOrNull("refundableAmountAfter", ">= 0")})`,
+      `${notBlank("reasonText")} AND length("reasonText") <= 200`,
+      `length("idempotencyKey") BETWEEN 1 AND 300`,
+    ].join(" AND "),
+    why: "취소 금액 1원 이상, 사유 1~200자(토스 제한), 멱등키 300자 이내",
+  },
+  {
+    table: "PaymentCancel",
+    name: "PaymentCancel_state_ck",
+    expr: [
+      `("status" IN ('REQUESTED', 'UNKNOWN') AND "transactionKey" IS NULL AND "canceledAt" IS NULL AND "failCode" IS NULL)`,
+      `("status" = 'DONE' AND "transactionKey" IS NOT NULL AND "canceledAt" IS NOT NULL AND "failCode" IS NULL)`,
+      `("status" = 'FAILED' AND "transactionKey" IS NULL AND "canceledAt" IS NULL AND "failCode" IS NOT NULL)`,
+    ].join(" OR "),
+    why: "취소 완료는 거래 키·취소 시각 필수, 실패는 실패 코드 필수",
+  },
+  { table: "PaymentCancel", name: "PaymentCancel_dates_ck", expr: dates(["requestedAt", false], ["canceledAt", true]), why: "날짜 형식" },
+
+  { table: "PaymentStatusHistory", name: "PaymentStatusHistory_values_ck", expr: `${int("canceledAmount", ">= 0")} AND ${isoDate("changedAt")}`, why: "취소 금액 0 이상, 날짜 형식" },
+
+  {
+    table: "PaymentApiLog",
+    name: "PaymentApiLog_values_ck",
+    expr: [
+      `"httpMethod" IN ('GET', 'POST')`,
+      `"path" GLOB '/v1/*'`,
+      int("durationMs", ">= 0"),
+      `("idempotencyKey" IS NULL OR length("idempotencyKey") <= 300)`,
+      `(("outcome" = 'SUCCESS' AND "httpStatus" BETWEEN 200 AND 299) OR ("outcome" = 'FAIL' AND "httpStatus" BETWEEN 300 AND 599) OR ("outcome" IN ('TIMEOUT', 'NETWORK_ERROR') AND "httpStatus" IS NULL))`,
+      `("requestBody" IS NULL OR length("requestBody") <= 20000) AND ("responseBody" IS NULL OR length("responseBody") <= 20000)`,
+      isoDate("createdAt"),
+    ].join(" AND "),
+    why: "결과와 HTTP 상태가 맞아야 함 (성공=2xx, 실패=응답 있음, 시간 초과·네트워크 오류=응답 없음), 본문 2만 자 이내",
+  },
+
+  {
+    table: "PaymentWebhookEvent",
+    name: "PaymentWebhookEvent_values_ck",
+    expr: [
+      notBlank("eventType"),
+      notBlank("dedupKey"),
+      int("retriedCount", ">= 0"),
+      int("attempts", ">= 0"),
+      `length("payload") <= 100000`,
+      `("status" NOT IN ('PROCESSED', 'IGNORED') OR "processedAt" IS NOT NULL) AND ("status" <> 'FAILED' OR "lastError" IS NOT NULL)`,
+      dates(["receivedAt", false], ["processedAt", true]),
+    ].join(" AND "),
+    why: "처리·무시하면 처리 시각, 실패하면 오류 내용 필수",
+  },
+
+  { table: "CashReceipt", name: "CashReceipt_values_ck", expr: `${int("amount", ">= 0")} AND ${int("taxFreeAmount", ">= 0")} AND "taxFreeAmount" <= "amount" AND (${httpsOrNull("receiptUrl")}) AND ${dates(["issuedAt", true], ["createdAt", false])}`, why: "금액 0 이상, 영수증 주소 https, 날짜 형식" },
+];
+
 export function allChecks(schemaText: string): CheckConstraint[] {
-  return [...autoChecks(schemaText), ...MANUAL_CHECKS];
+  return [...autoChecks(schemaText), ...MANUAL_CHECKS, ...PAYMENT_CHECKS];
 }
 
 // ---------------------------------------------------------------
@@ -790,9 +945,280 @@ BEGIN ${raise("Order_customer_active", "정상(ACTIVE) 상태의 고객만 주�
   },
 ];
 
+// ----- 결제·주문 도우미
+const ORDER_STATUS_CHANGES = [
+  "PENDING>WAITING_DEPOSIT", "PENDING>PAID", "PENDING>CANCELED", "PENDING>CANCEL_FAILED",
+  "WAITING_DEPOSIT>PAID", "WAITING_DEPOSIT>CANCELED", "WAITING_DEPOSIT>EXPIRED", "WAITING_DEPOSIT>CANCEL_FAILED",
+  "PAID>CANCELED", "PAID>CANCEL_FAILED",
+  "CANCEL_FAILED>CANCELED", "CANCEL_FAILED>PAID",
+];
+const PAYMENT_STATUS_CHANGES = [
+  "IN_PROGRESS>UNKNOWN", "IN_PROGRESS>DONE", "IN_PROGRESS>WAITING_FOR_DEPOSIT", "IN_PROGRESS>ABORTED", "IN_PROGRESS>EXPIRED",
+  "UNKNOWN>IN_PROGRESS", "UNKNOWN>DONE", "UNKNOWN>WAITING_FOR_DEPOSIT", "UNKNOWN>ABORTED", "UNKNOWN>EXPIRED",
+  "WAITING_FOR_DEPOSIT>DONE", "WAITING_FOR_DEPOSIT>CANCELED", "WAITING_FOR_DEPOSIT>EXPIRED",
+  "DONE>PARTIAL_CANCELED", "DONE>CANCELED", "PARTIAL_CANCELED>CANCELED",
+];
+const CANCEL_STATUS_CHANGES = ["REQUESTED>DONE", "REQUESTED>FAILED", "REQUESTED>UNKNOWN", "UNKNOWN>DONE", "UNKNOWN>FAILED"];
+/** 돈이 걸려 있는(진행 중이거나 결제된) 결제 상태 */
+const LIVE_PAYMENT = `('IN_PROGRESS', 'UNKNOWN', 'WAITING_FOR_DEPOSIT', 'DONE', 'PARTIAL_CANCELED')`;
+const inList = (xs: string[]) => xs.map((x) => `'${x}'`).join(", ");
+const DONE_CANCEL_SUM = (paymentRef: string) =>
+  `(SELECT COALESCE(SUM(c."cancelAmount"), 0) FROM "PaymentCancel" c WHERE c."paymentId" = ${paymentRef} AND c."status" = 'DONE')`;
+/** 취소가 완료되면 결제의 취소 금액·잔액·상태를 다시 계산 (앱이 직접 숫자를 바꾸지 않음) */
+const applyCancel = `UPDATE "Payment" SET
+    "canceledAmount" = ${DONE_CANCEL_SUM(`NEW."paymentId"`)},
+    "balanceAmount" = "amount" - ${DONE_CANCEL_SUM(`NEW."paymentId"`)},
+    "status" = CASE WHEN ${DONE_CANCEL_SUM(`NEW."paymentId"`)} >= "amount" THEN 'CANCELED' ELSE 'PARTIAL_CANCELED' END,
+    "canceledAt" = CASE WHEN ${DONE_CANCEL_SUM(`NEW."paymentId"`)} >= "amount" THEN NEW."canceledAt" ELSE "canceledAt" END,
+    "statusSource" = 'CANCEL',
+    "statusChangedAt" = NEW."canceledAt",
+    "updatedAt" = ${NOW}
+  WHERE "id" = NEW."paymentId";`;
+const fixedColumns = (table: string, name: string, cols: string[], message: string, why: string): TriggerConstraint => ({
+  table,
+  name,
+  why,
+  sql: `CREATE TRIGGER "${name}" BEFORE UPDATE OF ${cols.map(q).join(", ")} ON "${table}"
+WHEN ${cols.map((c) => `NEW."${c}" IS NOT OLD."${c}"`).join(" OR ")}
+BEGIN ${raise(name, message)} END;`,
+});
+const noDelete = (table: string, message: string, why: string): TriggerConstraint => ({
+  table,
+  name: `${table}_no_delete`,
+  why,
+  sql: `CREATE TRIGGER "${table}_no_delete" BEFORE DELETE ON "${table}"
+BEGIN ${raise(`${table}_no_delete`, message)} END;`,
+});
+const methodGuard = (table: string, methods: string[], label: string): TriggerConstraint => ({
+  table,
+  name: `${table}_method`,
+  why: `${label} 상세는 해당 결제수단의 결제에만`,
+  sql: `CREATE TRIGGER "${table}_method" BEFORE INSERT ON "${table}"
+WHEN (SELECT p."method" FROM "Payment" p WHERE p."id" = NEW."paymentId") IS NULL
+  OR (SELECT p."method" FROM "Payment" p WHERE p."id" = NEW."paymentId") NOT IN (${inList(methods)})
+BEGIN ${raise(`${table}_method`, `${label} 상세는 결제수단이 ${methods.join("/")}인 결제에만 추가할 수 있습니다`)} END;`,
+});
+
+const PAYMENT_TRIGGERS: TriggerConstraint[] = [
+  // --- 주문
+  {
+    table: "Order",
+    name: "Order_insert_pending",
+    why: "주문은 결제 대기(PENDING)로만 생성. 결제 완료는 결제(Payment)를 거쳐야 함",
+    sql: `CREATE TRIGGER "Order_insert_pending" BEFORE INSERT ON "Order"
+WHEN NEW."status" IS NOT 'PENDING'
+BEGIN ${raise("Order_insert_pending", "주문은 PENDING 상태로만 만들 수 있습니다")} END;`,
+  },
+  fixedColumns("Order", "Order_total_fixed", ["totalPrice", "paymentOrderId", "customerId"], "주문 금액·주문번호·고객은 바꿀 수 없습니다", "결제 금액 비교 기준과 토스 주문번호가 바뀌면 결제와 어긋남"),
+  {
+    table: "Order",
+    name: "Order_status_transition",
+    why: "허용된 주문 상태 변경만 + 결제 상태와 맞아야 함 (결제 없이 결제 완료 금지, 돈이 걸린 결제가 있는데 취소 금지)",
+    sql: `CREATE TRIGGER "Order_status_transition" BEFORE UPDATE OF "status" ON "Order"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN (${inList(ORDER_STATUS_CHANGES)})
+    THEN RAISE(ABORT, 'Order_status_transition: 허용되지 않은 주문 상태 변경입니다')
+  WHEN NEW."status" = 'PAID' AND NOT EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."id" AND p."status" IN ('DONE', 'PARTIAL_CANCELED') AND p."amount" = NEW."totalPrice")
+    THEN RAISE(ABORT, 'Order_paid_guard: 주문 금액과 같은 완료된 결제가 없어 결제 완료로 바꿀 수 없습니다')
+  WHEN NEW."status" = 'PAID' AND EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderId" = NEW."id" AND r."status" = 'RESERVED')
+    THEN RAISE(ABORT, 'Order_paid_guard: 재고 예약을 먼저 확정해야 결제 완료로 바꿀 수 있습니다')
+  WHEN NEW."status" = 'WAITING_DEPOSIT' AND NOT EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."id" AND p."status" = 'WAITING_FOR_DEPOSIT')
+    THEN RAISE(ABORT, 'Order_status_transition: 입금 대기 결제(가상계좌)가 없습니다')
+  WHEN NEW."status" IN ('CANCELED', 'EXPIRED') AND EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."id" AND p."status" IN ${LIVE_PAYMENT})
+    THEN RAISE(ABORT, 'Order_cancel_guard: 진행 중이거나 결제된 결제가 있어 취소할 수 없습니다. 결제를 먼저 취소하세요')
+  WHEN NEW."status" = 'CANCEL_FAILED' AND NOT EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."id" AND p."status" IN ('DONE', 'PARTIAL_CANCELED', 'WAITING_FOR_DEPOSIT'))
+    THEN RAISE(ABORT, 'Order_status_transition: 취소 실패는 돈이 걸린 결제가 남아 있을 때만 기록합니다')
+END;
+END;`,
+  },
+  noDelete("Order", "주문은 삭제할 수 없습니다 (전자상거래법 5년 보관)", "주문·결제 기록은 5년 보관"),
+  {
+    table: "InventoryReservation",
+    name: "InventoryReservation_order_open",
+    why: "결제 대기·입금 대기 주문만 재고를 예약할 수 있음 (취소·완료된 주문이 재고를 다시 잡는 것 방지)",
+    sql: `CREATE TRIGGER "InventoryReservation_order_open" BEFORE INSERT ON "InventoryReservation"
+WHEN (SELECT o."status" FROM "Order" o WHERE o."id" = NEW."orderId") NOT IN ('PENDING', 'WAITING_DEPOSIT')
+BEGIN ${raise("InventoryReservation_order_open", "결제 대기·입금 대기 주문만 재고를 예약할 수 있습니다")} END;`,
+  },
+
+  // --- 결제
+  {
+    table: "Payment",
+    name: "Payment_insert_guard",
+    why: "결제는 승인 시작(IN_PROGRESS) 또는 결제창 실패(ABORTED)로만 생성, 금액·주문번호는 주문과 같아야 함, 시도 번호는 순서대로, 한 주문에 진행 중·완료 결제는 1개만 (동시 승인 방지)",
+    sql: `CREATE TRIGGER "Payment_insert_guard" BEFORE INSERT ON "Payment"
+BEGIN
+SELECT CASE
+  WHEN NEW."status" NOT IN ('IN_PROGRESS', 'ABORTED')
+    THEN RAISE(ABORT, 'Payment_insert_guard: 결제는 IN_PROGRESS(승인 시작) 또는 ABORTED(실패 기록)로만 만들 수 있습니다')
+  WHEN NEW."amount" IS NOT (SELECT o."totalPrice" FROM "Order" o WHERE o."id" = NEW."orderId")
+    THEN RAISE(ABORT, 'Payment_amount_match: 결제 금액이 주문 금액과 다릅니다')
+  WHEN NEW."pgOrderId" IS NOT (SELECT o."paymentOrderId" FROM "Order" o WHERE o."id" = NEW."orderId")
+    THEN RAISE(ABORT, 'Payment_insert_guard: 토스 주문번호가 주문과 다릅니다')
+  WHEN NEW."attemptNo" IS NOT (SELECT COALESCE(MAX(p."attemptNo"), 0) + 1 FROM "Payment" p WHERE p."orderId" = NEW."orderId")
+    THEN RAISE(ABORT, 'Payment_insert_guard: 시도 번호는 이전 시도 + 1이어야 합니다')
+  WHEN NEW."status" = 'IN_PROGRESS' AND (SELECT o."status" FROM "Order" o WHERE o."id" = NEW."orderId") IS NOT 'PENDING'
+    THEN RAISE(ABORT, 'Payment_order_pending: 결제 대기 주문만 결제를 시작할 수 있습니다')
+  WHEN NEW."status" = 'IN_PROGRESS' AND EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."orderId" AND p."status" IN ${LIVE_PAYMENT})
+    THEN RAISE(ABORT, 'Payment_one_active: 이 주문은 이미 결제가 진행 중이거나 완료되었습니다')
+END;
+END;`,
+  },
+  fixedColumns("Payment", "Payment_immutable", ["orderId", "attemptNo", "provider", "pgOrderId", "amount", "confirmIdempotencyKey", "createdAt"], "결제의 주문·금액·시도 번호·멱등키는 바꿀 수 없습니다", "결제 기본 정보 변경 금지"),
+  {
+    table: "Payment",
+    name: "Payment_key_fixed",
+    why: "결제 키는 한 번 정해지면 변경 금지 (다른 결제로 바꿔치기 방지)",
+    sql: `CREATE TRIGGER "Payment_key_fixed" BEFORE UPDATE OF "paymentKey" ON "Payment"
+WHEN OLD."paymentKey" IS NOT NULL AND NEW."paymentKey" IS NOT OLD."paymentKey"
+BEGIN ${raise("Payment_key_fixed", "결제 키는 바꿀 수 없습니다")} END;`,
+  },
+  {
+    table: "Payment",
+    name: "Payment_status_transition",
+    why: "허용된 결제 상태 변경만 (실패·만료·전액취소는 되돌릴 수 없음)",
+    sql: `CREATE TRIGGER "Payment_status_transition" BEFORE UPDATE OF "status" ON "Payment"
+WHEN NEW."status" IS NOT OLD."status" AND (OLD."status" || '>' || NEW."status") NOT IN (${inList(PAYMENT_STATUS_CHANGES)})
+BEGIN ${raise("Payment_status_transition", "허용되지 않은 결제 상태 변경입니다")} END;`,
+  },
+  {
+    table: "Payment",
+    name: "Payment_amount_guard",
+    why: "취소 금액은 완료된 취소(PaymentCancel DONE)의 합계와 항상 같음 → 앱이 숫자를 직접 못 바꿈",
+    sql: `CREATE TRIGGER "Payment_amount_guard" BEFORE UPDATE OF "canceledAmount", "balanceAmount" ON "Payment"
+WHEN NEW."canceledAmount" IS NOT ${DONE_CANCEL_SUM(`NEW."id"`)}
+BEGIN ${raise("Payment_amount_guard", "취소 금액은 결제 취소(PaymentCancel)로만 바꿀 수 있습니다")} END;`,
+  },
+  {
+    table: "Payment",
+    name: "Payment_status_history_ins",
+    why: "결제가 생기면 상태 이력 첫 줄 자동 기록",
+    sql: `CREATE TRIGGER "Payment_status_history_ins" AFTER INSERT ON "Payment"
+BEGIN
+  INSERT INTO "PaymentStatusHistory" ("paymentId", "fromStatus", "toStatus", "source", "canceledAmount", "failCode", "changedAt")
+  VALUES (NEW."id", NULL, NEW."status", NEW."statusSource", NEW."canceledAmount", NEW."failCode", NEW."statusChangedAt");
+END;`,
+  },
+  {
+    table: "Payment",
+    name: "Payment_status_history_upd",
+    why: "상태나 취소 금액이 바뀌면 이력 자동 기록 (부분 취소를 여러 번 해도 매번 남음)",
+    sql: `CREATE TRIGGER "Payment_status_history_upd" AFTER UPDATE OF "status", "canceledAmount" ON "Payment"
+WHEN NEW."status" IS NOT OLD."status" OR NEW."canceledAmount" IS NOT OLD."canceledAmount"
+BEGIN
+  INSERT INTO "PaymentStatusHistory" ("paymentId", "fromStatus", "toStatus", "source", "canceledAmount", "failCode", "changedAt")
+  VALUES (NEW."id", OLD."status", NEW."status", NEW."statusSource", NEW."canceledAmount", NEW."failCode", NEW."statusChangedAt");
+END;`,
+  },
+  noDelete("Payment", "결제 기록은 삭제할 수 없습니다 (5년 보관)", "결제 기록 보관"),
+
+  // --- 수단별 상세
+  methodGuard("PaymentCard", ["CARD", "EASY_PAY"], "카드"),
+  methodGuard("PaymentEasyPay", ["EASY_PAY"], "간편결제"),
+  methodGuard("PaymentVirtualAccount", ["VIRTUAL_ACCOUNT"], "가상계좌"),
+  fixedColumns("PaymentVirtualAccount", "PaymentVirtualAccount_fixed", ["bankCode", "accountNumberEnc", "paymentId"], "발급된 가상계좌 정보는 바꿀 수 없습니다", "발급된 계좌번호를 바꾸면 고객이 엉뚱한 계좌로 입금"),
+  noDelete("PaymentCard", "결제 상세는 삭제할 수 없습니다", "결제 기록 보관"),
+  noDelete("PaymentEasyPay", "결제 상세는 삭제할 수 없습니다", "결제 기록 보관"),
+  noDelete("PaymentVirtualAccount", "결제 상세는 삭제할 수 없습니다", "결제 기록 보관"),
+
+  // --- 환불 계좌: 파기(암호문 지우기)만 가능
+  fixedColumns("PaymentRefundAccount", "PaymentRefundAccount_fixed", ["paymentId", "bankCode", "accountNumberMasked", "holderNameMasked", "createdAt"], "환불 계좌는 바꿀 수 없습니다. 새로 등록하세요", "환불 계좌 변경 금지 (어느 계좌로 환불했는지 남겨야 함)"),
+  {
+    table: "PaymentRefundAccount",
+    name: "PaymentRefundAccount_wipe_only",
+    why: "암호문은 지우는 것(파기)만 가능, 다른 값으로 바꿀 수 없음",
+    sql: `CREATE TRIGGER "PaymentRefundAccount_wipe_only" BEFORE UPDATE OF "accountNumberEnc", "holderNameEnc" ON "PaymentRefundAccount"
+WHEN (NEW."accountNumberEnc" IS NOT NULL AND NEW."accountNumberEnc" IS NOT OLD."accountNumberEnc")
+  OR (NEW."holderNameEnc" IS NOT NULL AND NEW."holderNameEnc" IS NOT OLD."holderNameEnc")
+BEGIN ${raise("PaymentRefundAccount_wipe_only", "환불 계좌 암호문은 파기(NULL)만 할 수 있습니다")} END;`,
+  },
+  noDelete("PaymentRefundAccount", "환불 계좌 기록은 삭제할 수 없습니다 (가린 값은 남김)", "환불 기록 보관"),
+
+  // --- 취소
+  {
+    table: "PaymentCancel",
+    name: "PaymentCancel_insert_guard",
+    why: "완료된 결제만 취소, 남은 금액을 넘는 취소 금지(진행 중인 취소 포함 → 동시에 두 번 취소해도 초과 불가), 입금 전 가상계좌는 전액만, 입금된 가상계좌는 환불 계좌 필수",
+    sql: `CREATE TRIGGER "PaymentCancel_insert_guard" BEFORE INSERT ON "PaymentCancel"
+BEGIN
+SELECT CASE
+  WHEN NEW."status" <> 'REQUESTED' AND NOT (NEW."status" = 'DONE' AND NEW."reasonCode" = 'PG_SYNC')
+    THEN RAISE(ABORT, 'PaymentCancel_insert_guard: 취소는 REQUESTED로 만들고 결과를 반영합니다 (토스에서 이미 취소된 것을 반영하는 PG_SYNC만 DONE으로 기록)')
+  WHEN (SELECT p."status" FROM "Payment" p WHERE p."id" = NEW."paymentId") NOT IN ('DONE', 'PARTIAL_CANCELED', 'WAITING_FOR_DEPOSIT')
+    THEN RAISE(ABORT, 'PaymentCancel_payment_state: 완료되었거나 입금 대기 중인 결제만 취소할 수 있습니다')
+  WHEN (SELECT p."status" FROM "Payment" p WHERE p."id" = NEW."paymentId") = 'WAITING_FOR_DEPOSIT'
+      AND (NEW."cancelAmount" IS NOT (SELECT p."amount" FROM "Payment" p WHERE p."id" = NEW."paymentId") OR NEW."refundAccountId" IS NOT NULL)
+    THEN RAISE(ABORT, 'PaymentCancel_waiting_deposit: 입금 전 가상계좌는 전액 취소만 가능합니다 (환불 계좌 불필요)')
+  WHEN (SELECT COALESCE(SUM(c."cancelAmount"), 0) FROM "PaymentCancel" c WHERE c."paymentId" = NEW."paymentId" AND c."status" IN ('REQUESTED', 'UNKNOWN', 'DONE')) + NEW."cancelAmount"
+      > (SELECT p."amount" FROM "Payment" p WHERE p."id" = NEW."paymentId")
+    THEN RAISE(ABORT, 'PaymentCancel_exceeds: 취소 금액이 남은 결제 금액을 넘습니다')
+  WHEN NEW."refundAccountId" IS NOT NULL AND (SELECT a."paymentId" FROM "PaymentRefundAccount" a WHERE a."id" = NEW."refundAccountId") IS NOT NEW."paymentId"
+    THEN RAISE(ABORT, 'PaymentCancel_insert_guard: 다른 결제의 환불 계좌입니다')
+  WHEN NEW."reasonCode" <> 'PG_SYNC' AND NEW."refundAccountId" IS NULL
+      AND (SELECT p."method" || '/' || p."status" FROM "Payment" p WHERE p."id" = NEW."paymentId") IN ('VIRTUAL_ACCOUNT/DONE', 'VIRTUAL_ACCOUNT/PARTIAL_CANCELED')
+    THEN RAISE(ABORT, 'PaymentCancel_refund_account: 입금된 가상계좌 결제를 취소하려면 환불 계좌가 필요합니다')
+END;
+END;`,
+  },
+  {
+    table: "PaymentCancel",
+    name: "PaymentCancel_transition",
+    why: "취소 상태는 정해진 길로만 (완료·실패는 되돌릴 수 없음)",
+    sql: `CREATE TRIGGER "PaymentCancel_transition" BEFORE UPDATE OF "status" ON "PaymentCancel"
+WHEN NEW."status" IS NOT OLD."status" AND (OLD."status" || '>' || NEW."status") NOT IN (${inList(CANCEL_STATUS_CHANGES)})
+BEGIN ${raise("PaymentCancel_transition", "허용되지 않은 취소 상태 변경입니다")} END;`,
+  },
+  fixedColumns("PaymentCancel", "PaymentCancel_immutable", ["paymentId", "cancelAmount", "taxFreeAmount", "reasonCode", "idempotencyKey", "refundAccountId", "requestedAt"], "취소 요청 내용은 바꿀 수 없습니다. 새로 요청하세요", "취소 요청 내용 변경 금지 (멱등키와 내용이 어긋나면 위험)"),
+  {
+    table: "PaymentCancel",
+    name: "PaymentCancel_apply_upd",
+    why: "취소가 완료되면 결제의 취소 금액·잔액·상태(부분/전액 취소)를 자동 계산",
+    sql: `CREATE TRIGGER "PaymentCancel_apply_upd" AFTER UPDATE OF "status" ON "PaymentCancel"
+WHEN NEW."status" = 'DONE' AND OLD."status" IS NOT 'DONE'
+BEGIN
+  ${applyCancel}
+END;`,
+  },
+  {
+    table: "PaymentCancel",
+    name: "PaymentCancel_apply_ins",
+    why: "토스 쪽 취소를 반영(PG_SYNC, 처음부터 DONE)할 때도 같은 계산",
+    sql: `CREATE TRIGGER "PaymentCancel_apply_ins" AFTER INSERT ON "PaymentCancel"
+WHEN NEW."status" = 'DONE'
+BEGIN
+  ${applyCancel}
+END;`,
+  },
+  noDelete("PaymentCancel", "취소 기록은 삭제할 수 없습니다", "취소·환불 기록 보관"),
+
+  // --- 이력·기록
+  ...appendOnly("PaymentStatusHistory"),
+  {
+    table: "PaymentApiLog",
+    name: "PaymentApiLog_no_update",
+    why: "API 기록은 수정 금지",
+    sql: `CREATE TRIGGER "PaymentApiLog_no_update" BEFORE UPDATE ON "PaymentApiLog"
+BEGIN ${raise("PaymentApiLog_append_only", "API 기록은 수정할 수 없습니다")} END;`,
+  },
+  {
+    table: "PaymentApiLog",
+    name: "PaymentApiLog_retention",
+    why: "API 기록은 1년(365일)이 지난 것만 삭제 가능 (내부 보관 정책)",
+    sql: `CREATE TRIGGER "PaymentApiLog_retention" BEFORE DELETE ON "PaymentApiLog"
+WHEN julianday(${NOW}) - julianday(OLD."createdAt") < 365
+BEGIN ${raise("PaymentApiLog_retention", "1년이 지나지 않은 API 기록은 지울 수 없습니다")} END;`,
+  },
+  fixedColumns("PaymentWebhookEvent", "PaymentWebhookEvent_immutable", ["eventType", "dedupKey", "payload", "receivedAt"], "받은 웹훅 원문은 바꿀 수 없습니다", "받은 알림 원문 보존"),
+  noDelete("PaymentWebhookEvent", "웹훅 기록은 삭제할 수 없습니다", "받은 알림 기록 보관"),
+  noDelete("CashReceipt", "현금영수증 기록은 삭제할 수 없습니다", "세무 기록 보관"),
+];
+
 export const TRIGGERS: TriggerConstraint[] = [
   ...INVENTORY_TRIGGERS,
   ...CUSTOMER_TRIGGERS,
+  ...PAYMENT_TRIGGERS,
   // ----- 판매 시작 검사 (⭐1)
   {
     table: "Style",

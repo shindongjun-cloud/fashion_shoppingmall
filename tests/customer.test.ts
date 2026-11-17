@@ -27,6 +27,8 @@ import {
   updateProfile,
 } from "../src/lib/customer";
 import { confirmOrderPayment, defaultPaymentDeps, placeOrder } from "../src/lib/checkout";
+import { createTossApi } from "../src/lib/toss";
+import { FakeToss } from "./helpers/fake-toss";
 
 class Rollback extends Error {}
 const DAY = 24 * 60 * 60 * 1000;
@@ -272,11 +274,13 @@ describe("탈퇴: 신청 → 7일 유예(철회 가능) → 익명화 + 로그�
     const placed = await placeOrder(customer.id, [{ skuId: sku.id, quantity: 1 }]);
     assert.ok(!("error" in placed), JSON.stringify(placed));
     const order = await prisma.order.findUniqueOrThrow({ where: { paymentOrderId: placed.paymentOrderId } });
+    const fake = new FakeToss();
+    const paymentKey = fake.authorize({ orderId: order.paymentOrderId, amount: order.totalPrice });
     const paid = await confirmOrderPayment(
-      { customerId: customer.id, paymentOrderId: placed.paymentOrderId, paymentKey: "pk_w", amount: order.totalPrice },
-      { ...defaultPaymentDeps, confirmPayment: async () => ({ ok: true }) },
+      { customerId: customer.id, paymentOrderId: placed.paymentOrderId, paymentKey, amount: String(order.totalPrice) },
+      { ...defaultPaymentDeps, toss: createTossApi({ transport: fake.transport, secretKey: () => "test_gsk_fake" }) },
     );
-    assert.equal(paid.ok, true);
+    assert.equal(paid.kind, "PAID");
     const account = await prisma.account.findFirstOrThrow({ where: { userId: user.id } });
 
     const requested = new Date();
@@ -334,9 +338,19 @@ describe("등급 재산정 (최근 12개월 결제 금액)", () => {
   test("30만원 이상 → 실버, 1년이 지나 실적이 빠지면 → 웰컴 (이력 기록)", async () => {
     const { customer } = await signup("등급");
     const now = new Date();
-    await prisma.order.create({
-      data: { paymentOrderId: `order_grade_${Date.now()}`, orderName: "등급", totalPrice: 350000, status: "PAID", customerId: customer.id, createdAt: new Date(now.getTime() - 10 * DAY) },
+    // 결제 완료 주문은 결제(Payment)를 거쳐야만 만들 수 있음 (DB 트리거) → 승인 흐름으로 만든 뒤 결제 시각만 10일 전으로
+    const order = await prisma.order.create({
+      data: { paymentOrderId: `order_grade_${Date.now()}`, orderName: "등급", totalPrice: 350000, customerId: customer.id, createdAt: new Date(now.getTime() - 10 * DAY) },
     });
+    const fake = new FakeToss();
+    const paymentKey = fake.authorize({ orderId: order.paymentOrderId, amount: 350000 });
+    const paid = await confirmOrderPayment(
+      { customerId: customer.id, paymentOrderId: order.paymentOrderId, paymentKey, amount: "350000" },
+      { ...defaultPaymentDeps, toss: createTossApi({ transport: fake.transport, secretKey: () => "test_gsk_fake" }), finalizeOrder: async (tx, o, p, at) => {
+        await tx.order.update({ where: { id: o.id }, data: { status: "PAID", paidAt: new Date(at.getTime() - 10 * DAY) } });
+      } },
+    );
+    assert.equal(paid.kind, "PAID");
     await recalculateGrades(now);
     const silver = await prisma.customer.findUniqueOrThrow({ where: { id: customer.id }, include: { grade: true } });
     assert.equal(silver.grade.code, "SILVER");

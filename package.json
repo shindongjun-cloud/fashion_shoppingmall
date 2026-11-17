@@ -15,7 +15,8 @@
     "db:verify": "tsx scripts/db-verify.ts",
     "test": "tsx --test \"tests/**/*.test.ts\"",
     "inventory:release-expired": "tsx scripts/release-expired.ts",
-    "customer:jobs": "tsx scripts/customer-jobs.ts"
+    "customer:jobs": "tsx scripts/customer-jobs.ts",
+    "payments:jobs": "tsx scripts/payment-jobs.ts"
   },
   "dependencies": {
     "@auth/prisma-adapter": "^2.11.3",

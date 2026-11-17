@@ -17,3 +17,8 @@ export function formatDate(date: Date) {
 export function formatDateTime(date: Date) {
   return date.toLocaleString("ko-KR", { timeZone: KST, month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
+
+// 2026. 11. 22. 오후 11:00 (연도 포함: 입금 기한처럼 날짜가 중요한 곳)
+export function formatDateTimeLong(date: Date) {
+  return date.toLocaleString("ko-KR", { timeZone: KST, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit" });
+}

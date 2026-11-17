@@ -5,6 +5,7 @@ import { getCartSkus } from "@/lib/catalog";
 import { getCurrentCustomer } from "@/lib/current-customer";
 import { listAddresses } from "@/lib/customer";
 import CheckoutView from "@/components/CheckoutView";
+import { getTossConfigProblem } from "@/lib/toss";
 
 export const dynamic = "force-dynamic";
 
@@ -25,6 +26,21 @@ export default async function CheckoutPage() {
         </p>
         <Link href="/my" className="mt-6 inline-block rounded-lg bg-gray-900 px-6 py-3 font-medium text-white hover:bg-gray-700">
           내 정보로 가기
+        </Link>
+      </main>
+    );
+  }
+
+  // 결제 키가 비어 있거나 짝이 안 맞으면 결제창을 띄우지 않고 바로 알림 (결제 직전에야 알게 되는 일 방지)
+  const configProblem = getTossConfigProblem();
+  if (configProblem) {
+    console.error(`[결제 설정 오류] ${configProblem}`);
+    return (
+      <main className="mx-auto w-full max-w-3xl px-4 py-20 text-center">
+        <p className="text-gray-700">지금은 결제할 수 없어요. 결제 설정을 확인하고 있어요.</p>
+        {process.env.NODE_ENV !== "production" && <p className="mt-2 text-sm text-red-600">개발자 안내: {configProblem} (.env 확인)</p>}
+        <Link href="/cart" className="mt-6 inline-block rounded-lg bg-gray-900 px-6 py-3 font-medium text-white hover:bg-gray-700">
+          장바구니로
         </Link>
       </main>
     );
