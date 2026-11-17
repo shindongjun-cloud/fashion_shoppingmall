@@ -44,6 +44,10 @@ const isoDateOrNull = (col: string) => `${q(col)} IS NULL OR ${q(col)} GLOB ${IS
 /** 대문자·숫자·밑줄만 (코드값) */
 const upperCode = (col: string) => `${q(col)} <> '' AND ${q(col)} NOT GLOB '*[^A-Z0-9_]*'`;
 const notBlank = (col: string) => `trim(${q(col)}) <> ''`;
+/** 암호문 형식 v1:IV:태그:암호문 (lib/crypto.ts) */
+const encOrNull = (col: string) => `${q(col)} IS NULL OR ${q(col)} GLOB 'v[0-9]*:?*:?*:?*'`;
+/** HMAC-SHA256 16진수 64자 */
+const hashOrNull = (col: string) => `${q(col)} IS NULL OR (length(${q(col)}) = 64 AND ${q(col)} NOT GLOB '*[^0-9a-f]*')`;
 const FOREVER = "'9999-12-31T23:59:59.999+00:00'";
 
 // ---------------------------------------------------------------
@@ -176,6 +180,57 @@ const MANUAL_CHECKS: CheckConstraint[] = [
     why: "상태별 필수 칸 (확정이면 확정 시각, 해제면 해제 시각+사유, 만료면 해제 시각)",
   },
   { table: "InventoryReservation", name: "InventoryReservation_dates_ck", expr: `(${isoDate("createdAt")}) AND (${isoDate("expiresAt")}) AND (${isoDateOrNull("confirmedAt")}) AND (${isoDateOrNull("releasedAt")})`, why: "날짜 형식 (만료 비교가 깨지지 않게)" },
+
+  // ----- 고객
+  { table: "Customer", name: "Customer_no_ck", expr: `"customerNo" GLOB 'C[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'`, why: "고객번호는 C + 숫자 10자리" },
+  {
+    table: "Customer",
+    name: "Customer_withdrawn_ck",
+    expr: `("status" = 'WITHDRAWN' AND "userId" IS NULL AND "withdrawnAt" IS NOT NULL AND "anonymizedAt" IS NOT NULL) OR ("status" <> 'WITHDRAWN' AND "withdrawnAt" IS NULL AND "anonymizedAt" IS NULL)`,
+    why: "탈퇴 완료면 로그인 계정 없음 + 탈퇴·익명화 시각 필수, 아니면 둘 다 비어 있음",
+  },
+  { table: "Customer", name: "Customer_suspended_ck", expr: `("status" = 'SUSPENDED') = ("suspendedAt" IS NOT NULL AND "suspendedReason" IS NOT NULL)`, why: "정지 상태면 정지 시각·사유 필수, 아니면 비어 있음" },
+  { table: "Customer", name: "Customer_dormant_ck", expr: `("status" = 'DORMANT') = ("dormantAt" IS NOT NULL)`, why: "휴면 상태면 휴면 시각 필수" },
+  {
+    table: "Customer",
+    name: "Customer_dates_ck",
+    expr: [isoDate("joinedAt"), isoDate("statusChangedAt"), isoDateOrNull("lastLoginAt"), isoDateOrNull("lastOrderAt"), isoDateOrNull("dormantAt"), isoDateOrNull("suspendedAt"), isoDateOrNull("withdrawnAt"), isoDateOrNull("anonymizedAt")].map((e) => `(${e})`).join(" AND "),
+    why: "날짜 형식",
+  },
+
+  { table: "CustomerProfile", name: "CustomerProfile_enc_ck", expr: ["nameEnc", "phoneEnc", "birthDateEnc", "contactEmailEnc"].map((c) => `(${encOrNull(c)})`).join(" AND "), why: "개인정보는 암호문 형식(v1:IV:태그:암호문)으로만 저장 (평문 저장 실수 방지)" },
+  { table: "CustomerProfile", name: "CustomerProfile_hash_ck", expr: `(${hashOrNull("phoneHash")}) AND (${hashOrNull("emailHash")})`, why: "검색용 해시는 HMAC-SHA256 16진수 64자" },
+  { table: "CustomerProfile", name: "CustomerProfile_pairs_ck", expr: `("phoneEnc" IS NULL) = ("phoneHash" IS NULL) AND ("contactEmailEnc" IS NULL) = ("emailHash" IS NULL) AND ("birthDateEnc" IS NULL) = ("birthMonth" IS NULL)`, why: "암호문과 검색 해시(또는 생일 월)는 함께 있거나 함께 없음" },
+  { table: "CustomerProfile", name: "CustomerProfile_birth_month_ck", expr: intOrNull("birthMonth", "BETWEEN 1 AND 12"), why: "생일 월 1~12" },
+
+  { table: "CustomerBodyProfile", name: "CustomerBodyProfile_range_ck", expr: `(${intOrNull("heightCm", "BETWEEN 100 AND 230")}) AND (${intOrNull("weightKg", "BETWEEN 25 AND 200")}) AND (${intOrNull("shoeSizeMm", "BETWEEN 200 AND 330")})`, why: "키 100~230, 몸무게 25~200, 신발 200~330mm" },
+  { table: "CustomerBodyProfile", name: "CustomerBodyProfile_size_ck", expr: `("topSize" IS NULL OR trim("topSize") <> '') AND ("bottomSize" IS NULL OR trim("bottomSize") <> '')`, why: "사이즈를 넣으면 빈 글자 금지" },
+
+  { table: "CustomerAddress", name: "CustomerAddress_label_ck", expr: `${notBlank("label")} AND length("label") <= 20`, why: "배송지 이름 1~20자" },
+  { table: "CustomerAddress", name: "CustomerAddress_zip_ck", expr: `length("zipCode") = 5 AND "zipCode" NOT GLOB '*[^0-9]*'`, why: "우편번호는 숫자 5자리" },
+  { table: "CustomerAddress", name: "CustomerAddress_enc_ck", expr: ["recipientEnc", "phoneEnc", "address1Enc", "address2Enc"].map((c) => `(${encOrNull(c)})`).join(" AND "), why: "주소·수령인·연락처는 암호문으로만 저장" },
+  { table: "CustomerAddress", name: "CustomerAddress_memo_ck", expr: `"deliveryMemo" IS NULL OR length("deliveryMemo") <= 100`, why: "배송 메모 100자 이내" },
+
+  { table: "CustomerStatusHistory", name: "CustomerStatusHistory_change_ck", expr: `"fromStatus" IS NULL OR "fromStatus" <> "toStatus"`, why: "상태가 실제로 바뀐 경우만 기록" },
+  { table: "CustomerStatusHistory", name: "CustomerStatusHistory_dates_ck", expr: isoDate("changedAt"), why: "날짜 형식" },
+
+  { table: "CustomerWithdrawal", name: "CustomerWithdrawal_outcome_ck", expr: `"completedAt" IS NULL OR "canceledAt" IS NULL`, why: "완료와 철회는 동시에 불가" },
+  { table: "CustomerWithdrawal", name: "CustomerWithdrawal_grace_ck", expr: `julianday("scheduledAt") - julianday("requestedAt") >= 7`, why: "처리 예정일은 신청 후 7일 이상 (철회 기간 보장)" },
+  { table: "CustomerWithdrawal", name: "CustomerWithdrawal_order_ck", expr: `("completedAt" IS NULL OR "completedAt" >= "scheduledAt") AND ("canceledAt" IS NULL OR "canceledAt" >= "requestedAt")`, why: "유예 기간이 끝나야 완료, 철회는 신청 이후" },
+  { table: "CustomerWithdrawal", name: "CustomerWithdrawal_rejoin_ck", expr: `("rejoinBlockHash" IS NULL) = ("rejoinBlockUntil" IS NULL) AND ("rejoinBlockHash" IS NULL OR "completedAt" IS NOT NULL) AND (${hashOrNull("rejoinBlockHash")})`, why: "재가입 제한 정보는 완료된 탈퇴에만, 해시와 기한은 함께" },
+  { table: "CustomerWithdrawal", name: "CustomerWithdrawal_text_ck", expr: `"reasonText" IS NULL OR length("reasonText") <= 500`, why: "사유 500자 이내" },
+  { table: "CustomerWithdrawal", name: "CustomerWithdrawal_dates_ck", expr: [isoDate("requestedAt"), isoDate("scheduledAt"), isoDateOrNull("completedAt"), isoDateOrNull("canceledAt"), isoDateOrNull("rejoinBlockUntil")].map((e) => `(${e})`).join(" AND "), why: "날짜 형식" },
+
+  { table: "CustomerGrade", name: "CustomerGrade_code_ck", expr: upperCode("code"), why: "등급 코드 형식" },
+  { table: "CustomerGrade", name: "CustomerGrade_name_ck", expr: notBlank("name"), why: "등급 이름 필수" },
+  { table: "CustomerGrade", name: "CustomerGrade_values_ck", expr: `${int("minAmount", ">= 0")} AND ${int("pointRateBp", "BETWEEN 0 AND 10000")} AND ${int("sortOrder", ">= 0")}`, why: "기준 금액 >= 0, 적립률 0~100%(bp), 정렬 >= 0" },
+
+  { table: "CustomerGradeHistory", name: "CustomerGradeHistory_change_ck", expr: `"fromGradeId" IS NULL OR "fromGradeId" <> "toGradeId"`, why: "등급이 실제로 바뀐 경우만 기록" },
+  { table: "CustomerGradeHistory", name: "CustomerGradeHistory_values_ck", expr: `(${intOrNull("purchaseAmount", ">= 0")}) AND ("periodFrom" IS NULL OR "periodTo" IS NULL OR "periodTo" > "periodFrom")`, why: "산정 금액 >= 0, 산정 기간 순서" },
+  { table: "CustomerGradeHistory", name: "CustomerGradeHistory_dates_ck", expr: [isoDate("changedAt"), isoDateOrNull("periodFrom"), isoDateOrNull("periodTo")].map((e) => `(${e})`).join(" AND "), why: "날짜 형식" },
+
+  { table: "CustomerLoginHistory", name: "CustomerLoginHistory_values_ck", expr: `${notBlank("provider")} AND ("userAgent" IS NULL OR length("userAgent") <= 500) AND ("ipMasked" IS NULL OR "ipMasked" GLOB '*[*]*')`, why: "로그인 수단 필수, IP는 반드시 마스킹된 값만 (원본 IP 저장 금지)" },
+  { table: "CustomerLoginHistory", name: "CustomerLoginHistory_dates_ck", expr: isoDate("loggedInAt"), why: "날짜 형식" },
 ];
 
 // ---------------------------------------------------------------
@@ -509,8 +564,235 @@ BEGIN ${raise("InventoryLocation_deactivate_guard", "결제 대기 예약이 있
   },
 ];
 
+// ----- 고객 도우미
+const PROFILE_PII_COLS = ["nameEnc", "phoneEnc", "phoneHash", "birthDateEnc", "birthMonth", "contactEmailEnc", "emailHash"];
+const ALLOWED_STATUS_CHANGES = [
+  "ACTIVE>DORMANT", "ACTIVE>SUSPENDED", "ACTIVE>WITHDRAW_PENDING",
+  "DORMANT>ACTIVE", "DORMANT>SUSPENDED", "DORMANT>WITHDRAW_PENDING",
+  "SUSPENDED>ACTIVE", "SUSPENDED>WITHDRAW_PENDING",
+  "WITHDRAW_PENDING>ACTIVE", "WITHDRAW_PENDING>WITHDRAWN",
+];
+const customerStatusOf = (col: string, rec: "NEW" | "OLD" = "NEW") => `(SELECT c."status" FROM "Customer" c WHERE c."id" = ${rec}."${col}")`;
+const appendOnly = (table: string): TriggerConstraint[] => [
+  {
+    table,
+    name: `${table}_no_update`,
+    why: "이력은 수정 금지",
+    sql: `CREATE TRIGGER "${table}_no_update" BEFORE UPDATE ON "${table}"
+BEGIN ${raise(`${table}_append_only`, "이력은 수정할 수 없습니다")} END;`,
+  },
+  {
+    table,
+    name: `${table}_no_delete`,
+    why: "이력은 삭제 금지",
+    sql: `CREATE TRIGGER "${table}_no_delete" BEFORE DELETE ON "${table}"
+BEGIN ${raise(`${table}_append_only`, "이력은 삭제할 수 없습니다")} END;`,
+  },
+];
+
+const CUSTOMER_TRIGGERS: TriggerConstraint[] = [
+  // --- 상태: 가입은 ACTIVE로, 정해진 길로만 바뀌고, 바뀌면 이력 자동 기록
+  {
+    table: "Customer",
+    name: "Customer_status_insert",
+    why: "가입은 ACTIVE 상태로만",
+    sql: `CREATE TRIGGER "Customer_status_insert" BEFORE INSERT ON "Customer"
+WHEN NEW."status" <> 'ACTIVE'
+BEGIN ${raise("Customer_status_insert", "고객은 ACTIVE 상태로만 만들 수 있습니다")} END;`,
+  },
+  {
+    table: "Customer",
+    name: "Customer_status_transition",
+    why: "허용된 상태 변경만 (탈퇴 완료는 되돌릴 수 없음, 탈퇴는 반드시 유예를 거침), 사유·시각 함께 기록, 탈퇴 완료 전 개인정보 파기 확인",
+    sql: `CREATE TRIGGER "Customer_status_transition" BEFORE UPDATE OF "status" ON "Customer"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN OLD."status" = 'WITHDRAWN'
+    THEN RAISE(ABORT, 'Customer_status_transition: 탈퇴 완료된 고객은 상태를 바꿀 수 없습니다')
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN (${ALLOWED_STATUS_CHANGES.map((s) => `'${s}'`).join(", ")})
+    THEN RAISE(ABORT, 'Customer_status_transition: 허용되지 않은 상태 변경입니다')
+  WHEN NEW."statusChangedAt" IS OLD."statusChangedAt"
+    THEN RAISE(ABORT, 'Customer_status_transition: 상태를 바꿀 때 statusReason·statusChangedAt도 함께 바꿔야 합니다')
+  WHEN NEW."status" = 'WITHDRAWN' AND NOT EXISTS (SELECT 1 FROM "CustomerWithdrawal" w WHERE w."customerId" = NEW."id" AND w."completedAt" IS NOT NULL)
+    THEN RAISE(ABORT, 'Customer_status_transition: 완료된 탈퇴 신청 없이 탈퇴 상태로 바꿀 수 없습니다')
+  WHEN NEW."status" = 'WITHDRAWN' AND (
+      EXISTS (SELECT 1 FROM "CustomerProfile" p WHERE p."customerId" = NEW."id" AND (${PROFILE_PII_COLS.map((c) => `p."${c}" IS NOT NULL`).join(" OR ")}))
+      OR EXISTS (SELECT 1 FROM "CustomerAddress" a WHERE a."customerId" = NEW."id")
+      OR EXISTS (SELECT 1 FROM "CustomerBodyProfile" b WHERE b."customerId" = NEW."id"))
+    THEN RAISE(ABORT, 'Customer_status_transition: 개인정보(프로필·배송지·체형)를 먼저 파기해야 탈퇴 완료할 수 있습니다')
+END;
+END;`,
+  },
+  {
+    table: "Customer",
+    name: "Customer_status_history_ins",
+    why: "가입하면 상태 이력 첫 줄 자동 기록",
+    sql: `CREATE TRIGGER "Customer_status_history_ins" AFTER INSERT ON "Customer"
+BEGIN
+  INSERT INTO "CustomerStatusHistory" ("customerId", "fromStatus", "toStatus", "reason", "memo", "changedBy", "changedAt")
+  VALUES (NEW."id", NULL, NEW."status", NEW."statusReason", NEW."statusMemo", NEW."statusChangedBy", NEW."statusChangedAt");
+END;`,
+  },
+  {
+    table: "Customer",
+    name: "Customer_status_history_upd",
+    why: "상태가 바뀌면 이력 자동 기록 (앱이 깜빡해도 빠지지 않음)",
+    sql: `CREATE TRIGGER "Customer_status_history_upd" AFTER UPDATE OF "status" ON "Customer"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  INSERT INTO "CustomerStatusHistory" ("customerId", "fromStatus", "toStatus", "reason", "memo", "changedBy", "changedAt")
+  VALUES (NEW."id", OLD."status", NEW."status", NEW."statusReason", NEW."statusMemo", NEW."statusChangedBy", NEW."statusChangedAt");
+END;`,
+  },
+  {
+    table: "Customer",
+    name: "Customer_grade_guard",
+    why: "등급은 등급 이력을 먼저 남긴 뒤에만 바꿀 수 있음 (가장 최근 이력의 등급 = 새 등급)",
+    sql: `CREATE TRIGGER "Customer_grade_guard" BEFORE UPDATE OF "gradeId" ON "Customer"
+WHEN NEW."gradeId" IS NOT OLD."gradeId"
+  AND (SELECT h."toGradeId" FROM "CustomerGradeHistory" h WHERE h."customerId" = NEW."id" ORDER BY h."id" DESC LIMIT 1) IS NOT NEW."gradeId"
+BEGIN ${raise("Customer_grade_guard", "등급 이력(CustomerGradeHistory)을 먼저 추가해야 등급을 바꿀 수 있습니다")} END;`,
+  },
+  {
+    table: "Customer",
+    name: "Customer_no_delete",
+    why: "고객 행은 삭제 금지 (탈퇴는 익명화, 주문 5년 보관)",
+    sql: `CREATE TRIGGER "Customer_no_delete" BEFORE DELETE ON "Customer"
+BEGIN ${raise("Customer_no_delete", "고객은 삭제하지 않고 탈퇴(익명화) 처리합니다")} END;`,
+  },
+
+  // --- 개인정보: 탈퇴 고객에게 다시 들어가지 않게, 휴대폰 중복 가입 금지
+  {
+    table: "CustomerProfile",
+    name: "CustomerProfile_withdrawn_ins",
+    why: "탈퇴 고객의 개인정보 다시 저장 금지",
+    sql: `CREATE TRIGGER "CustomerProfile_withdrawn_ins" BEFORE INSERT ON "CustomerProfile"
+WHEN ${customerStatusOf("customerId")} = 'WITHDRAWN' AND (${PROFILE_PII_COLS.map((c) => `NEW."${c}" IS NOT NULL`).join(" OR ")})
+BEGIN ${raise("CustomerProfile_withdrawn", "탈퇴한 고객의 개인정보는 저장할 수 없습니다")} END;`,
+  },
+  {
+    table: "CustomerProfile",
+    name: "CustomerProfile_withdrawn_upd",
+    why: "위와 같음 (수정 시)",
+    sql: `CREATE TRIGGER "CustomerProfile_withdrawn_upd" BEFORE UPDATE ON "CustomerProfile"
+WHEN ${customerStatusOf("customerId")} = 'WITHDRAWN' AND (${PROFILE_PII_COLS.map((c) => `NEW."${c}" IS NOT NULL`).join(" OR ")})
+BEGIN ${raise("CustomerProfile_withdrawn", "탈퇴한 고객의 개인정보는 저장할 수 없습니다")} END;`,
+  },
+  {
+    table: "CustomerProfile",
+    name: "CustomerProfile_phone_unique_ins",
+    // ⚠️ 본인 행은 제외해야 합니다. Prisma upsert는 SQLite의 INSERT ... ON CONFLICT DO UPDATE를 쓰는데,
+    //    이때 이미 있는 행을 "수정"하는 경우에도 BEFORE INSERT 트리거가 실행됩니다.
+    //    (본인 번호를 그대로 다시 저장하면 "다른 회원이 사용 중"으로 막히던 버그 — 테스트로 발견)
+    why: "같은 휴대폰 번호로 중복 가입 금지 (검색용 해시로 비교, 본인 제외)",
+    sql: `CREATE TRIGGER "CustomerProfile_phone_unique_ins" BEFORE INSERT ON "CustomerProfile"
+WHEN NEW."phoneHash" IS NOT NULL AND EXISTS (SELECT 1 FROM "CustomerProfile" p WHERE p."phoneHash" = NEW."phoneHash" AND p."customerId" <> NEW."customerId")
+BEGIN ${raise("CustomerProfile_phone_unique", "이미 다른 회원이 사용 중인 휴대폰 번호입니다")} END;`,
+  },
+  {
+    table: "CustomerProfile",
+    name: "CustomerProfile_phone_unique_upd",
+    why: "위와 같음 (수정 시)",
+    sql: `CREATE TRIGGER "CustomerProfile_phone_unique_upd" BEFORE UPDATE OF "phoneHash" ON "CustomerProfile"
+WHEN NEW."phoneHash" IS NOT NULL AND EXISTS (SELECT 1 FROM "CustomerProfile" p WHERE p."phoneHash" = NEW."phoneHash" AND p."customerId" <> NEW."customerId")
+BEGIN ${raise("CustomerProfile_phone_unique", "이미 다른 회원이 사용 중인 휴대폰 번호입니다")} END;`,
+  },
+  {
+    table: "CustomerBodyProfile",
+    name: "CustomerBodyProfile_withdrawn",
+    why: "탈퇴 고객의 체형 정보 저장 금지",
+    sql: `CREATE TRIGGER "CustomerBodyProfile_withdrawn" BEFORE INSERT ON "CustomerBodyProfile"
+WHEN ${customerStatusOf("customerId")} = 'WITHDRAWN'
+BEGIN ${raise("CustomerBodyProfile_withdrawn", "탈퇴한 고객의 체형 정보는 저장할 수 없습니다")} END;`,
+  },
+
+  // --- 배송지: 기본 배송지 1개, 최대 20개, 탈퇴 고객 금지
+  {
+    table: "CustomerAddress",
+    name: "CustomerAddress_insert_guard",
+    why: "탈퇴 고객 금지, 배송지 최대 20개, 기본 배송지는 1개",
+    sql: `CREATE TRIGGER "CustomerAddress_insert_guard" BEFORE INSERT ON "CustomerAddress"
+BEGIN
+SELECT CASE
+  WHEN ${customerStatusOf("customerId")} = 'WITHDRAWN'
+    THEN RAISE(ABORT, 'CustomerAddress_guard: 탈퇴한 고객의 배송지는 저장할 수 없습니다')
+  WHEN (SELECT count(*) FROM "CustomerAddress" a WHERE a."customerId" = NEW."customerId") >= 20
+    THEN RAISE(ABORT, 'CustomerAddress_guard: 배송지는 최대 20개까지 저장할 수 있습니다')
+  WHEN NEW."isDefault" = 1 AND EXISTS (SELECT 1 FROM "CustomerAddress" a WHERE a."customerId" = NEW."customerId" AND a."isDefault" = 1)
+    THEN RAISE(ABORT, 'CustomerAddress_default_one: 기본 배송지는 1개만 지정할 수 있습니다')
+END;
+END;`,
+  },
+  {
+    table: "CustomerAddress",
+    name: "CustomerAddress_default_one_upd",
+    why: "기본 배송지는 고객당 1개 (새 기본을 지정하려면 기존 기본을 먼저 해제)",
+    sql: `CREATE TRIGGER "CustomerAddress_default_one_upd" BEFORE UPDATE OF "isDefault", "customerId" ON "CustomerAddress"
+WHEN NEW."isDefault" = 1 AND EXISTS (SELECT 1 FROM "CustomerAddress" a WHERE a."customerId" = NEW."customerId" AND a."isDefault" = 1 AND a."id" <> NEW."id")
+BEGIN ${raise("CustomerAddress_default_one", "기본 배송지는 1개만 지정할 수 있습니다")} END;`,
+  },
+
+  // --- 탈퇴 신청
+  {
+    table: "CustomerWithdrawal",
+    name: "CustomerWithdrawal_open_one",
+    why: "진행 중인 탈퇴 신청은 고객당 1개",
+    sql: `CREATE TRIGGER "CustomerWithdrawal_open_one" BEFORE INSERT ON "CustomerWithdrawal"
+WHEN EXISTS (SELECT 1 FROM "CustomerWithdrawal" w WHERE w."customerId" = NEW."customerId" AND w."completedAt" IS NULL AND w."canceledAt" IS NULL)
+BEGIN ${raise("CustomerWithdrawal_open_one", "이미 진행 중인 탈퇴 신청이 있습니다")} END;`,
+  },
+  {
+    table: "CustomerWithdrawal",
+    name: "CustomerWithdrawal_immutable",
+    why: "신청 내용은 바꿀 수 없고, 완료·철회된 신청은 더 이상 바꿀 수 없음",
+    sql: `CREATE TRIGGER "CustomerWithdrawal_immutable" BEFORE UPDATE ON "CustomerWithdrawal"
+WHEN OLD."completedAt" IS NOT NULL OR OLD."canceledAt" IS NOT NULL
+  OR NEW."customerId" IS NOT OLD."customerId" OR NEW."requestedAt" IS NOT OLD."requestedAt"
+  OR NEW."scheduledAt" IS NOT OLD."scheduledAt" OR NEW."reasonCode" IS NOT OLD."reasonCode"
+BEGIN ${raise("CustomerWithdrawal_immutable", "탈퇴 신청 내용·처리 결과는 바꿀 수 없습니다")} END;`,
+  },
+  {
+    table: "CustomerWithdrawal",
+    name: "CustomerWithdrawal_no_delete",
+    why: "탈퇴 신청 기록 삭제 금지",
+    sql: `CREATE TRIGGER "CustomerWithdrawal_no_delete" BEFORE DELETE ON "CustomerWithdrawal"
+BEGIN ${raise("CustomerWithdrawal_no_delete", "탈퇴 신청 기록은 지울 수 없습니다")} END;`,
+  },
+
+  // --- 이력: 추가만 가능
+  ...appendOnly("CustomerStatusHistory"),
+  ...appendOnly("CustomerGradeHistory"),
+  {
+    table: "CustomerLoginHistory",
+    name: "CustomerLoginHistory_no_update",
+    why: "로그인 기록은 수정 금지",
+    sql: `CREATE TRIGGER "CustomerLoginHistory_no_update" BEFORE UPDATE ON "CustomerLoginHistory"
+BEGIN ${raise("CustomerLoginHistory_append_only", "로그인 기록은 수정할 수 없습니다")} END;`,
+  },
+  {
+    table: "CustomerLoginHistory",
+    name: "CustomerLoginHistory_retention",
+    why: "로그인 기록은 3개월(90일)이 지난 것만 삭제 가능 (통신비밀보호법 접속기록 보관)",
+    sql: `CREATE TRIGGER "CustomerLoginHistory_retention" BEFORE DELETE ON "CustomerLoginHistory"
+WHEN julianday(${NOW}) - julianday(OLD."loggedInAt") < 90
+BEGIN ${raise("CustomerLoginHistory_retention", "3개월이 지나지 않은 로그인 기록은 지울 수 없습니다")} END;`,
+  },
+
+  // --- 주문: 정상(ACTIVE) 고객만
+  {
+    table: "Order",
+    name: "Order_customer_active",
+    why: "탈퇴·탈퇴 신청·정지·휴면 고객은 새 주문 금지",
+    sql: `CREATE TRIGGER "Order_customer_active" BEFORE INSERT ON "Order"
+WHEN ${customerStatusOf("customerId")} IS NOT 'ACTIVE'
+BEGIN ${raise("Order_customer_active", "정상(ACTIVE) 상태의 고객만 주문할 수 있습니다")} END;`,
+  },
+];
+
 export const TRIGGERS: TriggerConstraint[] = [
   ...INVENTORY_TRIGGERS,
+  ...CUSTOMER_TRIGGERS,
   // ----- 판매 시작 검사 (⭐1)
   {
     table: "Style",

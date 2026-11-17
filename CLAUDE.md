@@ -68,6 +68,16 @@ Tests use Node's built-in runner via tsx (no extra framework). Also verify UI ch
 - `lib/checkout.ts`: `placeOrder` (validates, prices, releases the user's previous PENDING orders as SUPERSEDED, creates order + reservations in one transaction), `abandonOrder`, `confirmOrderPayment` (ensure → Toss confirm → finalize; if finalize fails after Toss approved it calls `cancelPayment` and marks the order CANCELED, or CANCEL_FAILED if the refund also failed). Deps are injectable for tests. `app/checkout/actions.ts` and the payment routes are thin wrappers; Toss `failUrl` is `/api/payments/fail` (releases the reservation, then redirects to `/checkout/fail`).
 - `Order.status` is still a free string (PENDING/PAID/CANCELED/CANCEL_FAILED) — to be formalized in the order step.
 
+## Customer (B안: login account User ≠ shop customer Customer)
+
+- `User`/`Account`/`Session` belong to Auth.js. `Customer` (1:1 via nullable unique `userId`) is the shop customer; **`Order.customerId` → Customer** (not User), so orders survive withdrawal. Always resolve the logged-in customer with `getCurrentCustomer()` (`lib/current-customer.ts`) — never `session.user.id` for shop data. `lib/customer.ts` must not import `@/auth` (auth.ts imports it → cycle).
+- Sign-up = first login: `auth.ts` events.signIn → `ensureCustomerForUser` (customer + empty profile + grade history; status history is written by trigger) + `recordLogin`. callbacks.signIn blocks SUSPENDED customers and re-joins within 30 days of withdrawal (`rejoinBlockHash` = HMAC of provider:providerAccountId) → `/login-blocked`.
+- PII (`CustomerProfile`, `CustomerAddress`) is AES-256-GCM encrypted via `lib/crypto.ts` (`v1:iv:tag:ct`; keys `CUSTOMER_ENC_KEY`, `CUSTOMER_HASH_KEY` in .env — 32-byte base64, **required in every environment incl. Vercel; losing the key = losing the data**). Phone/email lookups use HMAC blind indexes (`phoneHash`, `emailHash`); show only masked values (`maskName`/`maskPhone`...). CHECKs reject plaintext in encrypted columns; login IPs must be masked.
+- Status changes must also set `statusReason` + a new `statusChangedAt` (trigger enforces; another trigger writes `CustomerStatusHistory`). Allowed: ACTIVE↔DORMANT/SUSPENDED, →WITHDRAW_PENDING→(ACTIVE | WITHDRAWN). Grade changes require inserting `CustomerGradeHistory` first. Only ACTIVE customers can insert orders (trigger).
+- Withdrawal: `requestWithdrawal` (blocked while a RESERVED reservation exists) → 7-day grace (`cancelWithdrawal`) → `completeWithdrawal`/`processDueWithdrawals`: wipe profile PII, delete body profile + addresses, complete withdrawal + rejoin hash, set WITHDRAWN + userId null, then delete the User (Account/Session cascade). Customers are never deleted.
+- Prisma `upsert` on SQLite fires BEFORE INSERT triggers even when it updates — insert triggers must exclude the row's own key.
+- Jobs: `npm run customer:jobs -- withdrawals|dormant|grades|login-history|all` (cron after deploy). Pages: `/my` (profile masked, body, addresses, grade), `/my/withdraw`, `/login-blocked`. Tests: `tests/customer.test.ts` (temp DB), `tests/crypto.test.ts`. `tests/helpers/temp-db.ts` loads .env first.
+
 ## Architecture
 
 - **Data flow**: pages under `src/app` are async server components that query Prisma directly. Every page that reads the DB sets `export const dynamic = "force-dynamic"` so that DB changes show up without a rebuild.
@@ -98,5 +108,5 @@ Tests use Node's built-in runner via tsx (no extra framework). Also verify UI ch
   - Under `next start` (not dev, not Vercel), you must set `AUTH_TRUST_HOST=true`, or Auth.js throws UntrustedHost.
   - Server components call `auth()`. The `session` callback adds `session.user.id`.
   - When filtering by user, check that the id is defined first. A Prisma `where: { userId: undefined }` means no filter.
-  - To test logged-in pages without GitHub, insert `User` + `Session` rows and send the cookie `authjs.session-token=<token>`.
+  - To test logged-in pages without GitHub, insert `User` + `Session` rows (and call `ensureCustomerForUser`) and send the cookie `authjs.session-token=<token>`. Customers can't be deleted, so rebuild dev.db afterwards.
 - `src/lib/format.ts`: `formatPrice()` turns a price into a KRW string, e.g. `19,000원`.

@@ -141,6 +141,36 @@ const RULES: [string, string, "error" | "warn"][] = [
      WHERE ${SELLABLE_STYLE} AND k."status" = 'ON_SALE' AND NOT EXISTS (
        SELECT 1 FROM "InventoryBalance" b JOIN "InventoryLocation" loc ON loc."id" = b."locationId"
        WHERE b."skuId" = k."id" AND loc."isOnlineSellable" = 1 AND loc."isActive" = 1)`, "warn"],
+  ["고객: 탈퇴 고객은 개인정보·배송지·체형·로그인 계정이 모두 없음 (파기 확인)",
+    `SELECT c."customerNo" AS no FROM "Customer" c WHERE c."status" = 'WITHDRAWN' AND (
+       c."userId" IS NOT NULL
+       OR EXISTS (SELECT 1 FROM "CustomerProfile" p WHERE p."customerId" = c."id" AND (p."nameEnc" IS NOT NULL OR p."phoneEnc" IS NOT NULL OR p."phoneHash" IS NOT NULL OR p."birthDateEnc" IS NOT NULL OR p."birthMonth" IS NOT NULL OR p."contactEmailEnc" IS NOT NULL OR p."emailHash" IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM "CustomerAddress" a WHERE a."customerId" = c."id")
+       OR EXISTS (SELECT 1 FROM "CustomerBodyProfile" b WHERE b."customerId" = c."id"))`, "error"],
+  ["고객: 현재 상태 = 상태 이력의 마지막 상태",
+    `SELECT c."customerNo" AS no, c."status" AS status, h."toStatus" AS lastHistory FROM "Customer" c
+     LEFT JOIN "CustomerStatusHistory" h ON h."id" = (SELECT max(x."id") FROM "CustomerStatusHistory" x WHERE x."customerId" = c."id")
+     WHERE h."toStatus" IS NOT c."status"`, "error"],
+  ["고객: 현재 등급 = 등급 이력의 마지막 등급",
+    `SELECT c."customerNo" AS no FROM "Customer" c
+     LEFT JOIN "CustomerGradeHistory" h ON h."id" = (SELECT max(x."id") FROM "CustomerGradeHistory" x WHERE x."customerId" = c."id")
+     WHERE h."toGradeId" IS NOT c."gradeId"`, "error"],
+  ["고객: 탈퇴 신청 중(WITHDRAW_PENDING)이면 진행 중인 신청이 정확히 1개, 아니면 0개",
+    `SELECT c."customerNo" AS no, c."status" AS status, count(w."id") AS openRequests FROM "Customer" c
+     LEFT JOIN "CustomerWithdrawal" w ON w."customerId" = c."id" AND w."completedAt" IS NULL AND w."canceledAt" IS NULL
+     GROUP BY c."id" HAVING count(w."id") <> CASE WHEN c."status" = 'WITHDRAW_PENDING' THEN 1 ELSE 0 END`, "error"],
+  ["고객: 휴대폰 번호(해시) 중복 없음",
+    `SELECT "phoneHash" AS hash, count(*) AS n FROM "CustomerProfile" WHERE "phoneHash" IS NOT NULL GROUP BY "phoneHash" HAVING count(*) > 1`, "error"],
+  ["고객: 기본 배송지는 고객당 최대 1개",
+    `SELECT "customerId", count(*) AS n FROM "CustomerAddress" WHERE "isDefault" = 1 GROUP BY "customerId" HAVING count(*) > 1`, "error"],
+  ["고객: 배송지가 있으면 기본 배송지가 있음",
+    `SELECT "customerId" FROM "CustomerAddress" GROUP BY "customerId" HAVING max("isDefault") = 0`, "warn"],
+  ["고객: 로그인 계정(User)마다 고객이 있음 (없으면 로그인 이벤트 실패 → 다음 접속 때 자동 생성)",
+    `SELECT u."id" FROM "User" u LEFT JOIN "Customer" c ON c."userId" = u."id" WHERE c."id" IS NULL`, "warn"],
+  ["고객: 처리 예정일이 지난 탈퇴 신청 없음 (npm run customer:jobs -- withdrawals)",
+    `SELECT w."id" FROM "CustomerWithdrawal" w WHERE w."completedAt" IS NULL AND w."canceledAt" IS NULL AND w."scheduledAt" <= ${NOW}`, "warn"],
+  ["고객: 3개월 지난 로그인 기록 없음 (npm run customer:jobs -- login-history)",
+    `SELECT count(*) AS n FROM "CustomerLoginHistory" WHERE julianday(${NOW}) - julianday("loggedInAt") > 91 HAVING count(*) > 0`, "warn"],
   ["고시 품목군이 카테고리의 기본 품목군과 같음",
     `SELECT s."styleCode" AS code, n."noticeType" AS notice, c."noticeType" AS category FROM "StyleNotice" n JOIN "Style" s ON s."id" = n."styleId" JOIN "Category" c ON c."id" = s."categoryId"
      WHERE c."noticeType" IS NOT NULL AND n."noticeType" <> c."noticeType"`, "warn"],

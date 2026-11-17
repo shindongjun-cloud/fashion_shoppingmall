@@ -101,15 +101,15 @@ describe("값 범위 · 형식 (CHECK)", () => {
     rejects(`INSERT INTO "PricePromotionTarget" ("promotionId","targetType","mode","styleId","discountValueOverride","createdAt") VALUES (${ids.promo},'STYLE','EXCLUDE',${ids.jacket},10,${NOW})`, "PricePromotionTarget_override_ck"));
   test("주문 항목: 판매가 = 정가 − 할인", async () => {
     await rejects([
-      `INSERT INTO "User" (id, "createdAt", "updatedAt") VALUES ('t-user', ${NOW}, ${NOW})`,
-      `INSERT INTO "Order" (id, "paymentOrderId", "orderName", "totalPrice", status, "createdAt", "userId") VALUES (900001, 'order_t', 't', 1000, 'PENDING', ${NOW}, 't-user')`,
+      `INSERT INTO "Customer" (id, "customerNo", status, "gradeId", "joinChannel", "joinedAt", "statusReason", "statusChangedAt", "createdAt", "updatedAt") VALUES (900001, 'C9000000001', 'ACTIVE', (SELECT id FROM "CustomerGrade" WHERE code = 'WELCOME'), 'WEB', ${NOW}, 'SIGNUP', ${NOW}, ${NOW}, ${NOW})`,
+      `INSERT INTO "Order" (id, "paymentOrderId", "orderName", "totalPrice", status, "createdAt", "customerId") VALUES (900001, 'order_t', 't', 1000, 'PENDING', ${NOW}, 900001)`,
       `INSERT INTO "OrderItem" ("orderId","skuId",quantity,"listPrice","discountAmount",price,"styleCode","skuCode","styleName","colorName","sizeName") VALUES (900001, ${ids.sku}, 1, 10000, 1000, 5000, 'X','X','X','X','X')`,
     ], "OrderItem_price_math_ck");
   });
   test("주문 항목: 할인이 있으면 행사명 필수", async () => {
     await rejects([
-      `INSERT INTO "User" (id, "createdAt", "updatedAt") VALUES ('t-user', ${NOW}, ${NOW})`,
-      `INSERT INTO "Order" (id, "paymentOrderId", "orderName", "totalPrice", status, "createdAt", "userId") VALUES (900001, 'order_t', 't', 1000, 'PENDING', ${NOW}, 't-user')`,
+      `INSERT INTO "Customer" (id, "customerNo", status, "gradeId", "joinChannel", "joinedAt", "statusReason", "statusChangedAt", "createdAt", "updatedAt") VALUES (900001, 'C9000000001', 'ACTIVE', (SELECT id FROM "CustomerGrade" WHERE code = 'WELCOME'), 'WEB', ${NOW}, 'SIGNUP', ${NOW}, ${NOW}, ${NOW})`,
+      `INSERT INTO "Order" (id, "paymentOrderId", "orderName", "totalPrice", status, "createdAt", "customerId") VALUES (900001, 'order_t', 't', 1000, 'PENDING', ${NOW}, 900001)`,
       `INSERT INTO "OrderItem" ("orderId","skuId",quantity,"listPrice","discountAmount",price,"styleCode","skuCode","styleName","colorName","sizeName") VALUES (900001, ${ids.sku}, 1, 10000, 1000, 9000, 'X','X','X','X','X')`,
     ], "OrderItem_promotion_ck");
   });

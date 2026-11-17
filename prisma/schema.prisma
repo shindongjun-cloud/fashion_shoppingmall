@@ -813,6 +813,272 @@ model InventoryReservation {
   @@index([status, expiresAt]) // 만료 대상 찾기
 }
 
+// ===============================================================
+// 고객 도메인 (B안: 로그인 계정 User와 쇼핑몰 고객 Customer 분리)
+//
+//   User (Auth.js 로그인 계정) ──1:1── Customer (고객번호·상태·등급)
+//                                        ├─ CustomerProfile      개인정보 (AES-256-GCM 암호화)
+//                                        ├─ CustomerBodyProfile  체형 정보 (선택)
+//                                        ├─ CustomerAddress      배송지 N개 (암호화)
+//                                        ├─ CustomerStatusHistory 상태 이력 (트리거가 자동 기록)
+//                                        ├─ CustomerGradeHistory  등급 이력
+//                                        ├─ CustomerWithdrawal    탈퇴 신청·처리
+//                                        └─ CustomerLoginHistory  로그인 기록 (3개월 보관)
+//
+// 탈퇴: 신청 → 7일 유예(철회 가능) → 개인정보 익명화 + User 삭제. Customer와 주문은 남음(전자상거래법 5년 보관).
+// 개인정보 암호문 형식: "v1:<IV>:<인증태그>:<암호문>" (base64). 키는 .env의 CUSTOMER_ENC_KEY (lib/crypto.ts)
+// ===============================================================
+
+// 고객 상태
+enum CustomerStatus {
+  ACTIVE // 정상
+  DORMANT // 휴면 (1년 미접속. 분리 보관 의무는 2023.9 폐지 → 상태 표시만)
+  SUSPENDED // 이용 정지 (부정 이용)
+  WITHDRAW_PENDING // 탈퇴 신청 (7일 유예, 철회 가능)
+  WITHDRAWN // 탈퇴 완료 (익명화, 되돌릴 수 없음)
+}
+
+// 상태 변경 사유 (이력에 남음)
+enum CustomerStatusReason {
+  SIGNUP // 가입
+  LOGIN // 휴면 고객이 다시 로그인
+  INACTIVITY // 장기 미접속으로 휴면 전환
+  ABUSE // 부정 이용으로 정지
+  APPEAL // 정지 해제
+  WITHDRAW_REQUEST // 탈퇴 신청
+  WITHDRAW_CANCEL // 탈퇴 철회
+  WITHDRAW_COMPLETE // 탈퇴 완료
+  ADMIN // 관리자 처리
+}
+
+// 가입 경로
+enum JoinChannel {
+  WEB
+  APP
+  STORE // 매장 가입 (로그인 계정이 없을 수 있음)
+  IMPORT // 데이터 이전
+}
+
+// 고객 성별 (상품의 Gender와 별개: 고객은 밝히지 않을 수 있음)
+enum CustomerGender {
+  FEMALE
+  MALE
+  OTHER
+  UNDISCLOSED
+}
+
+// 탈퇴 사유
+enum WithdrawalReason {
+  LOW_USAGE // 이용 빈도 낮음
+  PRIVACY // 개인정보 우려
+  PRODUCT // 상품 불만
+  DELIVERY // 배송 불만
+  SERVICE // 서비스·응대 불만
+  REJOIN // 재가입 목적
+  OTHER
+}
+
+// 등급 변경 사유
+enum GradeChangeReason {
+  SIGNUP // 가입 시 기본 등급
+  PERIODIC // 정기 산정 (최근 12개월 구매 금액)
+  ADMIN // 관리자 조정
+}
+
+// 로그인 결과
+enum LoginResult {
+  SUCCESS
+  BLOCKED_SUSPENDED // 정지 회원 차단
+}
+
+// 쇼핑몰 고객
+model Customer {
+  id          Int            @id @default(autoincrement())
+  customerNo  String         @unique // C + 숫자 10자리 (외부 노출용. 순번이 아니라 무작위 → 다른 고객 번호 추측 방지)
+  userId      String?        @unique // 로그인 계정. 탈퇴하면 비움. 매장 가입 고객은 없을 수 있음
+  status      CustomerStatus @default(ACTIVE)
+  gradeId     Int // 현재 등급 (바꾸려면 등급 이력을 먼저 추가)
+  joinChannel JoinChannel    @default(WEB)
+  joinedAt    DateTime       @default(now())
+  lastLoginAt DateTime?
+  lastOrderAt DateTime? // 마지막 결제 완료 시각 (휴면·등급 산정 참고)
+
+  // 상태 변경 정보: 상태를 바꿀 때 함께 바꾸고, 트리거가 이 값으로 상태 이력을 남깁니다.
+  statusReason    CustomerStatusReason
+  statusMemo      String?
+  statusChangedBy String? // 처리자 (SYSTEM / 관리자)
+  statusChangedAt DateTime
+
+  dormantAt       DateTime? // 휴면 전환 시각
+  suspendedAt     DateTime? // 정지 시각
+  suspendedReason String?
+  withdrawnAt     DateTime? // 탈퇴 완료 시각
+  anonymizedAt    DateTime? // 개인정보 익명화 시각
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User?                   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  grade         CustomerGrade           @relation(fields: [gradeId], references: [id], onDelete: Restrict)
+  profile       CustomerProfile?
+  bodyProfile   CustomerBodyProfile?
+  addresses     CustomerAddress[]
+  statusHistory CustomerStatusHistory[]
+  gradeHistory  CustomerGradeHistory[]
+  withdrawals   CustomerWithdrawal[]
+  loginHistory  CustomerLoginHistory[]
+  orders        Order[]
+
+  @@index([status])
+  @@index([gradeId])
+  @@index([lastLoginAt]) // 휴면 대상 찾기
+}
+
+// 개인정보 (1:1, 암호화). 화면에는 마스킹해서 보여 줍니다 (홍*동, 010-****-5678)
+model CustomerProfile {
+  customerId      Int            @id
+  nameEnc         String? // 이름 암호문
+  phoneEnc        String? // 휴대폰 암호문
+  phoneHash       String? // 휴대폰 검색용 HMAC (블라인드 인덱스). 중복 가입 확인·전화번호로 찾기
+  birthDateEnc    String? // 생년월일 암호문 (YYYY-MM-DD)
+  birthMonth      Int? // 생일 월 (생일 쿠폰용, 평문. 월만으로는 개인 식별 불가)
+  gender          CustomerGender @default(UNDISCLOSED)
+  contactEmailEnc String? // 연락용 이메일 암호문 (로그인 이메일과 다를 수 있음)
+  emailHash       String? // 연락용 이메일 검색용 HMAC
+  updatedAt       DateTime       @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  @@index([phoneHash])
+  @@index([emailHash])
+}
+
+// 체형 정보 (1:1, 모두 선택). 사이즈 추천·리뷰의 "구매자 체형"에 사용
+model CustomerBodyProfile {
+  customerId    Int      @id
+  heightCm      Int?
+  weightKg      Int?
+  topSize       String? // 평소 상의 사이즈 (95, M ...)
+  bottomSize    String? // 평소 하의 사이즈 (30 ...)
+  shoeSizeMm    Int? // 평소 신발 사이즈 (270)
+  preferredFit  Fit? // 선호 핏
+  showInReviews Boolean  @default(false) // 리뷰에 체형 공개 동의 (기본 비공개)
+  updatedAt     DateTime @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+}
+
+// 배송지 (N개, 암호화). 주문에는 배송지 "스냅샷"을 복사하므로 주소록은 지워도 됨 (⑦ 주문 단계)
+model CustomerAddress {
+  id           Int       @id @default(autoincrement())
+  customerId   Int
+  label        String // 집 / 회사
+  recipientEnc String // 수령인 암호문
+  phoneEnc     String // 수령인 연락처 암호문
+  zipCode      String // 우편번호 5자리 (평문: 단독으로는 개인 식별 불가, 배송비 산정에 사용)
+  address1Enc  String // 기본 주소 암호문
+  address2Enc  String? // 상세 주소 암호문
+  deliveryMemo String? // 배송 요청 사항
+  isDefault    Boolean   @default(false) // 기본 배송지 (고객당 최대 1개, 트리거)
+  lastUsedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  @@index([customerId])
+}
+
+// 상태 변경 이력 (추가만 가능). Customer의 상태가 바뀌면 트리거가 자동으로 한 줄 추가
+model CustomerStatusHistory {
+  id         Int                  @id @default(autoincrement())
+  customerId Int
+  fromStatus CustomerStatus? // 가입 시 비어 있음
+  toStatus   CustomerStatus
+  reason     CustomerStatusReason
+  memo       String?
+  changedBy  String?
+  changedAt  DateTime
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  @@index([customerId, id])
+}
+
+// 탈퇴 신청·처리
+model CustomerWithdrawal {
+  id               Int              @id @default(autoincrement())
+  customerId       Int
+  reasonCode       WithdrawalReason
+  reasonText       String? // 직접 입력한 사유
+  requestedAt      DateTime
+  scheduledAt      DateTime // 처리 예정일 (신청 + 7일 이상). 이전에는 철회 가능
+  completedAt      DateTime? // 처리 완료 (익명화)
+  canceledAt       DateTime? // 철회
+  rejoinBlockHash  String? // 재가입 악용 방지: 로그인 계정(제공자+계정ID)의 HMAC. 개인정보 아님
+  rejoinBlockUntil DateTime? // 이 시각까지 같은 계정 재가입 제한 (완료 + 30일)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  @@index([customerId])
+  @@index([rejoinBlockHash])
+  @@index([scheduledAt]) // 처리 대상 찾기
+}
+
+// 회원 등급 마스터
+model CustomerGrade {
+  id          Int      @id @default(autoincrement())
+  code        String   @unique // WELCOME / SILVER / GOLD / VIP
+  name        String
+  minAmount   Int      @unique // 최근 12개월 결제 금액 기준 (원). 기준이 겹치지 않게 UNIQUE
+  pointRateBp Int // 포인트 적립률 (bp: 100 = 1%). ⑭ 포인트 단계에서 사용
+  sortOrder   Int      @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  customers   Customer[]
+  historyFrom CustomerGradeHistory[] @relation("GradeFrom")
+  historyTo   CustomerGradeHistory[] @relation("GradeTo")
+}
+
+// 등급 변경 이력 (추가만 가능)
+model CustomerGradeHistory {
+  id             Int               @id @default(autoincrement())
+  customerId     Int
+  fromGradeId    Int? // 가입 시 비어 있음
+  toGradeId      Int
+  reason         GradeChangeReason
+  purchaseAmount Int? // 산정에 쓴 결제 금액
+  periodFrom     DateTime? // 산정 기간
+  periodTo       DateTime?
+  changedBy      String?
+  changedAt      DateTime
+
+  customer  Customer       @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  fromGrade CustomerGrade? @relation("GradeFrom", fields: [fromGradeId], references: [id], onDelete: Restrict)
+  toGrade   CustomerGrade  @relation("GradeTo", fields: [toGradeId], references: [id], onDelete: Restrict)
+
+  @@index([customerId, id])
+}
+
+// 로그인 기록 (통신비밀보호법 접속기록 3개월 보관). 수정 금지, 3개월 지난 것만 삭제 가능
+model CustomerLoginHistory {
+  id         Int         @id @default(autoincrement())
+  customerId Int
+  provider   String // github
+  result     LoginResult
+  ipMasked   String? // 123.45.67.*  (마지막 자리 가림)
+  userAgent  String?
+  loggedInAt DateTime
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  @@index([customerId, loggedInAt])
+  @@index([loggedInAt]) // 3개월 지난 기록 정리
+}
+
 // 주문 (5단계 결제에서 사용)
 model Order {
   id             Int      @id @default(autoincrement())
@@ -822,11 +1088,13 @@ model Order {
   status         String   @default("PENDING") // PENDING(결제 대기) → PAID(결제 완료)
   paymentKey     String? // 결제 승인 후 토스가 준 결제 키 (환불할 때 필요)
   createdAt      DateTime @default(now())
-  userId         String // 주문한 사람
+  customerId     Int // 주문한 고객 (로그인 계정 User가 아니라 Customer를 가리킴 → 탈퇴해도 주문 기록은 남음)
 
-  user         User                   @relation(fields: [userId], references: [id])
+  customer     Customer               @relation(fields: [customerId], references: [id], onDelete: Restrict)
   items        OrderItem[]
   reservations InventoryReservation[]
+
+  @@index([customerId, createdAt])
 }
 
 // 주문 안의 상품 한 줄 (어떤 주문에, 어떤 SKU를, 몇 개)
@@ -876,7 +1144,7 @@ model User {
 
   accounts Account[]
   sessions Session[]
-  orders   Order[]
+  customer Customer? // 쇼핑몰 고객 (1:1). 탈퇴하면 이 User는 삭제되고 Customer는 익명화되어 남음
 }
 
 // 어떤 외부 서비스(GitHub 등) 계정으로 로그인했는지

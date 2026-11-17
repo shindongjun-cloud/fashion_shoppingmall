@@ -1,11 +1,11 @@
 // 주문 생성 → 결제 승인 흐름 (서버 전용)
 // 서버 액션(app/checkout/actions.ts)과 결제 승인 라우트(app/api/payments/confirm)가 이 파일을 씁니다.
-// 로그인 확인(auth)은 호출하는 쪽에서 하고, 여기서는 userId를 받습니다. → 테스트에서 직접 호출할 수 있음
+// 로그인 확인(auth)은 호출하는 쪽에서 하고, 여기서는 customerId(쇼핑몰 고객)를 받습니다. → 테스트에서 직접 호출할 수 있음
 import { randomUUID } from "crypto";
 import { prisma } from "@/lib/prisma";
 import { getCartSkus } from "@/lib/catalog";
 import { findQtyLimitViolation } from "@/lib/cart-rules";
-import { confirmOrder, ensureOrderReserved, InsufficientStockError, isBusyError, releaseOrder, reserveOrder, withBusyRetry } from "@/lib/inventory";
+import { confirmOrder, ensureOrderReserved, InsufficientStockError, isBusyError, isConstraintError, releaseOrder, reserveOrder, withBusyRetry } from "@/lib/inventory";
 import { cancelPayment, confirmPayment } from "@/lib/toss";
 
 export type PlaceOrderResult =
@@ -17,7 +17,7 @@ type CartLine = { skuId: number; quantity: number };
 // ---------------------------------------------------------------
 // 1) 주문 생성 + 재고 예약 (한 트랜잭션)
 // ---------------------------------------------------------------
-export async function placeOrder(userId: string, items: CartLine[], now = new Date()): Promise<PlaceOrderResult> {
+export async function placeOrder(customerId: number, items: CartLine[], now = new Date()): Promise<PlaceOrderResult> {
   // ⚠️ 브라우저에서 온 값은 사용자가 마음대로 바꿀 수 있으니 전부 검사합니다.
   const valid =
     Array.isArray(items) &&
@@ -59,7 +59,7 @@ export async function placeOrder(userId: string, items: CartLine[], now = new Da
     await withBusyRetry(() => prisma.$transaction(async (tx) => {
       // 같은 고객의 이전 "결제 대기" 주문이 잡고 있던 재고는 풉니다.
       // (결제하기를 여러 번 누르거나 결제창을 닫고 다시 시도하면 주문이 여러 개 생겨 재고를 계속 묶기 때문)
-      const previous = await tx.order.findMany({ where: { userId, status: "PENDING" }, select: { id: true } });
+      const previous = await tx.order.findMany({ where: { customerId, status: "PENDING" }, select: { id: true } });
       for (const p of previous) await releaseOrder(tx, p.id, "SUPERSEDED", now);
 
       const order = await tx.order.create({
@@ -67,7 +67,7 @@ export async function placeOrder(userId: string, items: CartLine[], now = new Da
           paymentOrderId,
           orderName,
           totalPrice: amount,
-          userId,
+          customerId,
           items: {
             create: lines.map(({ sku, quantity }) => ({
               skuId: sku.id,
@@ -91,6 +91,9 @@ export async function placeOrder(userId: string, items: CartLine[], now = new Da
       await reserveOrder(tx, order.id, lines.map(({ sku, quantity }) => ({ skuId: sku.id, qty: quantity })), now);
     }));
   } catch (e) {
+    if (isConstraintError(e, "Order_customer_active")) {
+      return { error: "주문할 수 없는 회원 상태예요. (탈퇴 신청·정지·휴면 회원)" };
+    }
     if (isBusyError(e)) {
       return { error: "주문이 몰려 처리하지 못했어요. 잠시 후 다시 시도해 주세요." };
     }
@@ -107,9 +110,9 @@ export async function placeOrder(userId: string, items: CartLine[], now = new Da
 // ---------------------------------------------------------------
 // 2) 결제를 진행하지 않기로 한 주문의 재고 풀기 (가격 변경으로 중단, 결제창 실패)
 // ---------------------------------------------------------------
-export async function abandonOrder(userId: string, paymentOrderId: string, reason: "PRICE_CHANGED" | "PAYMENT_FAILED") {
+export async function abandonOrder(customerId: number, paymentOrderId: string, reason: "PRICE_CHANGED" | "PAYMENT_FAILED") {
   const order = await prisma.order.findUnique({ where: { paymentOrderId } });
-  if (!order || order.userId !== userId || order.status !== "PENDING") return false;
+  if (!order || order.customerId !== customerId || order.status !== "PENDING") return false;
   await releaseOrder(prisma, order.id, reason);
   return true;
 }
@@ -132,7 +135,8 @@ async function defaultFinalize(orderId: number, paymentKey: string, now: Date) {
   await withBusyRetry(() =>
     prisma.$transaction(async (tx) => {
       await confirmOrder(tx, orderId, now); // 예약 확정 → 트리거가 판매 원장 생성, 실재고 감소
-      await tx.order.update({ where: { id: orderId }, data: { status: "PAID", paymentKey } });
+      const order = await tx.order.update({ where: { id: orderId }, data: { status: "PAID", paymentKey } });
+      await tx.customer.update({ where: { id: order.customerId }, data: { lastOrderAt: now } }); // 휴면·등급 산정 참고
     }),
   );
 }
@@ -142,11 +146,11 @@ export const defaultPaymentDeps: PaymentDeps = { confirmPayment, cancelPayment, 
 export type ConfirmResult = { ok: true; orderId: number } | { ok: false; message: string };
 
 export async function confirmOrderPayment(
-  input: { userId: string; paymentOrderId: string; paymentKey: string; amount: number },
+  input: { customerId: number; paymentOrderId: string; paymentKey: string; amount: number },
   deps: PaymentDeps = defaultPaymentDeps,
 ): Promise<ConfirmResult> {
   const order = await prisma.order.findUnique({ where: { paymentOrderId: input.paymentOrderId } });
-  if (!order || order.userId !== input.userId) return { ok: false, message: "주문을 찾을 수 없어요." };
+  if (!order || order.customerId !== input.customerId) return { ok: false, message: "주문을 찾을 수 없어요." };
   // 새로고침 등으로 다시 들어온 경우: 이미 완료된 주문 (토스에 다시 승인 요청하지 않음)
   if (order.status === "PAID") return { ok: true, orderId: order.id };
   if (order.status !== "PENDING") return { ok: false, message: "이미 취소된 주문이에요." };

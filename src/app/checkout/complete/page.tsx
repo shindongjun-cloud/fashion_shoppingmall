@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { auth } from "@/auth";
+import { getCurrentCustomer } from "@/lib/current-customer";
 import { prisma } from "@/lib/prisma";
 import { formatPrice } from "@/lib/format";
 import ClearCart from "@/components/ClearCart";
@@ -12,16 +12,15 @@ export default async function CompletePage({
   searchParams,
 }: PageProps<"/checkout/complete">) {
   const { orderId } = await searchParams;
-  const session = await auth();
-  const userId = session?.user?.id;
+  const customer = await getCurrentCustomer();
   const id = Number(orderId);
-  if (!userId || !Number.isInteger(id)) {
+  if (!customer || !Number.isInteger(id)) {
     notFound();
   }
 
   // 내 주문이고, 결제 완료된 주문만 보여줍니다.
   const order = await prisma.order.findFirst({
-    where: { id, userId, status: "PAID" },
+    where: { id, customerId: customer.id, status: "PAID" },
     include: { items: true }, // 상품 정보는 주문 항목의 스냅샷 컬럼에 있어서 상품 테이블을 조인하지 않습니다
   });
   if (!order) {

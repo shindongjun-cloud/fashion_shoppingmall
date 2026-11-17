@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { auth } from "@/auth";
+import { getCurrentCustomer } from "@/lib/current-customer";
 import { prisma } from "@/lib/prisma";
 import { formatDate, formatPrice } from "@/lib/format";
 
@@ -17,15 +18,15 @@ export default async function OrdersPage() {
   const session = await auth();
 
   // 로그인 안 했으면 로그인 페이지로 보내고, 로그인 후 이 페이지로 돌아옵니다.
-  // (id까지 확인: Prisma에서 userId가 undefined면 "조건 없음"이 되어 모든 주문이 나올 수 있어요)
-  const userId = session?.user?.id;
-  if (!userId) {
+  // (id까지 확인: Prisma에서 조건 값이 undefined면 "조건 없음"이 되어 모든 주문이 나올 수 있어요)
+  const customer = await getCurrentCustomer();
+  if (!customer) {
     redirect("/api/auth/signin?callbackUrl=/orders");
   }
 
-  // "내" 주문만 가져옵니다. (where: userId)
+  // "내" 주문만 가져옵니다. (where: customerId)
   const orders = await prisma.order.findMany({
-    where: { userId },
+    where: { customerId: customer.id },
     include: { items: true }, // 상품 정보는 주문 항목의 스냅샷 컬럼에 있어서 상품 테이블을 조인하지 않습니다
     orderBy: { createdAt: "desc" },
   });

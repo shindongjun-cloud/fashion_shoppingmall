@@ -18,6 +18,7 @@ import {
   reserveOrder,
 } from "../src/lib/inventory";
 import { abandonOrder, confirmOrderPayment, defaultPaymentDeps, placeOrder, type PaymentDeps } from "../src/lib/checkout";
+import { ensureCustomerForUser } from "../src/lib/customer";
 
 class Rollback extends Error {}
 const MIN = 60 * 1000;
@@ -47,7 +48,12 @@ async function rejects(sqls: string | string[], expected: string) {
 // ---------------------------------------------------------------
 let dc = 0; // 온라인 물류센터
 let returnCenter = 0;
-let userId = "";
+let customerId = 0;
+/** 새 고객 (로그인 계정 + 가입) */
+async function newCustomer(name: string) {
+  const user = await prisma.user.create({ data: { name } });
+  return (await ensureCustomerForUser(user.id)).id;
+}
 const skuIdOf = new Map<string, number>();
 const sku = (code: string) => skuIdOf.get(code)!;
 
@@ -71,10 +77,10 @@ async function setAvailable(code: string, n: number) {
 }
 let orderSeq = 0;
 /** 테스트용 결제 대기 주문 (주문 항목 포함, 예약은 따로) */
-async function makeOrder(items: { code: string; qty: number }[], owner = userId) {
+async function makeOrder(items: { code: string; qty: number }[], owner = customerId) {
   return prisma.order.create({
     data: {
-      paymentOrderId: `order_test_${++orderSeq}_${Date.now()}`, orderName: "테스트", totalPrice: 1000, userId: owner,
+      paymentOrderId: `order_test_${++orderSeq}_${Date.now()}`, orderName: "테스트", totalPrice: 1000, customerId: owner,
       items: { create: items.map((i) => ({ skuId: sku(i.code), quantity: i.qty, listPrice: 1000, discountAmount: 0, price: 1000, styleCode: "T", skuCode: i.code, styleName: "T", colorName: "T", sizeName: "T" })) },
     },
   });
@@ -84,7 +90,7 @@ before(async () => {
   dc = (await prisma.inventoryLocation.findUniqueOrThrow({ where: { code: "ONLINE_DC" } })).id;
   returnCenter = (await prisma.inventoryLocation.findUniqueOrThrow({ where: { code: "RETURN_CENTER" } })).id;
   for (const s of await prisma.sku.findMany({ select: { id: true, skuCode: true } })) skuIdOf.set(s.skuCode, s.id);
-  userId = (await prisma.user.create({ data: { name: "재고테스트", email: `inv-${Date.now()}@example.com` } })).id;
+  customerId = await newCustomer("재고테스트");
 });
 after(async () => {
   await prisma.$disconnect();
@@ -192,9 +198,9 @@ describe("동시 주문: 마지막 1개", () => {
     await setAvailable(CODE, 1);
     const otherDb = new PrismaClient({ adapter: new PrismaBetterSqlite3({ url: "file:" + TEMP_DB_PATH.split("\\").join("/") }) });
     try {
-      const buyers = await Promise.all([1, 2].map(() => prisma.user.create({ data: { name: "동시구매" } })));
+      const buyers = [await newCustomer("동시구매1"), await newCustomer("동시구매2")];
       // 두 번째 고객은 "다른 연결"에서 주문 (lib의 placeOrder는 기본 연결을 쓰므로 같은 로직을 다른 연결로 흉내)
-      const [o1, o2] = await Promise.all([makeOrder([{ code: CODE, qty: 1 }], buyers[0].id), makeOrder([{ code: CODE, qty: 1 }], buyers[1].id)]);
+      const [o1, o2] = await Promise.all([makeOrder([{ code: CODE, qty: 1 }], buyers[0]), makeOrder([{ code: CODE, qty: 1 }], buyers[1])]);
       const results = await Promise.allSettled([
         withBusyRetry(() => prisma.$transaction((tx) => reserveOrder(tx, o1.id, [{ skuId: sku(CODE), qty: 1 }]))),
         withBusyRetry(() => otherDb.$transaction((tx) => reserveOrder(tx, o2.id, [{ skuId: sku(CODE), qty: 1 }]))),
@@ -236,7 +242,7 @@ describe("주문 생성 (placeOrder)", () => {
 
   test("주문 생성 = 주문 + 항목 + 예약 (한 트랜잭션)", async () => {
     await setAvailable(CODE, 3);
-    const r = await placeOrder(userId, [{ skuId: sku(CODE), quantity: 2 }]);
+    const r = await placeOrder(customerId, [{ skuId: sku(CODE), quantity: 2 }]);
     assert.ok(!("error" in r), JSON.stringify(r));
     const order = await prisma.order.findUniqueOrThrow({ where: { paymentOrderId: r.paymentOrderId }, include: { reservations: true } });
     assert.equal(order.status, "PENDING");
@@ -247,9 +253,9 @@ describe("주문 생성 (placeOrder)", () => {
 
   test("같은 고객이 다시 주문하면 이전 결제 대기 주문의 예약은 풀림 (SUPERSEDED)", async () => {
     await setAvailable(CODE, 3);
-    const first = await placeOrder(userId, [{ skuId: sku(CODE), quantity: 2 }]);
+    const first = await placeOrder(customerId, [{ skuId: sku(CODE), quantity: 2 }]);
     assert.ok(!("error" in first));
-    const second = await placeOrder(userId, [{ skuId: sku(CODE), quantity: 2 }]);
+    const second = await placeOrder(customerId, [{ skuId: sku(CODE), quantity: 2 }]);
     assert.ok(!("error" in second), "이전 예약이 풀려서 다시 2개를 잡을 수 있어야 함");
     const firstOrder = await prisma.order.findUniqueOrThrow({ where: { paymentOrderId: first.paymentOrderId }, include: { reservations: true } });
     assert.equal(firstOrder.reservations[0].status, "RELEASED");
@@ -258,7 +264,7 @@ describe("주문 생성 (placeOrder)", () => {
 
   test("재고가 부족하면 주문 자체가 만들어지지 않음", async () => {
     await setAvailable(CODE, 1);
-    const otherUser = (await prisma.user.create({ data: { name: "다른고객" } })).id;
+    const otherUser = await newCustomer("다른고객");
     const before = await prisma.order.count();
     const r = await placeOrder(otherUser, [{ skuId: sku(CODE), quantity: 2 }]);
     assert.ok("error" in r && r.error.includes("재고가 부족"), JSON.stringify(r));
@@ -267,7 +273,7 @@ describe("주문 생성 (placeOrder)", () => {
 
   test("결제를 진행하지 않으면(abandonOrder) 예약이 바로 풀림", async () => {
     // 새 고객: 같은 고객이면 이전 결제 대기 주문의 예약이 SUPERSEDED로 풀려 수량 계산이 달라짐
-    const buyer = (await prisma.user.create({ data: { name: "이탈고객" } })).id;
+    const buyer = await newCustomer("이탈고객");
     await setAvailable(CODE, 2);
     const r = await placeOrder(buyer, [{ skuId: sku(CODE), quantity: 2 }]);
     assert.ok(!("error" in r));
@@ -278,9 +284,9 @@ describe("주문 생성 (placeOrder)", () => {
 
   test("다른 사람의 주문은 풀 수 없음", async () => {
     await setAvailable(CODE, 2);
-    const r = await placeOrder(userId, [{ skuId: sku(CODE), quantity: 1 }]);
+    const r = await placeOrder(customerId, [{ skuId: sku(CODE), quantity: 1 }]);
     assert.ok(!("error" in r));
-    assert.equal(await abandonOrder("someone-else", r.paymentOrderId, "PAYMENT_FAILED"), false);
+    assert.equal(await abandonOrder(-1, r.paymentOrderId, "PAYMENT_FAILED"), false);
   });
 });
 
@@ -306,11 +312,11 @@ describe("결제 승인 (confirmOrderPayment) — 토스는 가짜로 대체", (
   }
   async function newPendingOrder(qty = 1, now = new Date()) {
     // 같은 고객의 이전 주문 예약이 풀리지 않도록 테스트마다 새 고객 사용
-    const owner = (await prisma.user.create({ data: { name: "결제테스트" } })).id;
+    const owner = await newCustomer("결제테스트");
     const r = await placeOrder(owner, [{ skuId: sku(CODE), quantity: qty }], now);
     assert.ok(!("error" in r), JSON.stringify(r));
     const order = await prisma.order.findUniqueOrThrow({ where: { paymentOrderId: r.paymentOrderId } });
-    return { owner, order, input: { userId: owner, paymentOrderId: r.paymentOrderId, paymentKey: `pk_${order.id}`, amount: order.totalPrice } };
+    return { owner, order, input: { customerId: owner, paymentOrderId: r.paymentOrderId, paymentKey: `pk_${order.id}`, amount: order.totalPrice } };
   }
   const reservationsOf = (orderId: number) => prisma.inventoryReservation.findMany({ where: { orderId }, orderBy: { id: "asc" } });
 
