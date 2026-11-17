@@ -2,7 +2,8 @@
 import Link from "next/link";
 import type { Prisma } from "@/generated/prisma/client";
 import { formatPrice } from "@/lib/format";
-import { discountRate, GENDER_LABEL } from "@/lib/product-labels";
+import { GENDER_LABEL } from "@/lib/product-labels";
+import type { PriceInfo } from "@/lib/pricing";
 
 // 목록 페이지(app/page.tsx)에서 include로 읽어온 모양 그대로 받습니다.
 type CardStyle = Prisma.StyleGetPayload<{
@@ -19,7 +20,7 @@ type CardStyle = Prisma.StyleGetPayload<{
 }>;
 
 // 상품 카드: 대표 컬러 사진 + (마우스를 올리면) 착용 사진 + 컬러칩
-export default function ProductCard({ style }: { style: CardStyle }) {
+export default function ProductCard({ style, price }: { style: CardStyle; price: PriceInfo }) {
   const mainColor = style.colors[0];
   const mainImage = mainColor?.images.find((img) => img.type === "MAIN");
   const hoverImage = mainColor?.images.find((img) => img.type === "MODEL");
@@ -27,7 +28,7 @@ export default function ProductCard({ style }: { style: CardStyle }) {
   // 품절은 상태값이 아니라 재고로 계산합니다.
   const hasStock = (c: CardStyle["colors"][number]) => c.skus.some((s) => s.stock > 0);
   const soldOut = !style.colors.some(hasStock);
-  const rate = discountRate(style.listPrice, style.salePrice);
+  const rate = price.discountRate;
 
   return (
     <Link href={`/products/${style.styleCode}`} className="group block">
@@ -45,6 +46,12 @@ export default function ProductCard({ style }: { style: CardStyle }) {
             alt={hoverImage.alt}
             className="absolute inset-0 h-full w-full object-cover opacity-0 transition group-hover:opacity-100"
           />
+        )}
+        {/* 할인 행사 뱃지 (예: SEASON OFF) */}
+        {price.promotion?.badgeText && !soldOut && (
+          <span className="absolute left-2 top-2 rounded bg-red-600 px-2 py-0.5 text-xs font-bold tracking-wide text-white">
+            {price.promotion.badgeText}
+          </span>
         )}
         {soldOut && (
           <span className="absolute left-2 top-2 rounded bg-gray-900/80 px-2 py-0.5 text-xs font-medium text-white">
@@ -73,10 +80,10 @@ export default function ProductCard({ style }: { style: CardStyle }) {
         </h2>
         <p className="mt-1 text-sm">
           {rate > 0 && <span className="mr-1.5 font-bold text-red-600">{rate}%</span>}
-          <span className="font-bold text-gray-900">{formatPrice(style.salePrice)}</span>
+          <span className="font-bold text-gray-900">{formatPrice(price.salePrice)}</span>
           {rate > 0 && (
             <span className="ml-1.5 text-xs text-gray-400 line-through">
-              {formatPrice(style.listPrice)}
+              {formatPrice(price.listPrice)}
             </span>
           )}
         </p>

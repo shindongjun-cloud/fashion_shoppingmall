@@ -1,6 +1,7 @@
 // 상품(스타일/컬러/SKU)을 읽을 때 여러 페이지가 같이 쓰는 조건과 함수 모음 (서버 전용)
 import type { Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
+import { getPrices, type PriceInfo } from "@/lib/pricing";
 
 // ---------------------------------------------------------------
 // "고객에게 팔 수 있는 상품" 조건
@@ -54,11 +55,15 @@ export type CartSku = {
   colorName: string;
   colorHex: string;
   sizeName: string;
-  price: number; // 판매가
+  listPrice: number; // 정가
+  price: number; // 판매가 (정가 − 할인). lib/pricing.ts가 계산
+  discountAmount: number; // 1개당 할인액
+  promotionId: number | null; // 적용 중인 할인 행사
+  promotionName: string | null;
   maxQtyPerOrder: number | null; // 스타일 단위 1회 주문 최대 수량 (없으면 제한 없음)
   stock: number;
   imageUrl: string | null;
-  sellable: boolean; // 지금 주문 가능한지 (판매중지·숨김이면 false)
+  sellable: boolean; // 지금 주문 가능한지 (판매중지·숨김·정가 없음이면 false)
 };
 
 const cartSkuInclude = {
@@ -74,7 +79,7 @@ const cartSkuInclude = {
 
 type SkuWithRelations = Prisma.SkuGetPayload<{ include: typeof cartSkuInclude }>;
 
-function toCartSku(sku: SkuWithRelations, now: Date): CartSku {
+function toCartSku(sku: SkuWithRelations, priceInfo: PriceInfo | undefined, now: Date): CartSku {
   const { styleColor } = sku;
   const { style, color } = styleColor;
   return {
@@ -85,11 +90,16 @@ function toCartSku(sku: SkuWithRelations, now: Date): CartSku {
     colorName: styleColor.colorLabel ?? color.name,
     colorHex: color.hex,
     sizeName: sku.size.label,
-    price: style.salePrice,
+    listPrice: priceInfo?.listPrice ?? 0,
+    price: priceInfo?.salePrice ?? 0,
+    discountAmount: priceInfo?.discountAmount ?? 0,
+    promotionId: priceInfo?.promotion?.id ?? null,
+    promotionName: priceInfo?.promotion?.displayName ?? null,
     maxQtyPerOrder: style.maxQtyPerOrder,
     stock: sku.stock,
     imageUrl: styleColor.images[0]?.url ?? null,
     sellable:
+      priceInfo !== undefined && // 정가가 등록되지 않은 상품은 팔 수 없음
       sku.status === "ON_SALE" &&
       styleColor.status === "ON_SALE" &&
       styleColor.isDisplayed &&
@@ -105,5 +115,7 @@ export async function getCartSkus(ids?: number[]): Promise<CartSku[]> {
     where: ids ? { id: { in: ids } } : undefined,
     include: cartSkuInclude,
   });
-  return skus.map((sku) => toCartSku(sku, now));
+  // 가격은 스타일 단위로 한 번에 계산합니다 (같은 스타일의 SKU는 모두 같은 가격)
+  const prices = await getPrices(skus.map((sku) => sku.styleColor.styleId), now);
+  return skus.map((sku) => toCartSku(sku, prices.get(sku.styleColor.styleId), now));
 }

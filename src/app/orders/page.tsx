@@ -2,7 +2,7 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
-import { formatPrice } from "@/lib/format";
+import { formatDate, formatPrice } from "@/lib/format";
 
 // 내 주문 내역 (로그인한 사람만 볼 수 있는 페이지)
 export default async function OrdersPage() {
@@ -50,7 +50,7 @@ export default async function OrdersPage() {
               <div className="flex justify-between text-sm text-gray-500">
                 <span>
                   주문번호 {order.id} ·{" "}
-                  {order.createdAt.toLocaleDateString("ko-KR")}
+                  {formatDate(order.createdAt)}
                 </span>
                 <span>{order.status === "PAID" ? "결제 완료" : "결제 대기"}</span>
               </div>
@@ -58,6 +58,11 @@ export default async function OrdersPage() {
                 {order.items.map((item) => (
                   <li key={item.id}>
                     {item.styleName} ({item.colorName} / {item.sizeName}) × {item.quantity}
+                    {item.discountAmount > 0 && (
+                      <span className="ml-2 text-xs text-red-600">
+                        {item.promotionName} −{formatPrice(item.discountAmount * item.quantity)}
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>

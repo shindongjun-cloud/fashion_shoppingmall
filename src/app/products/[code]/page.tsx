@@ -3,10 +3,9 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
-import { formatPrice } from "@/lib/format";
+import { formatDate, formatDateTime, formatPrice } from "@/lib/format";
 import { sellableColorWhere, sellableStyleWhere } from "@/lib/catalog";
 import {
-  discountRate,
   FIT_SCALE,
   GENDER_LABEL,
   LINING_SCALE,
@@ -17,6 +16,7 @@ import {
   WEAR_SEASON_SCALE,
 } from "@/lib/product-labels";
 import SizeSelector from "@/components/SizeSelector";
+import { getPrices } from "@/lib/pricing";
 
 export const dynamic = "force-dynamic";
 
@@ -75,10 +75,16 @@ export default async function ProductPage({
     notFound();
   }
 
+  // 판매가 계산 (정가 + 지금 진행 중인 할인 행사). 정가가 없으면 팔 수 없는 상품
+  const price = (await getPrices([style.id])).get(style.id);
+  if (!price) {
+    notFound();
+  }
+
   // 주소의 ?color=BE 와 맞는 컬러를 고르고, 없으면 대표 컬러(0번)
   const selected =
     style.colors.find((c) => c.color.code === colorParam) ?? style.colors[0];
-  const rate = discountRate(style.listPrice, style.salePrice);
+  const rate = price.discountRate;
 
   // 실측표: 데이터가 있는 항목만 열로, 사이즈는 정렬 순서대로 행으로
   const measureColumns = MEASURE_ITEMS.filter((item) =>
@@ -143,18 +149,33 @@ export default async function ProductPage({
           <div className="mt-4 flex items-baseline gap-2">
             {rate > 0 && <span className="text-xl font-bold text-red-600">{rate}%</span>}
             <span className="text-2xl font-bold text-gray-900">
-              {formatPrice(style.salePrice)}
+              {formatPrice(price.salePrice)}
             </span>
             {rate > 0 && (
-              <span className="text-gray-400 line-through">{formatPrice(style.listPrice)}</span>
+              <span className="text-gray-400 line-through">{formatPrice(price.listPrice)}</span>
             )}
           </div>
+
+          {/* 적용 중인 할인 행사 */}
+          {price.promotion && (
+            <p className="mt-2 flex flex-wrap items-center gap-2 text-sm">
+              <span className="rounded bg-red-50 px-2 py-0.5 font-medium text-red-700">
+                {price.promotion.displayName}
+              </span>
+              <span className="text-gray-600">{formatPrice(price.discountAmount)} 할인</span>
+              {price.promotion.showEndDate && (
+                <span className="text-gray-400">
+                  ~{formatDateTime(price.promotion.endAt)} 종료
+                </span>
+              )}
+            </p>
+          )}
 
           {(style.preorderShipDate || style.maxQtyPerOrder) && (
             <ul className="mt-3 space-y-1 text-sm">
               {style.preorderShipDate && (
                 <li className="text-blue-700">
-                  예약 판매 · {style.preorderShipDate.toLocaleDateString("ko-KR")}부터 순차 출고
+                  예약 판매 · {formatDate(style.preorderShipDate)}부터 순차 출고
                 </li>
               )}
               {style.maxQtyPerOrder && (

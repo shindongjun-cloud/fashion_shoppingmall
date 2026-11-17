@@ -42,6 +42,11 @@ export default async function CompletePage({
           <li key={item.id} className="flex justify-between py-1 text-gray-800">
             <span>
               {item.styleName} ({item.colorName} / {item.sizeName}) × {item.quantity}
+                    {item.discountAmount > 0 && (
+                      <span className="ml-2 text-xs text-red-600">
+                        {item.promotionName} −{formatPrice(item.discountAmount * item.quantity)}
+                      </span>
+                    )}
             </span>
             <span>{formatPrice(item.price * item.quantity)}</span>
           </li>

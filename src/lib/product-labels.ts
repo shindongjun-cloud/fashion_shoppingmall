@@ -55,9 +55,3 @@ export const MEASURE_ITEMS: { value: MeasureItem; label: string }[] = [
   { value: "DEPTH", label: "깊이" },
   { value: "LENGTH", label: "총장" },
 ];
-
-// 정가 대비 할인율(%). 소수점은 버립니다. 259,000 → 199,000 이면 23%
-export function discountRate(listPrice: number, salePrice: number) {
-  if (listPrice <= 0 || salePrice >= listPrice) return 0;
-  return Math.floor(((listPrice - salePrice) / listPrice) * 100);
-}

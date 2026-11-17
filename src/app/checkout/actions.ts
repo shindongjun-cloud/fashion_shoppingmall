@@ -66,6 +66,8 @@ export async function createOrder(items: CartItem[]): Promise<CreateOrderResult>
   }
 
   // ⚠️ 금액은 반드시 서버에서, DB에 있는 가격으로 계산합니다.
+  //    sku.price는 getCartSkus()가 "지금 이 순간" 기준으로 정가와 할인 행사를 다시 계산한 값입니다.
+  //    (장바구니에 담은 뒤 행사가 끝났다면 끝난 가격으로 결제됩니다)
   //    (브라우저가 보낸 금액을 믿으면 100원짜리로 바꿔서 결제하는 조작이 가능해요)
   const amount = orderItems.reduce(
     (sum, { sku, quantity }) => sum + sku.price * quantity,
@@ -92,7 +94,11 @@ export async function createOrder(items: CartItem[]): Promise<CreateOrderResult>
         create: orderItems.map(({ sku, quantity }) => ({
           skuId: sku.id,
           quantity,
+          listPrice: sku.listPrice,
+          discountAmount: sku.discountAmount,
           price: sku.price,
+          promotionId: sku.promotionId,
+          promotionName: sku.promotionName,
           styleCode: sku.styleCode,
           skuCode: sku.skuCode,
           styleName: sku.styleName,

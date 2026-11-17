@@ -76,6 +76,17 @@ export default function CheckoutView({
       return;
     }
 
+    // 화면을 연 뒤 할인 행사가 끝나거나 시작되면, 화면 금액과 서버가 계산한 결제 금액이 달라집니다.
+    // 고객이 본 금액과 다른 금액으로 결제창을 띄우면 안 되므로 멈추고 알려 줍니다.
+    // (이 주문은 결제 대기(PENDING)로 남고, 결제되지 않은 주문이라 문제없습니다)
+    if (order.amount !== total) {
+      setError(
+        `그 사이 가격이 바뀌었어요 (${formatPrice(total)} → ${formatPrice(order.amount)}). 새로고침해서 바뀐 금액을 확인해 주세요.`,
+      );
+      setPaying(false);
+      return;
+    }
+
     try {
       await widgets.setAmount({ currency: "KRW", value: order.amount });
       // 결제창이 뜨고, 결제가 끝나면 successUrl 또는 failUrl로 이동합니다.

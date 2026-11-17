@@ -4,6 +4,8 @@
 import "dotenv/config";
 import { prisma } from "../src/lib/prisma";
 import type {
+  Prisma,
+  PriceChangeReason,
   CareCategory,
   Fit,
   Gender,
@@ -129,8 +131,7 @@ type StyleSeed = {
   season: string; // 시즌 code
   sizeGroup: string; // 사이즈 체계 code
   icon: string; // 이미지 대체 아이콘
-  listPrice: number;
-  salePrice: number;
+  listPrice: number; // 현재 정가 → StylePrice로 들어갑니다 (판매가는 할인 행사로 계산)
   fit?: Fit;
   thickness?: Level3;
   stretch?: Level3;
@@ -159,7 +160,7 @@ const styles: StyleSeed[] = [
     description:
       "탄탄한 울 블렌드 원단으로 형태감을 살린 싱글 브레스티드 자켓입니다. 어깨에 패드를 최소화해 자연스러운 실루엣을 만들었고, 슬랙스나 데님 어디에나 잘 어울립니다.",
     gender: "MEN", category: "OUTER_JACKET", season: "26FW", sizeGroup: "TOP_KR", icon: "🧥",
-    listPrice: 259000, salePrice: 259000,
+    listPrice: 259000,
     fit: "REGULAR", thickness: "MEDIUM", stretch: "LOW", sheerness: "LOW", lining: "FULL",
     releasedAt: "2026-11-10",
     colors: [
@@ -187,7 +188,7 @@ const styles: StyleSeed[] = [
     description:
       "도톰한 코튼 옥스포드 원단에 버튼다운 칼라를 더한 기본 셔츠입니다. 단독으로도, 니트나 자켓 안에 레이어드해도 좋습니다.",
     gender: "UNISEX", category: "TOP_SHIRT", season: "26SS", sizeGroup: "TOP_ALPHA", icon: "👔",
-    listPrice: 79000, salePrice: 69000,
+    listPrice: 79000,
     fit: "RELAXED", thickness: "MEDIUM", stretch: "LOW", sheerness: "LOW", lining: "NONE",
     releasedAt: "2026-03-02",
     colors: [
@@ -216,7 +217,7 @@ const styles: StyleSeed[] = [
     description:
       "가볍고 보온성이 좋은 램스울 100%로 짠 크루넥 니트입니다. 몸에 붙지 않는 적당한 품으로 셔츠 위에 겹쳐 입기 좋습니다.",
     gender: "WOMEN", category: "TOP_KNIT", season: "26FW", sizeGroup: "TOP_ALPHA", icon: "🧶",
-    listPrice: 129000, salePrice: 99000,
+    listPrice: 129000,
     fit: "REGULAR", thickness: "MEDIUM", stretch: "MEDIUM", sheerness: "LOW", lining: "NONE",
     releasedAt: "2026-10-20",
     colors: [
@@ -245,7 +246,7 @@ const styles: StyleSeed[] = [
     description:
       "허리에 원턱 주름을 넣어 허벅지부터 밑단까지 여유 있게 떨어지는 와이드 슬랙스입니다. 뒷허리 밴딩으로 편하게 입을 수 있습니다.",
     gender: "MEN", category: "BOTTOM_PANTS", season: "26FW", sizeGroup: "BOTTOM_INCH", icon: "👖",
-    listPrice: 89000, salePrice: 89000,
+    listPrice: 89000,
     fit: "RELAXED", thickness: "MEDIUM", stretch: "MEDIUM", sheerness: "LOW", lining: "NONE",
     releasedAt: "2026-09-15",
     colors: [
@@ -275,7 +276,7 @@ const styles: StyleSeed[] = [
     description:
       "부드러운 소가죽 어퍼에 쿠션 인솔을 넣은 미니멀 코트 스니커즈입니다. 정사이즈로 제작되었으며 발볼이 넓다면 반 사이즈 업을 추천합니다.",
     gender: "UNISEX", category: "SHOES_SNEAKERS", season: "26SS", sizeGroup: "SHOES_MM", icon: "👟",
-    listPrice: 169000, salePrice: 149000,
+    listPrice: 169000,
     releasedAt: "2026-04-01",
     colors: [
       { code: "WH", stock: [4, 8, 10, 6, 3] },
@@ -297,7 +298,7 @@ const styles: StyleSeed[] = [
     description:
       "워싱 가공한 코튼 트윌로 만든 6패널 볼캡입니다. 뒤쪽 스트랩으로 머리둘레를 조절할 수 있습니다.",
     gender: "UNISEX", category: "ACC_CAP", season: "26SS", sizeGroup: "FREE", icon: "🧢",
-    listPrice: 45000, salePrice: 45000,
+    listPrice: 45000,
     releasedAt: "2026-05-10",
     colors: [
       { code: "BK", stock: [20] },
@@ -322,6 +323,12 @@ const imageShots: { type: ImageType; label: string }[] = [
   { type: "MODEL", label: "MODEL" },
   { type: "DETAIL", label: "DETAIL" },
 ];
+// "2026-09-01" 같은 날짜만 있는 문자열을 한국 시각 0시로 바꿉니다.
+// ⚠️ new Date("2026-09-01")은 UTC 0시 = 한국 오전 9시라서, 가격 변경이 9시간 늦게 적용되는 버그가 생깁니다.
+function kst(date: string) {
+  return new Date(`${date}T00:00:00+09:00`);
+}
+
 function placeholderUrl(hex: string, icon: string, text: string) {
   const params = new URLSearchParams({ bg: hex.replace("#", ""), icon, text });
   return `/api/placeholder?${params.toString()}`;
@@ -330,7 +337,7 @@ function placeholderUrl(hex: string, icon: string, text: string) {
 // ---------------------------------------------------------------
 // 3) 실행
 // ---------------------------------------------------------------
-async function main() {
+async function seedProducts() {
   const count = await prisma.style.count();
   if (count > 0) {
     console.log(`이미 스타일 ${count}개가 있어서 건너뜁니다.`);
@@ -346,21 +353,18 @@ async function main() {
       seasonIds.set(s.code, row.id);
     }
 
-    // 카테고리 트리: 부모를 먼저 만들고 id를 받은 뒤 path를 채웁니다.
+    // 카테고리 트리: 부모를 먼저 만들어야 자식이 부모 id를 가리킬 수 있습니다.
+    // path("/1/4/")와 depth는 넣지 않습니다. DB 트리거(Category_path_fill)가 부모를 보고 자동으로 계산합니다.
     const categoryIds = new Map<string, number>();
     for (const [i, root] of categoryTree.entries()) {
       const parent = await tx.category.create({
-        data: { code: root.code, name: root.name, noticeType: root.noticeType, path: "", depth: 1, sortOrder: i },
+        data: { code: root.code, name: root.name, noticeType: root.noticeType, sortOrder: i },
       });
-      await tx.category.update({ where: { id: parent.id }, data: { path: `/${parent.id}/` } });
+      categoryIds.set(root.code, parent.id);
       for (const [j, child] of root.children.entries()) {
         const row = await tx.category.create({
-          data: {
-            code: child.code, name: child.name, noticeType: root.noticeType,
-            parentId: parent.id, path: "", depth: 2, sortOrder: j,
-          },
+          data: { code: child.code, name: child.name, noticeType: root.noticeType, parentId: parent.id, sortOrder: j },
         });
-        await tx.category.update({ where: { id: row.id }, data: { path: `/${parent.id}/${row.id}/` } });
         categoryIds.set(child.code, row.id);
       }
     }
@@ -423,16 +427,16 @@ async function main() {
           maxQtyPerOrder: s.maxQtyPerOrder,
           metaTitle: `${s.name} | 마이샵 공식몰`,
           metaDescription: s.summary,
-          listPrice: s.listPrice,
-          salePrice: s.salePrice,
           fit: s.fit,
           thickness: s.thickness,
           stretch: s.stretch,
           sheerness: s.sheerness,
           lining: s.lining,
-          status: "ON_SALE",
+          // 처음부터 ON_SALE로 등록할 수 없습니다(DB 트리거 Style_sale_ready_ins).
+          // DRAFT로 등록 → 컬러·SKU·이미지·고시·정가를 채운 뒤 openSales()에서 판매 시작
+          status: "DRAFT",
           isDisplayed: true,
-          releasedAt: new Date(s.releasedAt),
+          releasedAt: kst(s.releasedAt),
         },
       });
 
@@ -561,6 +565,181 @@ async function main() {
     prisma.sku.count(),
   ]);
   console.log(`스타일 ${styleCount}개, 컬러 ${colorCount}개, SKU ${skuCount}개를 추가했습니다.`);
+}
+
+// ---------------------------------------------------------------
+// 4) 가격: 정가 이력 + 할인 행사
+// ---------------------------------------------------------------
+const DAY = 24 * 60 * 60 * 1000;
+
+type PriceRow = { listPrice: number; from: Date; to?: Date; reason: PriceChangeReason; memo: string };
+
+// 정가 이력 (SCD Type 2). to가 없으면 현재 가격
+// 셔츠: 원가 인상으로 정가가 바뀐 이력 / 자켓: 미래에 바뀔 가격을 미리 등록해 둔 예
+function priceHistoryFor(styleCode: string, listPrice: number, releasedAt: string, now: Date): PriceRow[] {
+  if (styleCode === "SH26S002") {
+    return [
+      { listPrice: 75000, from: kst(releasedAt), to: kst("2026-09-01"), reason: "INITIAL", memo: "최초 출시 가격" },
+      { listPrice, from: kst("2026-09-01"), reason: "COST_CHANGE", memo: "옥스포드 원단 단가 6% 인상 반영" },
+    ];
+  }
+  if (styleCode === "JK26F001") {
+    const repriceAt = new Date(now.getTime() + 45 * DAY);
+    return [
+      { listPrice, from: kst(releasedAt), to: repriceAt, reason: "INITIAL", memo: "최초 출시 가격" },
+      { listPrice: 269000, from: repriceAt, reason: "REPRICE", memo: "27SS 가격 재책정 (미리 예약 등록)" },
+    ];
+  }
+  return [{ listPrice, from: kst(releasedAt), reason: "INITIAL", memo: "최초 출시 가격" }];
+}
+
+async function seedPricing() {
+  const count = await prisma.pricePromotion.count();
+  if (count > 0) {
+    console.log(`이미 할인 행사 ${count}개가 있어서 가격 데이터는 건너뜁니다.`);
+    return;
+  }
+
+  // 행사 기간은 "seed를 실행한 시각" 기준으로 잡습니다.
+  // (고정 날짜로 넣으면 며칠 뒤에는 전부 끝난 행사가 되어 동작을 확인할 수 없음)
+  const now = new Date();
+  const at = (days: number) => new Date(now.getTime() + days * DAY);
+
+  await prisma.$transaction(async (tx) => {
+    const styleRows = await tx.style.findMany({ select: { id: true, styleCode: true } });
+    const styleId = (code: string) => styleRows.find((r) => r.styleCode === code)!.id;
+    const categoryId = async (code: string) => (await tx.category.findUniqueOrThrow({ where: { code } })).id;
+    const seasonId = async (code: string) => (await tx.season.findUniqueOrThrow({ where: { code } })).id;
+
+    // 정가 이력: 샘플 기준으로 다시 만듭니다.
+    // (마이그레이션이 기존 정가를 1행씩 복사해 두었는데, 이를 이력이 있는 샘플로 교체)
+    await tx.stylePrice.deleteMany();
+    for (const s of styles) {
+      for (const row of priceHistoryFor(s.styleCode, s.listPrice, s.releasedAt, now)) {
+        await tx.stylePrice.create({
+          data: {
+            styleId: styleId(s.styleCode),
+            listPrice: row.listPrice,
+            validFrom: row.from,
+            validTo: row.to ?? null,
+            reason: row.reason,
+            memo: row.memo,
+            changedBy: "seed",
+          },
+        });
+      }
+    }
+
+    // 할인 행사: 진행 중 / 예정 / 종료 / 작성 중 / 일시 중지를 모두 만들어 동작을 확인합니다.
+    const promotions: Prisma.PricePromotionCreateInput[] = [
+      {
+        code: "SS26_SEASON_OFF", name: "26SS 시즌오프", displayName: "시즌오프",
+        description: "26SS 전 품목 40%, 상품당 최대 3만원. 스니커즈는 베스트셀러라 제외",
+        discountType: "RATE", discountValue: 40, maxDiscountAmount: 30000,
+        startAt: at(-7), endAt: at(30), status: "APPROVED", priority: 10,
+        badgeText: "SEASON OFF", approvedBy: "seed", approvedAt: at(-8),
+        targets: { create: [
+          { targetType: "SEASON", mode: "INCLUDE", season: { connect: { id: await seasonId("26SS") } } },
+          { targetType: "STYLE", mode: "EXCLUDE", style: { connect: { id: styleId("SN26S005") } } },
+        ] },
+      },
+      {
+        code: "KNIT_WEEK_2611", name: "11월 니트 위크", displayName: "니트 위크",
+        discountType: "RATE", discountValue: 20,
+        startAt: at(-2), endAt: at(5), status: "APPROVED", priority: 5,
+        badgeText: "KNIT WEEK", showEndDate: true, approvedBy: "seed", approvedAt: at(-3),
+        targets: { create: [
+          { targetType: "CATEGORY", mode: "INCLUDE", category: { connect: { id: await categoryId("TOP_KNIT") } } },
+        ] },
+      },
+      {
+        code: "TOP_DAILY_2611", name: "상의 데일리 특가", displayName: "데일리 특가",
+        description: "상의 전체 10%. 다른 행사와 겹치면 할인이 더 큰 쪽이 적용됨",
+        discountType: "RATE", discountValue: 10,
+        startAt: at(-3), endAt: at(10), status: "APPROVED", priority: 1,
+        approvedBy: "seed", approvedAt: at(-4),
+        targets: { create: [
+          { targetType: "CATEGORY", mode: "INCLUDE", category: { connect: { id: await categoryId("TOP") } } },
+        ] },
+      },
+      {
+        code: "SNEAKERS_139", name: "레더 스니커즈 균일가", displayName: "스니커즈 특가",
+        discountType: "FIXED_PRICE", discountValue: 139000, roundingUnit: 1000,
+        startAt: at(-1), endAt: at(3), status: "APPROVED", priority: 5,
+        badgeText: "SPECIAL PRICE", showEndDate: true, approvedBy: "seed", approvedAt: at(-2),
+        targets: { create: [
+          { targetType: "STYLE", mode: "INCLUDE", style: { connect: { id: styleId("SN26S005") } } },
+        ] },
+      },
+      {
+        code: "BLACK_FRIDAY_2026", name: "2026 블랙프라이데이", displayName: "블랙프라이데이",
+        description: "전체 30%(최대 5만원), 아우터는 35%. 신상 자켓은 제외. 예정된 행사",
+        discountType: "RATE", discountValue: 30, maxDiscountAmount: 50000,
+        startAt: at(8), endAt: at(14), status: "APPROVED", priority: 20,
+        badgeText: "BLACK FRIDAY", showEndDate: true, approvedBy: "seed", approvedAt: at(-1),
+        targets: { create: [
+          { targetType: "ALL", mode: "INCLUDE" },
+          { targetType: "CATEGORY", mode: "INCLUDE", category: { connect: { id: await categoryId("OUTER") } }, discountValueOverride: 35 },
+          { targetType: "STYLE", mode: "EXCLUDE", style: { connect: { id: styleId("JK26F001") } } },
+        ] },
+      },
+      {
+        code: "FW_OUTER_PREVIEW", name: "가을 아우터 프리뷰", displayName: "아우터 프리뷰",
+        description: "이미 끝난 행사 (기간 종료)",
+        discountType: "AMOUNT", discountValue: 20000,
+        startAt: at(-30), endAt: at(-10), status: "APPROVED",
+        approvedBy: "seed", approvedAt: at(-31),
+        targets: { create: [
+          { targetType: "CATEGORY", mode: "INCLUDE", category: { connect: { id: await categoryId("OUTER") } } },
+        ] },
+      },
+      {
+        code: "YEAR_END_2026", name: "연말 감사제 (기획 중)", displayName: "연말 감사제",
+        description: "작성 중이라 적용되지 않음",
+        discountType: "RATE", discountValue: 15,
+        startAt: at(30), endAt: at(40), status: "DRAFT",
+        targets: { create: [{ targetType: "ALL", mode: "INCLUDE" }] },
+      },
+      {
+        code: "PANTS_50_ERROR", name: "슬랙스 50% (가격 오류로 중지)", displayName: "슬랙스 특가",
+        description: "50%로 잘못 등록되어 긴급 일시 중지. 기간 안이지만 적용되지 않음",
+        discountType: "RATE", discountValue: 50,
+        startAt: at(-1), endAt: at(5), status: "PAUSED",
+        approvedBy: "seed", approvedAt: at(-1),
+        targets: { create: [
+          { targetType: "STYLE", mode: "INCLUDE", style: { connect: { id: styleId("PT26F004") } } },
+        ] },
+      },
+    ];
+    for (const data of promotions) {
+      await tx.pricePromotion.create({ data: { ...data, createdBy: "seed" } });
+    }
+  });
+
+  const [priceCount, promoCount] = await Promise.all([
+    prisma.stylePrice.count(),
+    prisma.pricePromotion.count(),
+  ]);
+  console.log(`정가 이력 ${priceCount}행, 할인 행사 ${promoCount}개를 추가했습니다.`);
+}
+
+// 상품을 먼저 넣고, 가격(정가 이력·행사)을 이어서 넣습니다.
+// 각각 "이미 있으면 건너뛰기"라서 여러 번 실행해도 중복되지 않습니다.
+// 판매 시작: DRAFT → ON_SALE
+// 이 순간 DB 트리거(Style_sale_ready_upd)가 정가·고시·판매 컬러·SKU·대표 이미지·혼용률 합계를 검사합니다.
+// 하나라도 빠지면 어떤 정보가 없는지 알려 주며 거부합니다.
+async function openSales() {
+  const opened = await prisma.style.updateMany({
+    where: { status: "DRAFT", styleCode: { in: styles.map((s) => s.styleCode) } },
+    data: { status: "ON_SALE" },
+  });
+  if (opened.count > 0) console.log(`스타일 ${opened.count}개 판매를 시작했습니다.`);
+}
+
+async function main() {
+  await seedProducts();
+  await seedPricing(); // 정가가 있어야 판매를 시작할 수 있으므로 가격이 먼저
+  await openSales();
 }
 
 main()
