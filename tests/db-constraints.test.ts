@@ -70,8 +70,9 @@ after(() => prisma.$disconnect());
 const NOW = `'2026-11-17T00:00:00.000+00:00'`;
 
 describe("값 범위 · 형식 (CHECK)", () => {
-  test("재고 음수 금지", () => rejects(`UPDATE "Sku" SET stock = -5 WHERE id = ${ids.sku}`, "Sku_stock_ck"));
-  test("재고에 글자 금지 (SQLite는 INTEGER 칸에 글자도 넣어 줌)", () => rejects(`UPDATE "Sku" SET stock = 'abc' WHERE id = ${ids.sku}`, "Sku_stock_ck"));
+  // 재고는 Sku에서 InventoryBalance로 옮겨짐. onHand·reserved는 트리거가 먼저 막으므로 safetyStock으로 CHECK 확인
+  test("안전재고 음수 금지", () => rejects(`UPDATE "InventoryBalance" SET "safetyStock" = -5 WHERE "skuId" = ${ids.sku}`, "InventoryBalance_qty_ck"));
+  test("안전재고에 글자 금지 (SQLite는 INTEGER 칸에 글자도 넣어 줌)", () => rejects(`UPDATE "InventoryBalance" SET "safetyStock" = 'abc' WHERE "skuId" = ${ids.sku}`, "InventoryBalance_qty_ck"));
   test("enum에 없는 값 금지", () => rejects(`UPDATE "Style" SET status = 'HELLO' WHERE id = ${ids.jacket}`, "Style_status_enum_ck"));
   test("Boolean은 0/1만", () => rejects(`UPDATE "Style" SET "isDisplayed" = 2 WHERE id = ${ids.jacket}`, "Style_isDisplayed_bool_ck"));
   // (기존 자켓의 품번을 바꾸면 Style_code_fixed 트리거가 먼저 막으므로, 새 DRAFT 스타일로 확인)
@@ -120,7 +121,7 @@ describe("여러 행·여러 테이블 규칙 (트리거)", () => {
   test("정가 기간을 수정해서 겹치게 만드는 것도 금지", () =>
     rejects(`UPDATE "StylePrice" SET "validTo" = NULL WHERE "styleId" = ${ids.shirt} AND "listPrice" = 75000`, "StylePrice_no_overlap"));
   test("상의 자켓에 신발 사이즈(270) SKU 금지", () =>
-    rejects(`INSERT INTO "Sku" ("styleColorId","sizeId","skuCode",status,stock,"createdAt","updatedAt") VALUES (${ids.jacketBK}, ${ids.size270}, 'JK26F001-BK-270', 'ON_SALE', 1, ${NOW}, ${NOW})`, "Sku_size_group"));
+    rejects(`INSERT INTO "Sku" ("styleColorId","sizeId","skuCode",status,"createdAt","updatedAt") VALUES (${ids.jacketBK}, ${ids.size270}, 'JK26F001-BK-270', 'ON_SALE', ${NOW}, ${NOW})`, "Sku_size_group"));
   test("SKU를 수정해서 다른 체계의 사이즈로 바꾸는 것도 금지", () =>
     rejects(`UPDATE "Sku" SET "sizeId" = ${ids.size270} WHERE id = ${ids.sku}`, "Sku_size_group"));
   test("실측 사이즈도 스타일의 체계만", () =>
@@ -159,7 +160,7 @@ describe("코드 일치 (⭐ 보강)", () => {
   test("올바른 코드로 컬러·SKU 추가는 통과", () =>
     succeeds(async (tx) => {
       await tx.$executeRawUnsafe(`INSERT INTO "StyleColor" ("styleId","colorId",code,status,"isDisplayed","sortOrder") VALUES (${ids.jacket}, (SELECT id FROM "Color" WHERE code = 'NV'), 'JK26F001-NV', 'ON_SALE', 1, 9)`);
-      await tx.$executeRawUnsafe(`INSERT INTO "Sku" ("styleColorId","sizeId","skuCode",status,stock,"createdAt","updatedAt") VALUES ((SELECT id FROM "StyleColor" WHERE code = 'JK26F001-NV'), ${ids.size100}, 'JK26F001-NV-100', 'ON_SALE', 3, ${NOW}, ${NOW})`);
+      await tx.$executeRawUnsafe(`INSERT INTO "Sku" ("styleColorId","sizeId","skuCode",status,"createdAt","updatedAt") VALUES ((SELECT id FROM "StyleColor" WHERE code = 'JK26F001-NV'), ${ids.size100}, 'JK26F001-NV-100', 'ON_SALE', ${NOW}, ${NOW})`);
     }));
 });
 
@@ -220,7 +221,7 @@ describe("UNIQUE · 외래키 · 삭제 규칙", () => {
     rejects(`UPDATE "StyleColor" SET "sortOrder" = 0 WHERE "styleId" = ${ids.jacket} AND "sortOrder" = 1`, "UNIQUE constraint failed"));
   // (다른 SKU 코드로 바꾸면 Sku_code_match 트리거가 먼저 막으므로, 코드 규칙은 맞지만 이미 있는 SKU를 한 번 더 넣어 확인)
   test("SKU 중복 금지 (같은 컬러·사이즈)", () =>
-    rejects(`INSERT INTO "Sku" ("styleColorId","sizeId","skuCode",status,stock,"createdAt","updatedAt") VALUES (${ids.jacketBK}, ${ids.size100}, 'JK26F001-BK-100', 'ON_SALE', 1, ${NOW}, ${NOW})`, "UNIQUE constraint failed"));
+    rejects(`INSERT INTO "Sku" ("styleColorId","sizeId","skuCode",status,"createdAt","updatedAt") VALUES (${ids.jacketBK}, ${ids.size100}, 'JK26F001-BK-100', 'ON_SALE', ${NOW}, ${NOW})`, "UNIQUE constraint failed"));
   // (StyleColor에는 트리거가 먼저 걸리므로, 트리거가 없는 혼용률 테이블로 외래키만 확인)
   test("없는 스타일을 가리키는 행 금지 (외래키)", () =>
     rejects(`INSERT INTO "StyleMaterial" ("styleId",part,"materialId",percent,"sortOrder") VALUES (99999, '겉감', (SELECT id FROM "Material" LIMIT 1), 50, 0)`, "FOREIGN KEY constraint failed"));

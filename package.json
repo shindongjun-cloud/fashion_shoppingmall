@@ -13,7 +13,8 @@
     "postinstall": "prisma generate",
     "db:constraints": "tsx scripts/inject-constraints.ts",
     "db:verify": "tsx scripts/db-verify.ts",
-    "test": "tsx --test \"tests/**/*.test.ts\""
+    "test": "tsx --test \"tests/**/*.test.ts\"",
+    "inventory:release-expired": "tsx scripts/release-expired.ts"
   },
   "dependencies": {
     "@auth/prisma-adapter": "^2.11.3",

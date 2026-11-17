@@ -85,7 +85,6 @@ const MANUAL_CHECKS: CheckConstraint[] = [
   { table: "StyleColor", name: "StyleColor_code_ck", expr: `"code" GLOB '*-[A-Z][A-Z]'`, why: "컬러 품번은 스타일코드-컬러코드" },
   { table: "StyleColor", name: "StyleColor_sort_ck", expr: int("sortOrder", ">= 0"), why: "정렬 순서" },
 
-  { table: "Sku", name: "Sku_stock_ck", expr: int("stock", ">= 0"), why: "재고는 0 이상의 정수" },
   { table: "Sku", name: "Sku_code_ck", expr: `"skuCode" GLOB '*-*-*' AND "skuCode" NOT GLOB '*[^A-Z0-9-]*'`, why: "SKU 코드는 스타일-컬러-사이즈" },
   { table: "Sku", name: "Sku_barcode_ck", expr: `"barcode" IS NULL OR (length("barcode") BETWEEN 8 AND 14 AND "barcode" NOT GLOB '*[^0-9]*')`, why: "바코드는 숫자 8~14자리" },
 
@@ -139,6 +138,44 @@ const MANUAL_CHECKS: CheckConstraint[] = [
   { table: "OrderItem", name: "OrderItem_amounts_ck", expr: `${int("listPrice", ">= 0")} AND ${int("discountAmount", ">= 0")} AND ${int("price", ">= 0")}`, why: "금액은 0 이상의 정수" },
   { table: "OrderItem", name: "OrderItem_price_math_ck", expr: `"price" = "listPrice" - "discountAmount"`, why: "판매가 = 정가 − 할인 (스냅샷끼리 어긋나지 않게)" },
   { table: "OrderItem", name: "OrderItem_promotion_ck", expr: `"discountAmount" = 0 OR "promotionName" IS NOT NULL`, why: "할인이 있으면 어떤 행사인지 기록 필수" },
+
+  // ----- 재고
+  { table: "InventoryLocation", name: "InventoryLocation_code_ck", expr: upperCode("code"), why: "위치 코드 형식" },
+  { table: "InventoryLocation", name: "InventoryLocation_name_ck", expr: notBlank("name"), why: "위치 이름 필수" },
+  { table: "InventoryLocation", name: "InventoryLocation_priority_ck", expr: int("priority", ">= 0"), why: "할당 우선순위 >= 0" },
+  { table: "InventoryLocation", name: "InventoryLocation_online_ck", expr: `"isOnlineSellable" = 0 OR ("isActive" = 1 AND "type" IN ('WAREHOUSE', 'STORE'))`, why: "온라인 판매 위치는 활성 상태인 물류센터·매장만 (반품센터·불량창고 재고는 팔 수 없음)" },
+
+  { table: "InventoryBalance", name: "InventoryBalance_qty_ck", expr: `${int("onHand", ">= 0")} AND ${int("reserved", ">= 0")} AND ${int("safetyStock", ">= 0")}`, why: "실재고·예약·안전재고는 0 이상의 정수" },
+  { table: "InventoryBalance", name: "InventoryBalance_reserved_ck", expr: `"reserved" <= "onHand"`, why: "예약은 실재고를 넘을 수 없음 (초과 판매 방지의 마지막 방어선)" },
+  { table: "InventoryBalance", name: "InventoryBalance_dates_ck", expr: `(${isoDate("updatedAt")}) AND (${isoDateOrNull("lastCountedAt")})`, why: "날짜 형식" },
+
+  { table: "InventoryLedger", name: "InventoryLedger_qty_ck", expr: int("qty", "<> 0"), why: "변동 수량은 0이 아닌 정수" },
+  {
+    table: "InventoryLedger",
+    name: "InventoryLedger_sign_ck",
+    expr: `("type" IN ('INITIAL', 'INBOUND', 'RETURN_IN', 'ADJUST_IN', 'TRANSFER_IN') AND "qty" > 0) OR ("type" IN ('SALE', 'ADJUST_OUT', 'DEFECT_OUT', 'TRANSFER_OUT') AND "qty" < 0)`,
+    why: "유형별 부호: 입고·반품·조정입고·이동입고는 +, 판매·조정출고·불량·이동출고는 −",
+  },
+  { table: "InventoryLedger", name: "InventoryLedger_balance_after_ck", expr: int("balanceAfter", ">= 0"), why: "반영 후 실재고 >= 0" },
+  { table: "InventoryLedger", name: "InventoryLedger_sale_ck", expr: `("type" = 'SALE') = ("reservationId" IS NOT NULL) AND ("type" <> 'SALE' OR "refType" = 'ORDER')`, why: "판매(SALE)는 반드시 예약 확정에서만 생기고 주문을 참조. 다른 유형은 예약을 참조하지 않음" },
+  { table: "InventoryLedger", name: "InventoryLedger_ref_ck", expr: `"refType" IN ('MANUAL', 'MIGRATION') OR ("refId" IS NOT NULL AND trim("refId") <> '')`, why: "주문·반품·입고·실사·이동은 참조 번호 필수" },
+  { table: "InventoryLedger", name: "InventoryLedger_reason_ck", expr: `("type" NOT IN ('ADJUST_IN', 'ADJUST_OUT', 'DEFECT_OUT') AND "refType" <> 'MANUAL') OR ("reason" IS NOT NULL AND trim("reason") <> '')`, why: "조정·불량·수동 처리는 사유 필수 (재고가 사라진 이유를 남겨야 함)" },
+  { table: "InventoryLedger", name: "InventoryLedger_dates_ck", expr: `(${isoDate("occurredAt")}) AND (${isoDate("createdAt")})`, why: "날짜 형식" },
+
+  { table: "InventoryReservation", name: "InventoryReservation_qty_ck", expr: int("qty", ">= 1"), why: "예약 수량 1개 이상" },
+  { table: "InventoryReservation", name: "InventoryReservation_expiry_ck", expr: `"expiresAt" > "createdAt"`, why: "만료 시각은 생성 이후" },
+  {
+    table: "InventoryReservation",
+    name: "InventoryReservation_state_ck",
+    expr: [
+      `("status" = 'RESERVED'  AND "confirmedAt" IS NULL     AND "releasedAt" IS NULL     AND "releaseReason" IS NULL)`,
+      `("status" = 'CONFIRMED' AND "confirmedAt" IS NOT NULL AND "releasedAt" IS NULL     AND "releaseReason" IS NULL)`,
+      `("status" = 'RELEASED'  AND "confirmedAt" IS NULL     AND "releasedAt" IS NOT NULL AND "releaseReason" IS NOT NULL)`,
+      `("status" = 'EXPIRED'   AND "confirmedAt" IS NULL     AND "releasedAt" IS NOT NULL AND "releaseReason" IS NULL)`,
+    ].join(" OR "),
+    why: "상태별 필수 칸 (확정이면 확정 시각, 해제면 해제 시각+사유, 만료면 해제 시각)",
+  },
+  { table: "InventoryReservation", name: "InventoryReservation_dates_ck", expr: `(${isoDate("createdAt")}) AND (${isoDate("expiresAt")}) AND (${isoDateOrNull("confirmedAt")}) AND (${isoDateOrNull("releasedAt")})`, why: "날짜 형식 (만료 비교가 깨지지 않게)" },
 ];
 
 // ---------------------------------------------------------------
@@ -178,6 +215,76 @@ export function autoChecks(schemaText: string): CheckConstraint[] {
 
 export function allChecks(schemaText: string): CheckConstraint[] {
   return [...autoChecks(schemaText), ...MANUAL_CHECKS];
+}
+
+// ---------------------------------------------------------------
+// 정의 검사: 제약이 "없는 컬럼"을 가리키지 않는지
+// ⚠️ SQLite는 "없는컬럼"처럼 큰따옴표로 쓴 이름이 실제 컬럼이 아니면 오류 없이 '글자'로 취급합니다.
+//    그래서 컬럼을 지우고 제약을 안 지우면, CHECK가 항상 거짓이 되어 모든 쓰기가 막히거나
+//    (반대로 조건에 따라) 검사가 조용히 무력화됩니다. 실제로 Sku.stock을 지울 때 이 문제로 마이그레이션이 실패했습니다.
+// ---------------------------------------------------------------
+const SCALARS = new Set(["String", "Int", "Float", "Boolean", "DateTime", "Json", "BigInt", "Decimal", "Bytes"]);
+
+/** 모델 이름 → 실제 컬럼 이름들 (관계 필드는 컬럼이 아니므로 제외) */
+export function tableColumns(schemaText: string): Map<string, Set<string>> {
+  const enumNames = new Set([...schemaText.matchAll(/^enum\s+(\w+)/gm)].map((m) => m[1]));
+  const result = new Map<string, Set<string>>();
+  for (const m of schemaText.matchAll(/^model\s+(\w+)\s*\{([\s\S]*?)^\}/gm)) {
+    const cols = new Set<string>();
+    for (const raw of m[2].split("\n")) {
+      const f = raw.replace(/\/\/.*$/, "").trim().match(/^(\w+)\s+(\w+)(\?)?(\s|$)/);
+      if (f && (SCALARS.has(f[2]) || enumNames.has(f[2]))) cols.add(f[1]);
+    }
+    result.set(m[1], cols);
+  }
+  return result;
+}
+
+/** 문제가 있으면 설명 목록을 돌려줍니다 (없으면 빈 배열) */
+export function validateConstraints(schemaText: string): string[] {
+  const columns = tableColumns(schemaText);
+  const problems: string[] = [];
+
+  for (const c of allChecks(schemaText)) {
+    const cols = columns.get(c.table);
+    if (!cols) {
+      problems.push(`CHECK ${c.name}: 테이블 ${c.table}이 스키마에 없음`);
+      continue;
+    }
+    for (const [, ident] of c.expr.matchAll(/"(\w+)"/g)) {
+      if (!cols.has(ident)) problems.push(`CHECK ${c.name}: ${c.table}에 "${ident}" 컬럼이 없음`);
+    }
+  }
+
+  for (const t of TRIGGERS) {
+    const own = columns.get(t.table);
+    if (!own) {
+      problems.push(`트리거 ${t.name}: 테이블 ${t.table}이 스키마에 없음`);
+      continue;
+    }
+    // 트리거 안에서 쓰는 테이블과 별칭: FROM "Sku" k / JOIN "StyleColor" sc
+    const aliases = new Map<string, string>([["NEW", t.table], ["OLD", t.table]]);
+    for (const [, table, alias] of t.sql.matchAll(/(?:FROM|JOIN)\s+"(\w+)"\s+(\w+)/g)) aliases.set(alias, table);
+    const referenced = new Set([t.table, ...[...t.sql.matchAll(/"(\w+)"/g)].map((m) => m[1]).filter((n) => columns.has(n))]);
+    for (const n of referenced) {
+      if (!columns.has(n)) problems.push(`트리거 ${t.name}: 테이블 ${n}이 스키마에 없음`);
+    }
+    // 별칭.컬럼 (NEW."qty", b."onHand")
+    for (const [, alias, col] of t.sql.matchAll(/\b(\w+)\."(\w+)"/g)) {
+      const table = aliases.get(alias);
+      if (!table) problems.push(`트리거 ${t.name}: 별칭 ${alias}를 알 수 없음`);
+      else if (!columns.get(table)?.has(col)) problems.push(`트리거 ${t.name}: ${table}에 "${col}" 컬럼이 없음 (${alias}."${col}")`);
+    }
+    // 별칭 없이 쓴 "이름": 테이블 이름이거나, 트리거가 다루는 테이블 중 하나의 컬럼이어야 함
+    const allCols = new Set([...referenced].flatMap((n) => [...(columns.get(n) ?? [])]));
+    for (const m of t.sql.matchAll(/(^|[^.\w])"(\w+)"/g)) {
+      const ident = m[2];
+      if (!columns.has(ident) && !allCols.has(ident) && ident !== t.name) {
+        problems.push(`트리거 ${t.name}: "${ident}"는 테이블도 컬럼도 아님`);
+      }
+    }
+  }
+  return problems;
 }
 
 // ---------------------------------------------------------------
@@ -222,7 +329,188 @@ const saleReadyCheck = (name: string) => `SELECT CASE
     THEN RAISE(ABORT, '${name}: 혼용률 합계가 100%가 아닌 부위가 있습니다')
 END;`;
 
+// ----- 재고 도우미
+const BAL = (alias: string, rec: "NEW" | "OLD") =>
+  `${alias}."skuId" = ${rec}."skuId" AND ${alias}."locationId" = ${rec}."locationId"`;
+const LEDGER_SUM = (rec: "NEW" | "OLD") =>
+  `(SELECT COALESCE(SUM(l."qty"), 0) FROM "InventoryLedger" l WHERE ${BAL("l", rec)})`;
+const RESERVED_SUM = (rec: "NEW" | "OLD") =>
+  `(SELECT COALESCE(SUM(r."qty"), 0) FROM "InventoryReservation" r WHERE ${BAL("r", rec)} AND r."status" = 'RESERVED')`;
+const syncReserved = (rec: "NEW" | "OLD") =>
+  `UPDATE "InventoryBalance" SET "reserved" = ${RESERVED_SUM(rec)}, "updatedAt" = ${NOW} WHERE "skuId" = ${rec}."skuId" AND "locationId" = ${rec}."locationId";`;
+
+const INVENTORY_TRIGGERS: TriggerConstraint[] = [
+  // --- 잔고: 앱이 직접 숫자를 바꾸지 못하게
+  {
+    table: "InventoryBalance",
+    name: "InventoryBalance_insert_zero",
+    why: "잔고 행은 0으로만 생성 (재고는 원장 입고로만 늘어남)",
+    sql: `CREATE TRIGGER "InventoryBalance_insert_zero" BEFORE INSERT ON "InventoryBalance"
+WHEN NEW."onHand" <> 0 OR NEW."reserved" <> 0
+BEGIN ${raise("InventoryBalance_insert_zero", "잔고는 0으로 만들고 원장(InventoryLedger)으로 입고해야 합니다")} END;`,
+  },
+  {
+    table: "InventoryBalance",
+    name: "InventoryBalance_onhand_guard",
+    why: "실재고는 항상 원장 합계와 같아야 함 → 원장 없이 숫자만 고치는 것 금지",
+    sql: `CREATE TRIGGER "InventoryBalance_onhand_guard" BEFORE UPDATE OF "onHand" ON "InventoryBalance"
+WHEN NEW."onHand" IS NOT ${LEDGER_SUM("NEW")}
+BEGIN ${raise("InventoryBalance_onhand_guard", "실재고는 원장(InventoryLedger)으로만 바꿀 수 있습니다")} END;`,
+  },
+  {
+    table: "InventoryBalance",
+    name: "InventoryBalance_reserved_guard",
+    why: "예약 수량은 항상 RESERVED 예약 합계와 같아야 함",
+    sql: `CREATE TRIGGER "InventoryBalance_reserved_guard" BEFORE UPDATE OF "reserved" ON "InventoryBalance"
+WHEN NEW."reserved" IS NOT ${RESERVED_SUM("NEW")}
+BEGIN ${raise("InventoryBalance_reserved_guard", "예약 수량은 예약(InventoryReservation)으로만 바꿀 수 있습니다")} END;`,
+  },
+  {
+    table: "InventoryBalance",
+    name: "InventoryBalance_key_fixed",
+    why: "잔고 행의 SKU·위치를 바꾸면 원장과 어긋남",
+    sql: `CREATE TRIGGER "InventoryBalance_key_fixed" BEFORE UPDATE OF "skuId", "locationId" ON "InventoryBalance"
+WHEN NEW."skuId" IS NOT OLD."skuId" OR NEW."locationId" IS NOT OLD."locationId"
+BEGIN ${raise("InventoryBalance_key_fixed", "잔고 행의 SKU·위치는 바꿀 수 없습니다")} END;`,
+  },
+  {
+    table: "InventoryBalance",
+    name: "InventoryBalance_no_delete",
+    why: "원장 기록이 있는 잔고 행 삭제 금지",
+    sql: `CREATE TRIGGER "InventoryBalance_no_delete" BEFORE DELETE ON "InventoryBalance"
+WHEN EXISTS (SELECT 1 FROM "InventoryLedger" l WHERE ${BAL("l", "OLD")})
+  OR EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE ${BAL("r", "OLD")})
+BEGIN ${raise("InventoryBalance_no_delete", "원장·예약 기록이 있는 잔고는 지울 수 없습니다")} END;`,
+  },
+
+  // --- 원장: 추가만 가능, 추가하면 잔고에 자동 반영
+  {
+    table: "InventoryLedger",
+    name: "InventoryLedger_no_update",
+    why: "원장은 수정 금지 (잘못 넣었으면 반대 방향 행을 추가)",
+    sql: `CREATE TRIGGER "InventoryLedger_no_update" BEFORE UPDATE ON "InventoryLedger"
+BEGIN ${raise("InventoryLedger_append_only", "원장은 수정할 수 없습니다. 반대 방향 행을 추가하세요")} END;`,
+  },
+  {
+    table: "InventoryLedger",
+    name: "InventoryLedger_no_delete",
+    why: "원장은 삭제 금지",
+    sql: `CREATE TRIGGER "InventoryLedger_no_delete" BEFORE DELETE ON "InventoryLedger"
+BEGIN ${raise("InventoryLedger_append_only", "원장은 삭제할 수 없습니다")} END;`,
+  },
+  {
+    table: "InventoryLedger",
+    name: "InventoryLedger_check_balance",
+    why: "잔고 행이 있어야 하고, balanceAfter = 직전 실재고 + qty, 결과가 예약 수량보다 작아지면 거부",
+    sql: `CREATE TRIGGER "InventoryLedger_check_balance" BEFORE INSERT ON "InventoryLedger"
+BEGIN
+SELECT CASE
+  WHEN NOT EXISTS (SELECT 1 FROM "InventoryBalance" b WHERE ${BAL("b", "NEW")})
+    THEN RAISE(ABORT, 'InventoryLedger_check_balance: 잔고 행(InventoryBalance)이 없습니다. 먼저 0으로 만드세요')
+  WHEN NEW."balanceAfter" IS NOT ((SELECT b."onHand" FROM "InventoryBalance" b WHERE ${BAL("b", "NEW")}) + NEW."qty")
+    THEN RAISE(ABORT, 'InventoryLedger_check_balance: balanceAfter가 직전 실재고 + qty와 다릅니다')
+  WHEN NEW."balanceAfter" < (SELECT b."reserved" FROM "InventoryBalance" b WHERE ${BAL("b", "NEW")})
+    THEN RAISE(ABORT, 'InventoryLedger_check_balance: 결제 대기 예약보다 실재고가 적어집니다')
+END;
+END;`,
+  },
+  {
+    table: "InventoryLedger",
+    name: "InventoryLedger_apply",
+    why: "원장을 추가하면 잔고 실재고에 자동 반영 (앱이 따로 고치지 않음)",
+    sql: `CREATE TRIGGER "InventoryLedger_apply" AFTER INSERT ON "InventoryLedger"
+BEGIN
+  UPDATE "InventoryBalance" SET "onHand" = "onHand" + NEW."qty", "updatedAt" = ${NOW}
+  WHERE "skuId" = NEW."skuId" AND "locationId" = NEW."locationId";
+END;`,
+  },
+
+  // --- 예약: 판매 가능 수량 안에서만, 상태는 한 번만 바뀜, 확정되면 판매 원장 자동 생성
+  {
+    table: "InventoryReservation",
+    name: "InventoryReservation_reserve",
+    why: "판매 가능 수량(실재고−예약−안전재고)보다 많이 예약 금지. DB가 한 번에 검사하므로 동시 주문에도 초과 판매 불가",
+    sql: `CREATE TRIGGER "InventoryReservation_reserve" BEFORE INSERT ON "InventoryReservation"
+BEGIN
+SELECT CASE
+  WHEN NEW."status" <> 'RESERVED'
+    THEN RAISE(ABORT, 'InventoryReservation_reserve: 예약은 RESERVED 상태로만 만들 수 있습니다')
+  WHEN NOT EXISTS (SELECT 1 FROM "InventoryLocation" loc WHERE loc."id" = NEW."locationId" AND loc."isOnlineSellable" = 1 AND loc."isActive" = 1)
+    THEN RAISE(ABORT, 'InventoryReservation_reserve: 온라인 판매 위치가 아닙니다')
+  WHEN EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderId" = NEW."orderId" AND r."skuId" = NEW."skuId" AND r."status" = 'RESERVED')
+    THEN RAISE(ABORT, 'InventoryReservation_reserve: 같은 주문에 이 SKU의 예약이 이미 있습니다')
+  WHEN COALESCE((SELECT b."onHand" - b."reserved" - b."safetyStock" FROM "InventoryBalance" b WHERE ${BAL("b", "NEW")}), 0) < NEW."qty"
+    THEN RAISE(ABORT, 'InventoryReservation_insufficient: 판매 가능 재고가 부족합니다')
+END;
+END;`,
+  },
+  {
+    table: "InventoryReservation",
+    name: "InventoryReservation_sync_ins",
+    why: "예약을 만들면 잔고의 예약 수량 자동 반영",
+    sql: `CREATE TRIGGER "InventoryReservation_sync_ins" AFTER INSERT ON "InventoryReservation"
+BEGIN
+  ${syncReserved("NEW")}
+END;`,
+  },
+  {
+    table: "InventoryReservation",
+    name: "InventoryReservation_transition",
+    why: "RESERVED에서만 상태 변경 가능 (확정된 예약을 되돌리기 금지), 만료 시각이 지난 예약은 확정 금지",
+    sql: `CREATE TRIGGER "InventoryReservation_transition" BEFORE UPDATE OF "status" ON "InventoryReservation"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN OLD."status" <> 'RESERVED'
+    THEN RAISE(ABORT, 'InventoryReservation_transition: 이미 처리된 예약은 상태를 바꿀 수 없습니다')
+  WHEN NEW."status" = 'CONFIRMED' AND OLD."expiresAt" <= ${NOW}
+    THEN RAISE(ABORT, 'InventoryReservation_transition: 만료된 예약은 확정할 수 없습니다')
+END;
+END;`,
+  },
+  {
+    table: "InventoryReservation",
+    name: "InventoryReservation_immutable",
+    why: "예약의 주문·SKU·위치·수량·만료 시각은 바꿀 수 없음 (바꾸려면 해제 후 새로 예약)",
+    sql: `CREATE TRIGGER "InventoryReservation_immutable" BEFORE UPDATE OF "orderId", "skuId", "locationId", "qty", "expiresAt", "createdAt" ON "InventoryReservation"
+WHEN NEW."orderId" IS NOT OLD."orderId" OR NEW."skuId" IS NOT OLD."skuId" OR NEW."locationId" IS NOT OLD."locationId"
+  OR NEW."qty" IS NOT OLD."qty" OR NEW."expiresAt" IS NOT OLD."expiresAt" OR NEW."createdAt" IS NOT OLD."createdAt"
+BEGIN ${raise("InventoryReservation_immutable", "예약 내용은 바꿀 수 없습니다. 해제 후 새로 예약하세요")} END;`,
+  },
+  {
+    table: "InventoryReservation",
+    name: "InventoryReservation_sync_upd",
+    why: "상태가 바뀌면 예약 수량을 다시 맞추고, 확정(CONFIRMED)이면 판매 원장(SALE)을 자동 생성 → 실재고 감소",
+    sql: `CREATE TRIGGER "InventoryReservation_sync_upd" AFTER UPDATE OF "status" ON "InventoryReservation"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  ${syncReserved("NEW")}
+  INSERT INTO "InventoryLedger" ("skuId", "locationId", "type", "qty", "balanceAfter", "refType", "refId", "reservationId", "createdBy", "occurredAt", "createdAt")
+  SELECT NEW."skuId", NEW."locationId", 'SALE', -NEW."qty", b."onHand" - NEW."qty", 'ORDER', CAST(NEW."orderId" AS TEXT), NEW."id", 'SYSTEM', ${NOW}, ${NOW}
+  FROM "InventoryBalance" b
+  WHERE NEW."status" = 'CONFIRMED' AND ${BAL("b", "NEW")};
+END;`,
+  },
+  {
+    table: "InventoryReservation",
+    name: "InventoryReservation_no_delete",
+    why: "예약 기록 삭제 금지 (해제·만료 상태로 남김)",
+    sql: `CREATE TRIGGER "InventoryReservation_no_delete" BEFORE DELETE ON "InventoryReservation"
+BEGIN ${raise("InventoryReservation_no_delete", "예약 기록은 지울 수 없습니다. 해제(RELEASED)하세요")} END;`,
+  },
+  {
+    table: "InventoryLocation",
+    name: "InventoryLocation_deactivate_guard",
+    why: "결제 대기 예약이 남아 있는 위치를 판매 중지·비활성화하면 확정할 재고가 사라짐",
+    sql: `CREATE TRIGGER "InventoryLocation_deactivate_guard" BEFORE UPDATE OF "isActive", "isOnlineSellable" ON "InventoryLocation"
+WHEN (NEW."isActive" = 0 OR NEW."isOnlineSellable" = 0)
+  AND EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."locationId" = NEW."id" AND r."status" = 'RESERVED')
+BEGIN ${raise("InventoryLocation_deactivate_guard", "결제 대기 예약이 있는 위치는 판매 중지할 수 없습니다")} END;`,
+  },
+];
+
 export const TRIGGERS: TriggerConstraint[] = [
+  ...INVENTORY_TRIGGERS,
   // ----- 판매 시작 검사 (⭐1)
   {
     table: "Style",

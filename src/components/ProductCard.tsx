@@ -13,20 +13,28 @@ type CardStyle = Prisma.StyleGetPayload<{
       include: {
         color: true;
         images: true;
-        skus: { select: { stock: true } };
+        skus: { select: { id: true } };
       };
     };
   };
 }>;
 
 // 상품 카드: 대표 컬러 사진 + (마우스를 올리면) 착용 사진 + 컬러칩
-export default function ProductCard({ style, price }: { style: CardStyle; price: PriceInfo }) {
+export default function ProductCard({
+  style,
+  price,
+  inStockColorIds,
+}: {
+  style: CardStyle;
+  price: PriceInfo;
+  inStockColorIds: number[]; // 판매 가능 재고가 있는 컬러 (목록 페이지가 잔고 테이블로 계산)
+}) {
   const mainColor = style.colors[0];
   const mainImage = mainColor?.images.find((img) => img.type === "MAIN");
   const hoverImage = mainColor?.images.find((img) => img.type === "MODEL");
 
   // 품절은 상태값이 아니라 재고로 계산합니다.
-  const hasStock = (c: CardStyle["colors"][number]) => c.skus.some((s) => s.stock > 0);
+  const hasStock = (c: CardStyle["colors"][number]) => inStockColorIds.includes(c.id);
   const soldOut = !style.colors.some(hasStock);
   const rate = price.discountRate;
 

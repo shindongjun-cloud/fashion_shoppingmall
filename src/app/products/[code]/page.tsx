@@ -17,6 +17,7 @@ import {
 } from "@/lib/product-labels";
 import SizeSelector from "@/components/SizeSelector";
 import { getPrices } from "@/lib/pricing";
+import { getAvailability } from "@/lib/inventory";
 
 export const dynamic = "force-dynamic";
 
@@ -76,7 +77,12 @@ export default async function ProductPage({
   }
 
   // 판매가 계산 (정가 + 지금 진행 중인 할인 행사). 정가가 없으면 팔 수 없는 상품
-  const price = (await getPrices([style.id])).get(style.id);
+  const [prices, availability] = await Promise.all([
+    getPrices([style.id]),
+    getAvailability(style.colors.flatMap((c) => c.skus.map((k) => k.id))), // 판매 가능 수량 (실재고 − 예약 − 안전재고)
+  ]);
+  const price = prices.get(style.id);
+  const available = (skuId: number) => availability.get(skuId) ?? 0;
   if (!price) {
     notFound();
   }
@@ -191,7 +197,7 @@ export default async function ProductPage({
             </p>
             <div className="mt-2 flex gap-2">
               {style.colors.map((c) => {
-                const soldOut = !c.skus.some((s) => s.status === "ON_SALE" && s.stock > 0);
+                const soldOut = !c.skus.some((s) => s.status === "ON_SALE" && available(s.id) > 0);
                 const isSelected = c.id === selected.id;
                 return (
                   <Link
@@ -224,7 +230,7 @@ export default async function ProductPage({
             skus={selected.skus.map((sku) => ({
               id: sku.id,
               sizeLabel: sku.size.label,
-              stock: sku.stock,
+              stock: available(sku.id),
               onSale: sku.status === "ON_SALE",
             }))}
           />

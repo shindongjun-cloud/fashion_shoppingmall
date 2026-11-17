@@ -7,7 +7,7 @@ import { useCart } from "@/context/CartContext";
 type SizeOption = {
   id: number; // SKU id (장바구니에 담기는 값)
   sizeLabel: string;
-  stock: number;
+  stock: number; // 판매 가능 수량 (실재고 − 결제 대기 예약 − 안전재고)
   onSale: boolean;
 };
 

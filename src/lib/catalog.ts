@@ -2,6 +2,7 @@
 import type { Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getPrices, type PriceInfo } from "@/lib/pricing";
+import { getAvailability } from "@/lib/inventory";
 
 // ---------------------------------------------------------------
 // "고객에게 팔 수 있는 상품" 조건
@@ -61,7 +62,7 @@ export type CartSku = {
   promotionId: number | null; // 적용 중인 할인 행사
   promotionName: string | null;
   maxQtyPerOrder: number | null; // 스타일 단위 1회 주문 최대 수량 (없으면 제한 없음)
-  stock: number;
+  stock: number; // 판매 가능 수량 = 실재고 − 예약 − 안전재고 (온라인 판매 위치 합계, lib/inventory.ts)
   imageUrl: string | null;
   sellable: boolean; // 지금 주문 가능한지 (판매중지·숨김·정가 없음이면 false)
 };
@@ -79,7 +80,7 @@ const cartSkuInclude = {
 
 type SkuWithRelations = Prisma.SkuGetPayload<{ include: typeof cartSkuInclude }>;
 
-function toCartSku(sku: SkuWithRelations, priceInfo: PriceInfo | undefined, now: Date): CartSku {
+function toCartSku(sku: SkuWithRelations, priceInfo: PriceInfo | undefined, available: number, now: Date): CartSku {
   const { styleColor } = sku;
   const { style, color } = styleColor;
   return {
@@ -96,7 +97,7 @@ function toCartSku(sku: SkuWithRelations, priceInfo: PriceInfo | undefined, now:
     promotionId: priceInfo?.promotion?.id ?? null,
     promotionName: priceInfo?.promotion?.displayName ?? null,
     maxQtyPerOrder: style.maxQtyPerOrder,
-    stock: sku.stock,
+    stock: available,
     imageUrl: styleColor.images[0]?.url ?? null,
     sellable:
       priceInfo !== undefined && // 정가가 등록되지 않은 상품은 팔 수 없음
@@ -116,6 +117,9 @@ export async function getCartSkus(ids?: number[]): Promise<CartSku[]> {
     include: cartSkuInclude,
   });
   // 가격은 스타일 단위로 한 번에 계산합니다 (같은 스타일의 SKU는 모두 같은 가격)
-  const prices = await getPrices(skus.map((sku) => sku.styleColor.styleId), now);
-  return skus.map((sku) => toCartSku(sku, prices.get(sku.styleColor.styleId), now));
+  const [prices, availability] = await Promise.all([
+    getPrices(skus.map((sku) => sku.styleColor.styleId), now),
+    getAvailability(skus.map((sku) => sku.id), undefined, now),
+  ]);
+  return skus.map((sku) => toCartSku(sku, prices.get(sku.styleColor.styleId), availability.get(sku.id) ?? 0, now));
 }

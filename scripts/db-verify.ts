@@ -10,7 +10,7 @@ import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
 import { prisma } from "../src/lib/prisma";
-import { allChecks, TRIGGERS } from "../prisma/db-constraints";
+import { allChecks, TRIGGERS, validateConstraints } from "../prisma/db-constraints";
 
 type Row = Record<string, unknown>;
 const errors: string[] = [];
@@ -21,6 +21,7 @@ const query = (sql: string) => prisma.$queryRawUnsafe<Row[]>(sql);
 
 async function checkStructure() {
   const schema = fs.readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
+  for (const p of validateConstraints(schema)) errors.push(`[정의] ${p}`);
   const checks = allChecks(schema);
   const tables = new Map(
     (await query(`SELECT name, sql FROM sqlite_master WHERE type = 'table'`)).map((r) => [String(r.name), String(r.sql)]),
@@ -103,6 +104,43 @@ const RULES: [string, string, "error" | "warn"][] = [
   ["확정된 행사: 포함(INCLUDE) 대상이 1개 이상 (없으면 아무 상품에도 적용 안 됨)",
     `SELECT p."code" AS code FROM "PricePromotion" p WHERE p."status" = 'APPROVED'
        AND NOT EXISTS (SELECT 1 FROM "PricePromotionTarget" t WHERE t."promotionId" = p."id" AND t."mode" = 'INCLUDE')`, "warn"],
+  ["재고: 실재고 = 원장 합계 (위치별)",
+    `SELECT b."skuId" AS skuId, b."locationId" AS loc, b."onHand" AS onHand, COALESCE(SUM(l."qty"), 0) AS ledgerSum
+     FROM "InventoryBalance" b LEFT JOIN "InventoryLedger" l ON l."skuId" = b."skuId" AND l."locationId" = b."locationId"
+     GROUP BY b."skuId", b."locationId" HAVING b."onHand" <> COALESCE(SUM(l."qty"), 0)`, "error"],
+  ["재고: 예약 수량 = RESERVED 예약 합계",
+    `SELECT b."skuId" AS skuId, b."reserved" AS reserved, COALESCE(SUM(r."qty"), 0) AS reservationSum
+     FROM "InventoryBalance" b LEFT JOIN "InventoryReservation" r ON r."skuId" = b."skuId" AND r."locationId" = b."locationId" AND r."status" = 'RESERVED'
+     GROUP BY b."skuId", b."locationId" HAVING b."reserved" <> COALESCE(SUM(r."qty"), 0)`, "error"],
+  ["재고: 원장의 balanceAfter가 누적 합계와 일치 (중간 기록 위조·누락 없음)",
+    `SELECT id, "skuId", "balanceAfter", running FROM (
+       SELECT l."id", l."skuId", l."balanceAfter", SUM(l."qty") OVER (PARTITION BY l."skuId", l."locationId" ORDER BY l."id") AS running
+       FROM "InventoryLedger" l) WHERE "balanceAfter" <> running`, "error"],
+  ["재고: 원장·예약이 있는 SKU·위치에는 잔고 행이 있음",
+    `SELECT DISTINCT x."skuId" AS skuId, x."locationId" AS loc FROM (
+       SELECT "skuId", "locationId" FROM "InventoryLedger" UNION SELECT "skuId", "locationId" FROM "InventoryReservation") x
+     LEFT JOIN "InventoryBalance" b ON b."skuId" = x."skuId" AND b."locationId" = x."locationId" WHERE b."skuId" IS NULL`, "error"],
+  ["재고: 확정된 예약마다 판매 원장(SALE)이 정확히 1개",
+    `SELECT r."id" AS reservationId, count(l."id") AS sales FROM "InventoryReservation" r
+     LEFT JOIN "InventoryLedger" l ON l."reservationId" = r."id" AND l."type" = 'SALE'
+     WHERE r."status" = 'CONFIRMED' GROUP BY r."id" HAVING count(l."id") <> 1`, "error"],
+  ["재고: 판매 원장은 확정된 예약에서만 생김 (수량도 일치)",
+    `SELECT l."id" AS ledgerId FROM "InventoryLedger" l LEFT JOIN "InventoryReservation" r ON r."id" = l."reservationId"
+     WHERE l."type" = 'SALE' AND (r."id" IS NULL OR r."status" <> 'CONFIRMED' OR -l."qty" <> r."qty")`, "error"],
+  ["주문: 결제 완료 주문의 수량 = 확정된 예약 수량 (SKU별)",
+    `SELECT o."id" AS orderId, i."skuId" AS skuId, i.q AS ordered, COALESCE(c.q, 0) AS confirmed
+     FROM "Order" o
+     JOIN (SELECT "orderId", "skuId", SUM("quantity") AS q FROM "OrderItem" GROUP BY "orderId", "skuId") i ON i."orderId" = o."id"
+     LEFT JOIN (SELECT "orderId", "skuId", SUM("qty") AS q FROM "InventoryReservation" WHERE "status" = 'CONFIRMED' GROUP BY "orderId", "skuId") c
+       ON c."orderId" = o."id" AND c."skuId" = i."skuId"
+     WHERE o."status" = 'PAID' AND i.q <> COALESCE(c.q, 0)`, "error"],
+  ["재고: 만료 시각이 지난 RESERVED 예약 없음 (만료 정리 필요: npm run inventory:release-expired)",
+    `SELECT r."id" AS reservationId, r."expiresAt" AS expiresAt FROM "InventoryReservation" r WHERE r."status" = 'RESERVED' AND r."expiresAt" <= ${NOW}`, "warn"],
+  ["재고: 판매 중인 SKU는 온라인 판매 위치에 잔고 행이 있음",
+    `SELECT k."skuCode" AS code FROM "Sku" k JOIN "StyleColor" c ON c."id" = k."styleColorId" JOIN "Style" s ON s."id" = c."styleId"
+     WHERE ${SELLABLE_STYLE} AND k."status" = 'ON_SALE' AND NOT EXISTS (
+       SELECT 1 FROM "InventoryBalance" b JOIN "InventoryLocation" loc ON loc."id" = b."locationId"
+       WHERE b."skuId" = k."id" AND loc."isOnlineSellable" = 1 AND loc."isActive" = 1)`, "warn"],
   ["고시 품목군이 카테고리의 기본 품목군과 같음",
     `SELECT s."styleCode" AS code, n."noticeType" AS notice, c."noticeType" AS category FROM "StyleNotice" n JOIN "Style" s ON s."id" = n."styleId" JOIN "Category" c ON c."id" = s."categoryId"
      WHERE c."noticeType" IS NOT NULL AND n."noticeType" <> c."noticeType"`, "warn"],

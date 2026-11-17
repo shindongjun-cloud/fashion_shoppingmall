@@ -9,7 +9,7 @@
 // 새 마이그레이션 순서: migrate diff로 SQL 생성 → 이 스크립트 → SQL 검토 → migrate deploy → npm run db:verify
 import fs from "node:fs";
 import path from "node:path";
-import { allChecks, TRIGGERS } from "../prisma/db-constraints";
+import { allChecks, TRIGGERS, validateConstraints } from "../prisma/db-constraints";
 
 const file = process.argv[2];
 if (!file || !fs.existsSync(file)) {
@@ -18,6 +18,13 @@ if (!file || !fs.existsSync(file)) {
 }
 
 const schema = fs.readFileSync(path.join(__dirname, "..", "prisma", "schema.prisma"), "utf8");
+// 제약 정의가 없는 컬럼·테이블을 가리키면 주입하지 않고 멈춥니다 (SQLite는 이런 실수를 오류 없이 넘어가므로)
+const problems = validateConstraints(schema);
+if (problems.length > 0) {
+  console.error("제약 정의 오류 — prisma/db-constraints.ts를 고친 뒤 다시 실행하세요:");
+  for (const p of problems) console.error(`  - ${p}`);
+  process.exit(1);
+}
 const checks = allChecks(schema);
 let sql = fs.readFileSync(file, "utf8");
 

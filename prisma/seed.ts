@@ -138,7 +138,7 @@ type StyleSeed = {
   sheerness?: Level3;
   lining?: Lining;
   releasedAt: string;
-  // 컬러 코드 → 사이즈별 재고 (사이즈 순서대로)
+  // 컬러 코드 → 사이즈별 입고 수량 (사이즈 순서대로). 재고는 seedInventory()가 원장(입고)으로 넣습니다.
   colors: { code: string; label?: string; stock: number[] }[];
   materials: [part: string, materialCode: string, percent: number][];
   manufacturer: string; // 제조사 code
@@ -461,7 +461,6 @@ async function seedProducts() {
             sizeId,
             skuCode: `${s.styleCode}-${c.code}-${groupSizes[si][0]}`,
             barcode: `880${String(style.id).padStart(3, "0")}${String(ci).padStart(2, "0")}${String(si).padStart(2, "0")}`,
-            stock: c.stock[si] ?? 0,
           })),
         });
 
@@ -728,6 +727,83 @@ async function seedPricing() {
 // 판매 시작: DRAFT → ON_SALE
 // 이 순간 DB 트리거(Style_sale_ready_upd)가 정가·고시·판매 컬러·SKU·대표 이미지·혼용률 합계를 검사합니다.
 // 하나라도 빠지면 어떤 정보가 없는지 알려 주며 거부합니다.
+// ---------------------------------------------------------------
+// 5) 재고: 위치 → 잔고(0) → 원장(입고) 순서. 잔고 숫자는 DB 트리거가 원장을 보고 맞춥니다.
+// ---------------------------------------------------------------
+const locations = [
+  { code: "ONLINE_DC", name: "온라인 물류센터", type: "WAREHOUSE" as const, isOnlineSellable: true, priority: 0, address: "경기도 이천시 (샘플)" },
+  { code: "STORE_SEONGSU", name: "성수 플래그십 스토어", type: "STORE" as const, isOnlineSellable: false, priority: 10, address: "서울 성동구 성수동 (샘플)" },
+  { code: "RETURN_CENTER", name: "반품 검수센터", type: "RETURN_CENTER" as const, isOnlineSellable: false, priority: 90 },
+  { code: "DEFECT_WH", name: "불량 창고", type: "DEFECT" as const, isOnlineSellable: false, priority: 99 },
+];
+
+async function seedInventory() {
+  // 위치는 항상 맞춰 둡니다 (마이그레이션이 ONLINE_DC만 만들어 두므로 나머지를 추가)
+  for (const loc of locations) {
+    await prisma.inventoryLocation.upsert({ where: { code: loc.code }, update: {}, create: loc });
+  }
+
+  const ledgerCount = await prisma.inventoryLedger.count();
+  if (ledgerCount > 0) {
+    console.log(`이미 재고 원장 ${ledgerCount}행이 있어서 재고 데이터는 건너뜁니다.`);
+    return;
+  }
+
+  await prisma.$transaction(async (tx) => {
+    const dc = await tx.inventoryLocation.findUniqueOrThrow({ where: { code: "ONLINE_DC" } });
+    const store = await tx.inventoryLocation.findUniqueOrThrow({ where: { code: "STORE_SEONGSU" } });
+    const skus = await tx.sku.findMany({ select: { id: true, skuCode: true } });
+    const skuId = (code: string) => skus.find((k) => k.skuCode === code)!.id;
+
+    // 원장 한 줄 추가 (balanceAfter = 직전 실재고 + qty, DB 트리거가 다시 검사)
+    const move = async (
+      code: string,
+      locationId: number,
+      data: { type: "INBOUND" | "ADJUST_OUT" | "DEFECT_OUT"; qty: number; refType: "INBOUND_ORDER" | "STOCK_COUNT"; refId: string; reason?: string; occurredAt: Date },
+    ) => {
+      const id = skuId(code);
+      const balance =
+        (await tx.inventoryBalance.findUnique({ where: { skuId_locationId: { skuId: id, locationId } } })) ??
+        (await tx.inventoryBalance.create({ data: { skuId: id, locationId } })); // 잔고 행은 0으로만 생성 가능
+      await tx.inventoryLedger.create({
+        data: { skuId: id, locationId, ...data, balanceAfter: balance.onHand + data.qty, createdBy: "seed" },
+      });
+    };
+
+    for (const st of styles) {
+      const group = sizeGroups.find((g) => g.code === st.sizeGroup)!;
+      for (const c of st.colors) {
+        for (const [si, [sizeCode]] of group.sizes.entries()) {
+          const code = `${st.styleCode}-${c.code}-${sizeCode}`;
+          const qty = c.stock[si] ?? 0;
+          if (qty > 0) {
+            await move(code, dc.id, { type: "INBOUND", qty, refType: "INBOUND_ORDER", refId: `PO-${st.styleCode}`, occurredAt: kst(st.releasedAt) });
+          } else {
+            await tx.inventoryBalance.create({ data: { skuId: skuId(code), locationId: dc.id } }); // 품절 SKU도 잔고 행은 둠
+          }
+        }
+      }
+    }
+
+    // 실무 예시: 실사에서 분실 발견, 불량 처리, 매장 재고 (매장은 온라인 판매 위치가 아니라 판매 가능 수량에 안 잡힘)
+    await move("JK26F001-BK-100", dc.id, { type: "INBOUND", qty: 3, refType: "INBOUND_ORDER", refId: "PO-JK26F001-2", occurredAt: kst("2026-11-12") });
+    await move("JK26F001-BK-100", dc.id, { type: "ADJUST_OUT", qty: -3, refType: "STOCK_COUNT", refId: "SC-2611-01", reason: "11월 정기 실사: 3개 분실", occurredAt: kst("2026-11-15") });
+    await move("SH26S002-WH-M", dc.id, { type: "DEFECT_OUT", qty: -1, refType: "STOCK_COUNT", refId: "SC-2611-01", reason: "단추 불량", occurredAt: kst("2026-11-15") });
+    await move("JK26F001-BK-105", store.id, { type: "INBOUND", qty: 4, refType: "INBOUND_ORDER", refId: "PO-STORE-2611", occurredAt: kst("2026-11-12") });
+
+    // 안전재고: 자켓 블랙은 실사 오차가 있었으므로 사이즈마다 1개씩 남겨 둠 (판매 가능 = 실재고 − 1)
+    for (const size of ["95", "100", "105", "110"]) {
+      await tx.inventoryBalance.update({
+        where: { skuId_locationId: { skuId: skuId(`JK26F001-BK-${size}`), locationId: dc.id } },
+        data: { safetyStock: 1, updatedAt: new Date() },
+      });
+    }
+  });
+
+  const [balances, ledgers] = await Promise.all([prisma.inventoryBalance.count(), prisma.inventoryLedger.count()]);
+  console.log(`재고 잔고 ${balances}행, 원장 ${ledgers}행을 추가했습니다.`);
+}
+
 async function openSales() {
   const opened = await prisma.style.updateMany({
     where: { status: "DRAFT", styleCode: { in: styles.map((s) => s.styleCode) } },
@@ -739,6 +815,7 @@ async function openSales() {
 async function main() {
   await seedProducts();
   await seedPricing(); // 정가가 있어야 판매를 시작할 수 있으므로 가격이 먼저
+  await seedInventory();
   await openSales();
 }
 

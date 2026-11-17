@@ -39,3 +39,26 @@ export async function confirmPayment(params: {
 
   return { ok: true };
 }
+
+type CancelResult = { ok: true } | { ok: false; code: string; message: string };
+
+// 토스페이먼츠 "결제 취소" API (전액 취소)
+// 결제 승인 후 우리 DB 저장(재고 확정 등)이 실패했을 때, 돈만 빠져나가지 않도록 되돌리는 데 씁니다(보상 처리).
+export async function cancelPayment(params: { paymentKey: string; cancelReason: string }): Promise<CancelResult> {
+  const secretKey = process.env.TOSS_SECRET_KEY ?? "";
+  const encoded = Buffer.from(`${secretKey}:`).toString("base64");
+  const response = await fetch(
+    `https://api.tosspayments.com/v1/payments/${encodeURIComponent(params.paymentKey)}/cancel`,
+    {
+      method: "POST",
+      headers: { Authorization: `Basic ${encoded}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ cancelReason: params.cancelReason }),
+      cache: "no-store",
+    },
+  );
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    return { ok: false, code: error.code ?? "UNKNOWN_ERROR", message: error.message ?? "결제 취소 중 오류가 발생했어요." };
+  }
+  return { ok: true };
+}

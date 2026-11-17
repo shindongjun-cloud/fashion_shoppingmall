@@ -7,7 +7,7 @@ import {
   type TossPaymentsWidgets,
 } from "@tosspayments/tosspayments-sdk";
 import { useCart } from "@/context/CartContext";
-import { createOrder } from "@/app/checkout/actions";
+import { cancelPendingOrder, createOrder } from "@/app/checkout/actions";
 import type { CartSku } from "@/lib/catalog";
 import { formatPrice } from "@/lib/format";
 
@@ -78,8 +78,9 @@ export default function CheckoutView({
 
     // 화면을 연 뒤 할인 행사가 끝나거나 시작되면, 화면 금액과 서버가 계산한 결제 금액이 달라집니다.
     // 고객이 본 금액과 다른 금액으로 결제창을 띄우면 안 되므로 멈추고 알려 줍니다.
-    // (이 주문은 결제 대기(PENDING)로 남고, 결제되지 않은 주문이라 문제없습니다)
+    // 이 주문이 잡아 둔 재고 예약은 바로 풉니다 (안 풀면 20분 동안 다른 고객이 못 삼)
     if (order.amount !== total) {
+      await cancelPendingOrder(order.paymentOrderId, "PRICE_CHANGED");
       setError(
         `그 사이 가격이 바뀌었어요 (${formatPrice(total)} → ${formatPrice(order.amount)}). 새로고침해서 바뀐 금액을 확인해 주세요.`,
       );
@@ -96,10 +97,12 @@ export default function CheckoutView({
         customerName,
         customerEmail,
         successUrl: `${window.location.origin}/api/payments/confirm`,
-        failUrl: `${window.location.origin}/checkout/fail`,
+        // 실패·취소 시 재고 예약을 풀고 실패 화면으로 보내는 라우트
+        failUrl: `${window.location.origin}/api/payments/fail`,
       });
     } catch (e) {
-      // 결제창을 닫았거나 약관 미동의 등
+      // 결제창을 닫았거나 약관 미동의 등 → 재고 예약을 바로 풂
+      await cancelPendingOrder(order.paymentOrderId, "PAYMENT_FAILED");
       setError(e instanceof Error ? e.message : "결제를 진행하지 못했어요.");
       setPaying(false);
     }

@@ -4,6 +4,14 @@ import { auth } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { formatDate, formatPrice } from "@/lib/format";
 
+// 주문 상태 표시 (⑦ 주문 단계에서 enum과 상태 전이를 정식으로 설계합니다)
+const ORDER_STATUS_LABEL: Record<string, string> = {
+  PENDING: "결제 대기",
+  PAID: "결제 완료",
+  CANCELED: "결제 취소",
+  CANCEL_FAILED: "취소 확인 중",
+};
+
 // 내 주문 내역 (로그인한 사람만 볼 수 있는 페이지)
 export default async function OrdersPage() {
   const session = await auth();
@@ -52,7 +60,7 @@ export default async function OrdersPage() {
                   주문번호 {order.id} ·{" "}
                   {formatDate(order.createdAt)}
                 </span>
-                <span>{order.status === "PAID" ? "결제 완료" : "결제 대기"}</span>
+                <span>{ORDER_STATUS_LABEL[order.status] ?? order.status}</span>
               </div>
               <ul className="mt-2 text-gray-800">
                 {order.items.map((item) => (

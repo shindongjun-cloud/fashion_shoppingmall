@@ -386,14 +386,16 @@ model Sku {
   skuCode      String     @unique // JK26F001-BK-100
   barcode      String?    @unique // 바코드 (매장 POS·물류용)
   status       SaleStatus @default(ON_SALE)
-  // 재고 (임시): 3번 재고 단계에서 창고별 재고·예약·원장 테이블로 확장합니다.
-  stock        Int        @default(0)
+  // 재고는 Sku에 두지 않습니다 → InventoryBalance(위치별 잔고) / InventoryLedger(원장) / InventoryReservation(예약)
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
-  styleColor StyleColor  @relation(fields: [styleColorId], references: [id])
-  size       Size        @relation(fields: [sizeId], references: [id])
-  orderItems OrderItem[]
+  styleColor   StyleColor             @relation(fields: [styleColorId], references: [id])
+  size         Size                   @relation(fields: [sizeId], references: [id])
+  orderItems   OrderItem[]
+  balances     InventoryBalance[]
+  ledgers      InventoryLedger[]
+  reservations InventoryReservation[]
 
   @@unique([styleColorId, sizeId]) // 같은 컬러에 같은 사이즈 중복 금지
 }
@@ -658,6 +660,159 @@ model PricePromotionTarget {
   @@index([categoryId])
 }
 
+// ===============================================================
+// 재고 도메인 (B안: 주문 시 예약 → 결제 시 확정 → 시간 초과 시 해제)
+//
+//   InventoryLocation   재고 위치 (온라인 물류센터, 매장, 반품센터, 불량창고)
+//   InventoryBalance    SKU × 위치별 "지금 수량" (실재고·예약·안전재고) — 앱이 직접 고치지 않음
+//   InventoryLedger     재고 원장 (입고·판매·반품·조정…) — 추가만 가능, 합계 = 실재고
+//   InventoryReservation 결제 대기 중인 예약 — RESERVED → CONFIRMED / RELEASED / EXPIRED
+//
+//   판매 가능 수량 = 실재고(onHand) − 예약(reserved) − 안전재고(safetyStock)
+//
+// ⚠️ 잔고(onHand, reserved)는 DB 트리거가 원장·예약에서 자동으로 맞춥니다(prisma/db-constraints.ts).
+//    앱은 원장 행 추가 / 예약 행 추가·상태 변경만 합니다. 그래서 "원장 합계 = 실재고"가 DB에서 보장됩니다.
+// ===============================================================
+
+// 재고 위치 종류
+enum LocationType {
+  WAREHOUSE // 물류센터 (온라인 출고)
+  STORE // 오프라인 매장 (⑲ 단계에서 사용)
+  RETURN_CENTER // 반품 검수센터 (검수 전 재고, 판매 불가)
+  DEFECT // 불량 창고 (판매 불가)
+}
+
+// 원장 유형. 유형마다 수량의 부호가 정해져 있습니다 (CHECK로 강제).
+enum LedgerType {
+  INITIAL // + 시스템 도입 시 기초 재고
+  INBOUND // + 입고 (생산·발주)
+  RETURN_IN // + 반품 입고 (검수 완료)
+  ADJUST_IN // + 실사 조정 (시스템보다 실물이 많음)
+  TRANSFER_IN // + 위치 이동 입고
+  SALE // − 판매 출고 확정 (결제 승인 시 예약 확정에서 자동 생성)
+  ADJUST_OUT // − 실사 조정 (분실 등, 시스템보다 실물이 적음)
+  DEFECT_OUT // − 불량 처리
+  TRANSFER_OUT // − 위치 이동 출고
+}
+
+// 원장이 무엇 때문에 생겼는지
+enum LedgerRefType {
+  ORDER // 주문 (refId = 주문 id)
+  RETURN // 반품 (⑩ 클레임 단계)
+  INBOUND_ORDER // 입고 문서 (발주·생산 오더 번호)
+  STOCK_COUNT // 재고 실사
+  TRANSFER // 위치 이동 (나가는 행·들어오는 행이 같은 refId)
+  MANUAL // 관리자 수동 처리 (사유 필수)
+  MIGRATION // 시스템 이전 (Sku.stock → 원장)
+}
+
+// 예약 상태: RESERVED에서 한 번만 바뀝니다.
+enum ReservationStatus {
+  RESERVED // 결제 대기 중 (판매 가능 수량에서 빠져 있음)
+  CONFIRMED // 결제 승인 → 판매 확정 (원장 SALE 생성)
+  RELEASED // 해제 (결제 실패·이탈·새 주문으로 대체 등)
+  EXPIRED // 만료 (유효 시간 초과)
+}
+
+// 예약 해제 사유
+enum ReleaseReason {
+  PAYMENT_FAILED // 결제 실패·결제창 취소
+  SUPERSEDED // 같은 고객이 새 주문을 만들어 이전 결제 대기 주문을 대체
+  PRICE_CHANGED // 결제 직전 가격 변경으로 중단
+  COMPENSATED // 결제 승인 후 저장 실패 → 결제 취소(보상)
+  RENEWED // 결제 승인 직전 만료가 임박해서 새 예약으로 갱신
+  ADMIN // 관리자 처리
+}
+
+// 재고 위치
+model InventoryLocation {
+  id               Int          @id @default(autoincrement())
+  code             String       @unique // ONLINE_DC
+  name             String // 온라인 물류센터 (이천)
+  type             LocationType
+  isOnlineSellable Boolean      @default(false) // 온라인 주문에 재고를 쓸 수 있는 위치인가
+  isActive         Boolean      @default(true)
+  priority         Int          @default(0) // 여러 위치에 재고가 있을 때 먼저 쓰는 순서 (작을수록 먼저)
+  address          String?
+  contactPhone     String?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  balances     InventoryBalance[]
+  ledgers      InventoryLedger[]
+  reservations InventoryReservation[]
+}
+
+// 위치별 재고 잔고 ("지금 몇 개")
+// 행은 0으로만 만들 수 있고, onHand·reserved는 트리거만 바꿀 수 있습니다.
+model InventoryBalance {
+  skuId         Int
+  locationId    Int
+  onHand        Int       @default(0) // 실재고: 창고에 실제로 있는 수량 (= 원장 합계)
+  reserved      Int       @default(0) // 예약: 결제 대기 중인 수량 (= RESERVED 예약 합계)
+  safetyStock   Int       @default(0) // 안전재고: 오차 대비로 팔지 않고 남겨 두는 수량
+  lastCountedAt DateTime? // 마지막 실사 일시
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @default(now()) // 트리거·앱이 갱신
+
+  sku      Sku               @relation(fields: [skuId], references: [id], onDelete: Restrict)
+  location InventoryLocation @relation(fields: [locationId], references: [id], onDelete: Restrict)
+
+  @@id([skuId, locationId])
+  @@index([locationId])
+}
+
+// 재고 원장: 재고가 바뀐 모든 이유를 한 줄씩 기록 (추가만 가능 — 수정·삭제 금지)
+// 실재고 = 이 테이블 qty의 합계. 잘못 넣었으면 지우지 말고 반대 방향 행을 추가합니다.
+model InventoryLedger {
+  id            Int           @id @default(autoincrement())
+  skuId         Int
+  locationId    Int
+  type          LedgerType
+  qty           Int // 변동 수량 (입고 +10, 판매 −1)
+  balanceAfter  Int // 반영 후 실재고 (트리거가 "직전 실재고 + qty"와 같은지 검사)
+  refType       LedgerRefType
+  refId         String? // 참조 번호 (주문 id, 입고 문서 번호 PO-2611-001 등)
+  reservationId Int? // SALE이면 어떤 예약이 확정된 것인지
+  reason        String? // 조정·불량·수동 처리 사유 (해당 유형은 필수)
+  memo          String?
+  createdBy     String? // 처리자 (관리자 단계에서 FK로 연결, 시스템 처리는 SYSTEM)
+  occurredAt    DateTime // 실제로 일어난 시각 (실사일, 입고일)
+  createdAt     DateTime      @default(now()) // 기록한 시각
+
+  sku         Sku                   @relation(fields: [skuId], references: [id], onDelete: Restrict)
+  location    InventoryLocation     @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  reservation InventoryReservation? @relation(fields: [reservationId], references: [id], onDelete: Restrict)
+
+  @@index([skuId, locationId, id]) // 잔고 재계산·이력 조회
+  @@index([refType, refId])
+  @@index([reservationId])
+}
+
+// 재고 예약: 주문을 만들 때 잡고, 결제되면 확정, 아니면 해제·만료
+model InventoryReservation {
+  id            Int               @id @default(autoincrement())
+  orderId       Int
+  skuId         Int
+  locationId    Int
+  qty           Int
+  status        ReservationStatus @default(RESERVED)
+  expiresAt     DateTime // 이 시각까지 결제하지 않으면 만료
+  confirmedAt   DateTime?
+  releasedAt    DateTime? // 해제·만료된 시각
+  releaseReason ReleaseReason? // 해제 사유 (만료는 상태로 구분하므로 비워 둠)
+  createdAt     DateTime          @default(now())
+
+  order    Order             @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  sku      Sku               @relation(fields: [skuId], references: [id], onDelete: Restrict)
+  location InventoryLocation @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  ledgers  InventoryLedger[]
+
+  @@index([skuId, locationId, status]) // 예약 합계 계산
+  @@index([orderId])
+  @@index([status, expiresAt]) // 만료 대상 찾기
+}
+
 // 주문 (5단계 결제에서 사용)
 model Order {
   id             Int      @id @default(autoincrement())
@@ -669,8 +824,9 @@ model Order {
   createdAt      DateTime @default(now())
   userId         String // 주문한 사람
 
-  user  User        @relation(fields: [userId], references: [id])
-  items OrderItem[]
+  user         User                   @relation(fields: [userId], references: [id])
+  items        OrderItem[]
+  reservations InventoryReservation[]
 }
 
 // 주문 안의 상품 한 줄 (어떤 주문에, 어떤 SKU를, 몇 개)
