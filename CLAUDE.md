@@ -64,7 +64,7 @@ Roadmap: 0 setup ✅ → 1 product list/detail ✅ → 2 cart ✅ → 3 DB (Pris
 `dev.db`, `.env`, `backups/`는 Git에 올라가지 않습니다.
 
 1. `git pull` → `npm install` (Node는 `C:\Program Files\nodejs`)
-2. **`.env`는 직접 옮겨야 함**: 다른 컴퓨터의 `.env`를 USB 등으로 복사합니다. Git·채팅·메신저로 보내지 않습니다. `CUSTOMER_ENC_KEY`·`CUSTOMER_HASH_KEY`가 다르면 그 컴퓨터 DB의 암호문을 읽을 수 없습니다. 다만 DB도 새로 만든다면 새 키여도 괜찮습니다.
+2. **`.env`는 Git에 없음**: USB로 옮기거나, `.env.example`을 복사해 새로 만듭니다(항목별로 구하는 방법이 적혀 있음). 새로 만들 때 Claude가 `AUTH_SECRET`·`CUSTOMER_ENC_KEY`·`CUSTOMER_HASH_KEY`는 만들어 주고, GitHub 키(새 Client secret 발급)와 토스 문서 테스트 키는 사용자가 직접 `.env`에 붙여 넣습니다(채팅에 붙여 넣지 않음). 암호화 키가 다르면 다른 컴퓨터 DB의 암호문은 읽을 수 없지만, DB도 새로 만들면 괜찮습니다. 비밀값을 출력하지 말고 이름만 확인합니다.
 3. DB 새로 만들기: `npx prisma migrate deploy --config prisma7.config.ts` → `npx prisma generate --config prisma7.config.ts` → `npm run db:seed` → `npm run db:verify` → `npm test` (2026-11-18 빈 DB에서 확인: 오류 0, 테스트 437개 통과)
 4. GitHub 로그인은 OAuth 앱 콜백이 `http://localhost:3000/api/auth/callback/github`이므로 어느 컴퓨터에서든 같은 `.env`로 동작합니다.
 5. E2E 도구(playwright-core)와 일회용 스크립트는 Claude의 임시 폴더(scratchpad)에 있어서 컴퓨터를 옮기면 없습니다. 필요하면 다시 만듭니다.
