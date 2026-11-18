@@ -35,6 +35,7 @@ export const CUSTOMER_CANCEL_NOTICE: Record<string, string> = {
   FAILED: "취소하지 못했어요. 잠시 후 다시 시도하거나 고객센터로 문의해 주세요.",
   ADDRESS_CHANGED: "배송지를 바꿨어요.",
   CONFIRMED: "구매를 확정했어요. 감사합니다!",
+  CLAIMED: "비회원 주문을 내 계정으로 가져왔어요. 이제 주문 내역에서 볼 수 있어요.",
 };
 
 /** 택배사 배송조회 주소 ({no} 자리에 송장번호) */

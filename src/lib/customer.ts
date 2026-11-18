@@ -522,6 +522,7 @@ async function netPaidByCustomer(db: Db, from: Date, to: Date, customerId?: numb
   const result = new Map<number, number>();
   for (const r of rows) {
     const cid = orders.find((o) => o.id === r.orderId)!.customerId;
+    if (cid === null) continue; // 비회원 주문 (가져오기 전)은 등급 실적에 없음
     result.set(cid, (result.get(cid) ?? 0) + (r._sum.amount ?? 0) - (r._sum.canceledAmount ?? 0));
   }
   return result;

@@ -11,10 +11,15 @@ export default async function UserMenu() {
 
   if (!session?.user) {
     return (
-      // 로그인 화면(로그인 상태 유지 체크박스)으로 이동
-      <Link href="/login" className="rounded-lg bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700">
-        로그인
-      </Link>
+      // 비회원 주문조회 + 로그인 화면(로그인 상태 유지 체크박스)으로 이동
+      <div className="flex items-center gap-3">
+        <Link href="/guest/orders" className="text-gray-600 hover:text-gray-900">
+          비회원 주문조회
+        </Link>
+        <Link href="/login" className="rounded-lg bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700">
+          로그인
+        </Link>
+      </div>
     );
   }
 

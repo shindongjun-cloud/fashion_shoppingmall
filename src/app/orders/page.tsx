@@ -39,7 +39,12 @@ export default async function OrdersPage() {
   return (
     <main className="mx-auto w-full max-w-5xl px-4 py-10">
       <h1 className="text-2xl font-bold text-gray-900">내 주문 내역</h1>
-      <p className="mt-1 text-sm text-gray-500">{session?.user?.name}님, 안녕하세요.</p>
+      <div className="mt-1 flex flex-wrap items-center justify-between gap-2 text-sm text-gray-500">
+        <p>{session?.user?.name}님, 안녕하세요.</p>
+        <Link href="/orders/claim" className="underline">
+          비회원으로 주문하셨나요? 비회원 주문 가져오기
+        </Link>
+      </div>
 
       {orders.length === 0 ? (
         <div className="mt-10 text-center">
@@ -59,6 +64,7 @@ export default async function OrdersPage() {
                 <div className="flex flex-wrap justify-between gap-2 text-sm text-gray-500">
                   <span>
                     {formatDate(order.createdAt)} · 주문번호 {order.orderNo}
+                    {order.ordererType === "GUEST" && <span className="ml-1 text-xs text-gray-400">(비회원 주문에서 가져옴)</span>}
                   </span>
                   <span className={order.status === "CANCEL_FAILED" ? "font-bold text-red-600" : "font-medium text-gray-800"}>{statusText}</span>
                 </div>

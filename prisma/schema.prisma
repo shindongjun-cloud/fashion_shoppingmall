@@ -934,16 +934,18 @@ model Customer {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user          User?                   @relation(fields: [userId], references: [id], onDelete: SetNull)
-  grade         CustomerGrade           @relation(fields: [gradeId], references: [id], onDelete: Restrict)
-  profile       CustomerProfile?
-  bodyProfile   CustomerBodyProfile?
-  addresses     CustomerAddress[]
-  statusHistory CustomerStatusHistory[]
-  gradeHistory  CustomerGradeHistory[]
-  withdrawals   CustomerWithdrawal[]
-  loginHistory  CustomerLoginHistory[]
-  orders        Order[]
+  user               User?                   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  grade              CustomerGrade           @relation(fields: [gradeId], references: [id], onDelete: Restrict)
+  profile            CustomerProfile?
+  bodyProfile        CustomerBodyProfile?
+  addresses          CustomerAddress[]
+  statusHistory      CustomerStatusHistory[]
+  gradeHistory       CustomerGradeHistory[]
+  withdrawals        CustomerWithdrawal[]
+  loginHistory       CustomerLoginHistory[]
+  orders             Order[]
+  claimedGuestOrders GuestOrderAccess[] // 비회원 때 주문했다가 가져온 주문
+  guestAttempts      GuestLookupAttempt[] // 비회원 주문 가져오기 시도
 
   @@index([status])
   @@index([gradeId])
@@ -1162,6 +1164,31 @@ enum OrderActor {
   SYSTEM
 }
 
+// 주문자 신분 (주문할 때 기준)
+enum OrdererType {
+  MEMBER // 회원 (로그인)
+  GUEST // 비회원 (주문번호 + 주문 비밀번호로 조회)
+}
+
+// 비회원 임시 출입증 용도
+enum GuestSessionPurpose {
+  CHECKOUT // 주문서 → 결제창 → 완료 화면까지 (같은 브라우저가 주문한 사람임을 확인)
+  LOOKUP // 주문번호 + 비밀번호 조회에 성공한 뒤
+}
+
+enum GuestAttemptPurpose {
+  LOOKUP // 비회원 주문 조회
+  CLAIM // 회원이 비회원 주문을 내 계정으로 가져오기
+}
+
+enum GuestAttemptResult {
+  SUCCESS
+  WRONG // 주문번호가 없거나 비밀번호가 틀림 (같은 결과로 취급 — 주문번호 존재 여부를 알려 주지 않음)
+  LOCKED // 그 주문이 연속 실패로 잠김
+  RATE_LIMITED // 같은 IP의 실패가 너무 많음
+  CLAIMED_ALREADY // 이미 회원 계정으로 옮겨진 주문 (비밀번호가 맞을 때만 알려 줌)
+}
+
 enum OrderChannel {
   WEB // PC 웹
   MOBILE_WEB // 모바일 웹
@@ -1198,7 +1225,9 @@ model Order {
   orderNo        String       @unique // ★ 고객용 주문번호 "20261118-48213907" (한국 날짜 + 무작위 8자리: 하루 주문 수 노출 방지)
   paymentOrderId String       @unique // 토스페이먼츠에 보내는 주문번호 (영문/숫자/-_= 6~64자)
   orderName      String // 결제창에 보이는 이름. 예: "러닝 스니커즈 외 2건"
-  customerId     Int // 주문한 고객 (로그인 계정 User가 아니라 Customer → 탈퇴해도 주문 기록은 남음)
+  customerId     Int? // 주문한 회원 (로그인 계정 User가 아니라 Customer → 탈퇴해도 남음). 비회원 주문은 비어 있고, 회원 계정으로 가져오면 그 회원
+  ordererType    OrdererType // ★ 주문할 "때"의 신분 MEMBER / GUEST (가져와도 바뀌지 않음: 비회원으로 산 사실)
+  linkedAt       DateTime? // ★ 비회원 주문을 회원 계정으로 가져온 시각
   channel        OrderChannel @default(WEB) // ★ 주문 경로
 
   // 상태 (돈). 바꿀 때 statusChangedAt·statusChangedBy를 함께 바꾸면 트리거가 이력을 남김
@@ -1235,7 +1264,10 @@ model Order {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @default(now()) // 앱이 갱신 (트리거가 바꾸는 요약 칸도 있어 @updatedAt 대신 직접)
 
-  customer        Customer               @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  customer        Customer?              @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  guestAccess     GuestOrderAccess? // 비회원 주문의 조회 비밀번호·동의·가져오기 기록
+  guestSessions   GuestOrderSession[]
+  guestAttempts   GuestLookupAttempt[]
   shippingPolicy  ShippingPolicy         @relation(fields: [shippingPolicyId], references: [id], onDelete: Restrict)
   shippingAddress OrderShippingAddress?
   items           OrderItem[]
@@ -1250,6 +1282,66 @@ model Order {
   @@index([fulfillmentStatus, createdAt]) // 관리: "준비 전 주문" 목록
   @@index([ordererPhoneHash])
   @@index([createdAt]) // 5년 지난 개인정보 파기 대상
+}
+
+// 비회원 주문의 조회 비밀번호·개인정보 동의·회원 가져오기 기록 (비회원 주문당 1개)
+// 비밀번호는 scrypt 해시만 저장 ("s1:<소금값>:<해시>"), 5번 틀리면 30분 잠금
+// 회원이 가져가면 claimedAt·claimedByCustomerId 기록 → 비회원 조회로는 "회원 계정으로 옮겨졌어요" 안내만 (비밀번호가 맞을 때)
+model GuestOrderAccess {
+  orderId               Int       @id
+  passwordHash          String? // 5년 뒤 개인정보 파기 때 비움
+  failedCount           Int       @default(0) // 연속 실패 (성공하면 0)
+  lockedUntil           DateTime? // 연속 5회 실패 → 30분 잠금
+  lastFailedAt          DateTime?
+  lastAccessAt          DateTime? // 마지막 조회 성공
+  privacyConsentAt      DateTime // 비회원 주문 개인정보 수집·이용 동의 시각 (필수)
+  privacyConsentVersion String // 동의 문구 버전 (예: guest-order-2611)
+  claimedAt             DateTime? // 회원 계정으로 옮긴 시각
+  claimedByCustomerId   Int? // 옮겨 간 회원
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  order     Order     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  claimedBy Customer? @relation(fields: [claimedByCustomerId], references: [id], onDelete: Restrict)
+
+  @@index([claimedByCustomerId])
+}
+
+// 비회원 임시 출입증 (쿠키에는 무작위 값, DB에는 SHA-256 해시만). 30분, 회원으로 가져가면 모두 무효
+model GuestOrderSession {
+  id        Int                 @id @default(autoincrement())
+  orderId   Int
+  tokenHash String              @unique
+  purpose   GuestSessionPurpose
+  expiresAt DateTime
+  revokedAt DateTime?
+  ipMasked  String?
+  createdAt DateTime            @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([expiresAt]) // 지난 출입증 정리
+}
+
+// 비회원 조회·가져오기 시도 기록 (무작위 대입 차단 + 감사, 추가만 가능, 90일 보관)
+model GuestLookupAttempt {
+  id           Int                 @id @default(autoincrement())
+  purpose      GuestAttemptPurpose
+  orderNoInput String // 입력한 주문번호 (형식이 틀리면 'INVALID')
+  orderId      Int? // 실제로 있는 주문이면
+  customerId   Int? // 가져오기를 시도한 회원
+  result       GuestAttemptResult
+  ipHash       String // 같은 IP 실패 횟수 세기용 (HMAC, 원문 IP 저장 안 함)
+  ipMasked     String? // 사람이 보는 용도 (가린 IP)
+  attemptedAt  DateTime
+
+  order    Order?    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  @@index([ipHash, attemptedAt]) // IP별 최근 실패
+  @@index([orderId, attemptedAt])
+  @@index([attemptedAt]) // 90일 지난 기록 정리
 }
 
 // 주문 당시 배송지 (주문당 1개, 암호화). 주소록(CustomerAddress)을 바꾸거나 지워도 이 값은 그대로

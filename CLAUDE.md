@@ -107,6 +107,16 @@ Tests use Node's built-in runner via tsx (no extra framework). Also verify UI ch
 - `orderNo` = KST date + 8 random digits (unique; never sequential). Pages: `/orders/[orderNo]` (items, tracking link, confirm, cancel, address change). Action errors go through a one-time flash cookie bound to `?e=<id>` — never put message text in the URL.
 - Orders created before ⑦ use policy `LEGACY-FREE` and have no address snapshot.
 
+## Guest orders (비회원, lib/guest.ts)
+
+- `Order.ordererType` (MEMBER | GUEST) is the identity **at purchase time** and never changes. `customerId` is null for a guest order until a member claims it (`linkedAt`). Guests: orderer name/phone/email required (encrypted), coupon/point/shipping discount = 0 (CHECKs).
+- Owner checks go through `OrderOwner` (`lib/order-rules.ts`): `{ customerId }` (login) or `{ guestOrderId }` (pass). A plain number still means a member id. Resolve the request's owner with `lib/current-owner.ts` (`getOwners`, `getGuestOrderId`); never trust a client-sent id.
+- Tables: `GuestOrderAccess` (scrypt hash `s1:salt:hash`, failedCount/lockedUntil, privacy consent time+version, claimedAt/By), `GuestOrderSession` (pass = random token in httpOnly cookie `shop-guest-order`, SHA-256 in DB; CHECKOUT 60 min / LOOKUP 30 min; revoke-only), `GuestLookupAttempt` (append-only, ipHash HMAC + masked IP, 90 days).
+- Lookup (`/guest/orders`): 5 wrong → 30-min lock; 20 failures/hour per IP → blocked. "No such order / wrong / locked" all answer WRONG (no existence leak); CLAIMED is shown only when the password matches.
+- Checkout: `/login` → "비회원으로 주문하기" → `/checkout?guest=1` (members always get member checkout). `placeGuestOrder` creates order + access + CHECKOUT pass; Toss gets `customerKey: ANONYMOUS`. `/api/payments/confirm` accepts a guest only if the pass belongs to that order (else `GUEST_SESSION_EXPIRED`, nothing charged).
+- Claim (`/orders/claim`, `claimGuestOrder`): member proves ownership with order no. + password or a valid pass from the same browser; **never auto-link by phone/email** (sign-up has no phone/email verification). Claiming sets `customerId`/`linkedAt` once (trigger `Order_link_guard` + `GuestOrderAccess_update_guard`), revokes passes; counts toward grades, no retroactive coupons/points. Pending orders and non-ACTIVE members can't claim.
+- Jobs: `npm run orders:jobs -- guest-cleanup`. The 5-year PII purge also wipes the guest password hash.
+
 ## Architecture
 
 - **Data flow**: pages under `src/app` are async server components that query Prisma directly. Every page that reads the DB sets `export const dynamic = "force-dynamic"` so that DB changes show up without a rebuild.

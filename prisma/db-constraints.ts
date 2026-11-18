@@ -547,8 +547,39 @@ const ORDER_CHECKS: CheckConstraint[] = [
   { table: "ShipmentItem", name: "ShipmentItem_qty_ck", expr: int("qty", ">= 1"), why: "수량 1개 이상" },
 ];
 
+// ----- 비회원 주문
+const GUEST_CHECKS: CheckConstraint[] = [
+  {
+    table: "Order",
+    name: "Order_orderer_type_ck",
+    expr: `("ordererType" = 'MEMBER' AND "customerId" IS NOT NULL AND "linkedAt" IS NULL) OR ("ordererType" = 'GUEST' AND ("customerId" IS NULL) = ("linkedAt" IS NULL))`,
+    why: "회원 주문은 회원 필수, 비회원 주문은 회원이 비어 있거나(가져오기 전) 가져온 시각과 함께 있음",
+  },
+  { table: "Order", name: "Order_guest_benefit_ck", expr: `"ordererType" <> 'GUEST' OR ("couponDiscountTotal" = 0 AND "pointUsed" = 0 AND "shippingDiscount" = 0)`, why: "비회원은 쿠폰·포인트·배송비 할인 없이 결제" },
+  {
+    table: "Order",
+    name: "Order_guest_orderer_ck",
+    expr: `"ordererType" <> 'GUEST' OR "piiPurgedAt" IS NOT NULL OR ("ordererNameEnc" IS NOT NULL AND "ordererPhoneEnc" IS NOT NULL AND "ordererPhoneHash" IS NOT NULL AND "ordererEmailEnc" IS NOT NULL)`,
+    why: "비회원 주문은 주문자 이름·연락처·이메일 필수 (회원 정보가 없으므로 연락 수단) — 5년 뒤 파기 전까지",
+  },
+  { table: "Order", name: "Order_linked_date_ck", expr: `(${isoDateOrNull("linkedAt")}) AND ("linkedAt" IS NULL OR "linkedAt" >= "createdAt")`, why: "가져온 시각은 주문 이후" },
+  {
+    table: "GuestOrderAccess",
+    name: "GuestOrderAccess_values_ck",
+    expr: `("passwordHash" IS NULL OR ("passwordHash" GLOB 's1:?*:?*' AND length("passwordHash") BETWEEN 40 AND 300)) AND (${int("failedCount", ">= 0")}) AND ${notBlank("privacyConsentVersion")} AND ("claimedAt" IS NULL) = ("claimedByCustomerId" IS NULL) AND ${dates(["lockedUntil", true], ["lastFailedAt", true], ["lastAccessAt", true], ["privacyConsentAt", false], ["claimedAt", true], ["createdAt", false], ["updatedAt", false])}`,
+    why: "비밀번호는 해시 형식만(원문 금지), 실패 횟수 0 이상, 동의 버전 필수, 가져온 시각·회원은 함께",
+  },
+  { table: "GuestOrderSession", name: "GuestOrderSession_values_ck", expr: `length("tokenHash") = 64 AND "tokenHash" NOT GLOB '*[^0-9a-f]*' AND "expiresAt" > "createdAt" AND ${dates(["expiresAt", false], ["revokedAt", true], ["createdAt", false])}`, why: "출입증은 해시(64자)로만, 만료는 발급 이후" },
+  {
+    table: "GuestLookupAttempt",
+    name: "GuestLookupAttempt_values_ck",
+    expr: `length("ipHash") = 64 AND "ipHash" NOT GLOB '*[^0-9a-f]*' AND length("orderNoInput") BETWEEN 1 AND 20 AND ("purpose" = 'CLAIM') = ("customerId" IS NOT NULL) AND ${dates(["attemptedAt", false])}`,
+    why: "IP는 해시로만, 가져오기 시도는 회원 필수",
+  },
+];
+
 export function allChecks(schemaText: string): CheckConstraint[] {
-  return [...autoChecks(schemaText), ...MANUAL_CHECKS, ...PAYMENT_CHECKS, ...ORDER_CHECKS];
+  return [...autoChecks(schemaText), ...MANUAL_CHECKS, ...PAYMENT_CHECKS, ...ORDER_CHECKS, ...GUEST_CHECKS];
 }
 
 // ---------------------------------------------------------------
@@ -1080,7 +1111,7 @@ BEGIN ${raise("CustomerLoginHistory_retention", "3개월이 지나지 않은 로
     name: "Order_customer_active",
     why: "탈퇴·탈퇴 신청·정지·휴면 고객은 새 주문 금지",
     sql: `CREATE TRIGGER "Order_customer_active" BEFORE INSERT ON "Order"
-WHEN ${customerStatusOf("customerId")} IS NOT 'ACTIVE'
+WHEN NEW."customerId" IS NOT NULL AND ${customerStatusOf("customerId")} IS NOT 'ACTIVE'
 BEGIN ${raise("Order_customer_active", "정상(ACTIVE) 상태의 고객만 주문할 수 있습니다")} END;`,
   },
 ];
@@ -1152,7 +1183,7 @@ BEGIN ${raise("Order_insert_pending", "주문은 PENDING 상태로만 만들 수
   fixedColumns(
     "Order",
     "Order_total_fixed",
-    ["totalPrice", "paymentOrderId", "customerId", "orderNo", "channel", "itemsListTotal", "itemsDiscountTotal", "itemsTotal", "couponDiscountTotal", "shippingBaseFee", "shippingExtraFee", "shippingFee", "shippingDiscount", "pointUsed", "shippingPolicyId", "freeShippingThreshold", "createdAt"],
+    ["totalPrice", "paymentOrderId", "orderNo", "ordererType", "channel", "itemsListTotal", "itemsDiscountTotal", "itemsTotal", "couponDiscountTotal", "shippingBaseFee", "shippingExtraFee", "shippingFee", "shippingDiscount", "pointUsed", "shippingPolicyId", "freeShippingThreshold", "createdAt"],
     "주문 금액·주문번호·고객·배송비 규칙은 바꿀 수 없습니다",
     "결제 금액 비교 기준·토스 주문번호·금액 구성이 바뀌면 결제·환불 계산과 어긋남",
   ),
@@ -1564,6 +1595,100 @@ END;`,
   ...appendOnly("OrderStatusHistory"),
   ...appendOnly("OrderItemStatusHistory"),
 
+  // --- 비회원 주문 → 회원 계정 가져오기 (한 번만)
+  {
+    table: "Order",
+    name: "Order_link_guard",
+    why: "주문자 신분은 바꿀 수 없음. 회원 지정은 비회원 주문에서 '비어 있음 → 회원' 한 번만, 결제 대기가 아닐 때, 정상 회원에게, 가져오기 기록(GuestOrderAccess)과 같은 회원으로",
+    sql: `CREATE TRIGGER "Order_link_guard" BEFORE UPDATE OF "customerId", "linkedAt", "ordererType" ON "Order"
+WHEN NEW."customerId" IS NOT OLD."customerId" OR NEW."linkedAt" IS NOT OLD."linkedAt" OR NEW."ordererType" IS NOT OLD."ordererType"
+BEGIN
+SELECT CASE
+  WHEN NEW."ordererType" IS NOT OLD."ordererType"
+    THEN RAISE(ABORT, 'Order_link_guard: 주문자 신분(회원·비회원)은 바꿀 수 없습니다')
+  WHEN OLD."customerId" IS NOT NULL OR OLD."linkedAt" IS NOT NULL
+    THEN RAISE(ABORT, 'Order_link_guard: 이미 회원 주문입니다 (주문의 회원은 바꿀 수 없습니다)')
+  WHEN NEW."ordererType" <> 'GUEST' OR NEW."customerId" IS NULL OR NEW."linkedAt" IS NULL
+    THEN RAISE(ABORT, 'Order_link_guard: 비회원 주문만 회원 계정으로 가져올 수 있습니다 (회원·가져온 시각 함께)')
+  WHEN OLD."status" = 'PENDING'
+    THEN RAISE(ABORT, 'Order_link_guard: 결제 대기 주문은 가져올 수 없습니다')
+  WHEN ${customerStatusOf("customerId")} IS NOT 'ACTIVE'
+    THEN RAISE(ABORT, 'Order_link_guard: 정상(ACTIVE) 회원만 주문을 가져올 수 있습니다')
+  WHEN (SELECT g."claimedByCustomerId" FROM "GuestOrderAccess" g WHERE g."orderId" = NEW."id") IS NOT NEW."customerId"
+    THEN RAISE(ABORT, 'Order_link_guard: 가져오기 기록(GuestOrderAccess)의 회원과 다릅니다')
+END;
+END;`,
+  },
+  {
+    table: "GuestOrderAccess",
+    name: "GuestOrderAccess_insert_guard",
+    why: "비회원 결제 대기 주문에만, 처음에는 실패·잠금·가져오기 기록 없이",
+    sql: `CREATE TRIGGER "GuestOrderAccess_insert_guard" BEFORE INSERT ON "GuestOrderAccess"
+WHEN (SELECT o."ordererType" || '/' || o."status" FROM "Order" o WHERE o."id" = NEW."orderId") IS NOT 'GUEST/PENDING'
+  OR NEW."failedCount" <> 0 OR NEW."lockedUntil" IS NOT NULL OR NEW."claimedAt" IS NOT NULL OR NEW."passwordHash" IS NULL
+BEGIN ${raise("GuestOrderAccess_insert_guard", "비회원 결제 대기 주문에만 조회 비밀번호를 만들 수 있습니다")} END;`,
+  },
+  {
+    table: "GuestOrderAccess",
+    name: "GuestOrderAccess_update_guard",
+    why: "동의 기록·주문은 고정, 비밀번호는 파기(비우기)만, 가져오기는 한 번만(결제 대기 아닌, 아직 회원이 없는 주문)",
+    sql: `CREATE TRIGGER "GuestOrderAccess_update_guard" BEFORE UPDATE ON "GuestOrderAccess"
+BEGIN
+SELECT CASE
+  WHEN NEW."orderId" IS NOT OLD."orderId" OR NEW."privacyConsentAt" IS NOT OLD."privacyConsentAt" OR NEW."privacyConsentVersion" IS NOT OLD."privacyConsentVersion" OR NEW."createdAt" IS NOT OLD."createdAt"
+    THEN RAISE(ABORT, 'GuestOrderAccess_fixed: 주문·동의 기록은 바꿀 수 없습니다')
+  WHEN NEW."passwordHash" IS NOT OLD."passwordHash" AND NEW."passwordHash" IS NOT NULL
+    THEN RAISE(ABORT, 'GuestOrderAccess_fixed: 조회 비밀번호는 바꿀 수 없습니다 (파기만 가능)')
+  WHEN OLD."claimedAt" IS NOT NULL AND (NEW."claimedAt" IS NOT OLD."claimedAt" OR NEW."claimedByCustomerId" IS NOT OLD."claimedByCustomerId")
+    THEN RAISE(ABORT, 'GuestOrderAccess_claim_once: 이미 회원 계정으로 옮겨진 주문입니다')
+  WHEN OLD."claimedAt" IS NULL AND NEW."claimedAt" IS NOT NULL
+      AND (SELECT o."customerId" IS NOT NULL OR o."status" = 'PENDING' FROM "Order" o WHERE o."id" = NEW."orderId")
+    THEN RAISE(ABORT, 'GuestOrderAccess_claim_once: 결제 대기이거나 이미 회원이 있는 주문은 가져올 수 없습니다')
+END;
+END;`,
+  },
+  noDelete("GuestOrderAccess", "비회원 주문 조회 기록은 삭제할 수 없습니다 (파기는 비밀번호 비우기)", "동의·가져오기 기록 보관"),
+  {
+    table: "GuestOrderSession",
+    name: "GuestOrderSession_insert_guard",
+    why: "아직 회원 계정으로 옮기지 않은 비회원 주문에만 출입증 발급",
+    sql: `CREATE TRIGGER "GuestOrderSession_insert_guard" BEFORE INSERT ON "GuestOrderSession"
+WHEN (SELECT o."ordererType" = 'GUEST' AND o."customerId" IS NULL FROM "Order" o WHERE o."id" = NEW."orderId") IS NOT 1 OR NEW."revokedAt" IS NOT NULL
+BEGIN ${raise("GuestOrderSession_insert_guard", "회원 계정으로 옮긴 주문이나 회원 주문에는 비회원 출입증을 만들 수 없습니다")} END;`,
+  },
+  {
+    table: "GuestOrderSession",
+    name: "GuestOrderSession_revoke_only",
+    why: "출입증은 무효로 만드는 것(revokedAt)만 가능 — 기간 연장·다른 주문으로 바꾸기 금지",
+    sql: `CREATE TRIGGER "GuestOrderSession_revoke_only" BEFORE UPDATE ON "GuestOrderSession"
+WHEN NEW."orderId" IS NOT OLD."orderId" OR NEW."tokenHash" IS NOT OLD."tokenHash" OR NEW."purpose" IS NOT OLD."purpose" OR NEW."expiresAt" IS NOT OLD."expiresAt"
+  OR NEW."createdAt" IS NOT OLD."createdAt" OR (OLD."revokedAt" IS NOT NULL AND NEW."revokedAt" IS NOT OLD."revokedAt") OR NEW."revokedAt" IS NULL
+BEGIN ${raise("GuestOrderSession_revoke_only", "출입증은 무효 처리만 할 수 있습니다")} END;`,
+  },
+  {
+    table: "GuestOrderSession",
+    name: "GuestOrderSession_delete_guard",
+    why: "만료되거나 무효가 된 출입증만 삭제(정리) 가능",
+    sql: `CREATE TRIGGER "GuestOrderSession_delete_guard" BEFORE DELETE ON "GuestOrderSession"
+WHEN OLD."revokedAt" IS NULL AND OLD."expiresAt" > ${NOW}
+BEGIN ${raise("GuestOrderSession_delete_guard", "아직 유효한 출입증은 지울 수 없습니다")} END;`,
+  },
+  {
+    table: "GuestLookupAttempt",
+    name: "GuestLookupAttempt_no_update",
+    why: "시도 기록은 수정 금지",
+    sql: `CREATE TRIGGER "GuestLookupAttempt_no_update" BEFORE UPDATE ON "GuestLookupAttempt"
+BEGIN ${raise("GuestLookupAttempt_append_only", "시도 기록은 수정할 수 없습니다")} END;`,
+  },
+  {
+    table: "GuestLookupAttempt",
+    name: "GuestLookupAttempt_retention",
+    why: "시도 기록은 90일이 지난 것만 삭제 가능",
+    sql: `CREATE TRIGGER "GuestLookupAttempt_retention" BEFORE DELETE ON "GuestLookupAttempt"
+WHEN julianday(${NOW}) - julianday(OLD."attemptedAt") < 90
+BEGIN ${raise("GuestLookupAttempt_retention", "90일이 지나지 않은 시도 기록은 지울 수 없습니다")} END;`,
+  },
+
   // --- 결제와의 연결: 결제 시작 전 마지막 검사, 출고 후 취소 막기
   {
     table: "Payment",
@@ -1575,6 +1700,9 @@ BEGIN
 SELECT CASE
   WHEN NOT EXISTS (SELECT 1 FROM "OrderShippingAddress" a WHERE a."orderId" = NEW."orderId" AND a."piiPurgedAt" IS NULL)
     THEN RAISE(ABORT, 'Payment_order_ready: 배송지가 없는 주문은 결제할 수 없습니다')
+  WHEN (SELECT o."ordererType" FROM "Order" o WHERE o."id" = NEW."orderId") = 'GUEST'
+      AND NOT EXISTS (SELECT 1 FROM "GuestOrderAccess" g WHERE g."orderId" = NEW."orderId" AND g."passwordHash" IS NOT NULL)
+    THEN RAISE(ABORT, 'Payment_order_ready: 비회원 주문은 조회 비밀번호·개인정보 동의 기록이 있어야 결제할 수 있습니다')
   WHEN EXISTS (SELECT 1 FROM "Order" o WHERE o."id" = NEW."orderId" AND (
       o."itemsListTotal" IS NOT (SELECT SUM(i."lineListTotal") FROM "OrderItem" i WHERE i."orderId" = o."id")
       OR o."itemsDiscountTotal" IS NOT (SELECT SUM(i."lineDiscountTotal") FROM "OrderItem" i WHERE i."orderId" = o."id")

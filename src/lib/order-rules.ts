@@ -96,3 +96,21 @@ export async function quoteShipping(db: Db, itemsTotal: number, zipCode: string,
 
 export const autoConfirmAt = (deliveredAt: Date) => new Date(deliveredAt.getTime() + AUTO_CONFIRM_DAYS * DAY);
 export const piiPurgeCutoff = (now: Date) => new Date(now.getTime() - PII_RETENTION_DAYS * DAY);
+
+// ---------------------------------------------------------------
+// 주문의 주인: 회원(로그인) 또는 비회원(그 주문 전용 출입증)
+//   숫자만 넘기면 회원 고객 id로 봅니다 (기존 호출 그대로 동작)
+//   비회원 주문을 회원 계정으로 가져가면 그때부터는 회원만 주인 (비회원 출입증으로는 접근 불가)
+// ---------------------------------------------------------------
+export type OrderOwner = { customerId: number; guestOrderId?: undefined } | { guestOrderId: number; customerId?: undefined };
+export type OwnerArg = number | OrderOwner;
+export const toOwner = (o: OwnerArg): OrderOwner => (typeof o === "number" ? { customerId: o } : o);
+export function ownsOrder(owner: OwnerArg, order: { id: number; customerId: number | null }) {
+  const o = toOwner(owner);
+  return o.customerId !== undefined ? order.customerId === o.customerId : order.id === o.guestOrderId && order.customerId === null;
+}
+/** 결제 취소 요청자 기록용 ("12" = 회원 고객 id, "GUEST:34" = 비회원 주문 id) */
+export const ownerRef = (owner: OwnerArg) => {
+  const o = toOwner(owner);
+  return o.customerId !== undefined ? String(o.customerId) : `GUEST:${o.guestOrderId}`;
+};

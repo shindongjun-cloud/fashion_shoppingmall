@@ -225,6 +225,20 @@ const RULES: [string, string, "error" | "warn"][] = [
     `SELECT o."orderNo" FROM "Order" o JOIN "ShippingPolicy" sp ON sp."id" = o."shippingPolicyId"
      WHERE sp."code" <> 'LEGACY-FREE' AND EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = o."id" AND p."status" <> 'ABORTED')
        AND NOT EXISTS (SELECT 1 FROM "OrderShippingAddress" a WHERE a."orderId" = o."id")`, "error"],
+  // ----- 비회원 주문
+  ["비회원 주문: 조회 비밀번호·개인정보 동의 기록(GuestOrderAccess)이 있고, 회원 주문에는 없음",
+    `SELECT o."orderNo", o."ordererType" FROM "Order" o LEFT JOIN "GuestOrderAccess" g ON g."orderId" = o."id"
+     WHERE (o."ordererType" = 'GUEST') <> (g."orderId" IS NOT NULL)`, "error"],
+  ["비회원 주문: 회원으로 가져온 주문은 가져온 회원 = 주문의 회원, 아직이면 둘 다 비어 있음",
+    `SELECT o."orderNo" FROM "Order" o JOIN "GuestOrderAccess" g ON g."orderId" = o."id" WHERE g."claimedByCustomerId" IS NOT o."customerId"`, "error"],
+  ["비회원 주문: 쿠폰·포인트 사용 없음",
+    `SELECT o."orderNo" FROM "Order" o WHERE o."ordererType" = 'GUEST' AND (o."couponDiscountTotal" <> 0 OR o."pointUsed" <> 0 OR o."shippingDiscount" <> 0)`, "error"],
+  ["비회원 주문: 회원으로 옮긴 주문의 비회원 출입증은 모두 무효",
+    `SELECT s."id" FROM "GuestOrderSession" s JOIN "Order" o ON o."id" = s."orderId" WHERE o."customerId" IS NOT NULL AND s."revokedAt" IS NULL AND s."expiresAt" > ${NOW}`, "error"],
+  ["비회원 주문: 지난 출입증·90일 지난 조회 기록이 정리됨 → npm run orders:jobs -- guest-cleanup",
+    `SELECT (SELECT count(*) FROM "GuestOrderSession" WHERE julianday(${NOW}) - julianday("expiresAt") > 1) AS sessions,
+            (SELECT count(*) FROM "GuestLookupAttempt" WHERE julianday(${NOW}) - julianday("attemptedAt") > 91) AS attempts
+     WHERE sessions > 0 OR attempts > 0`, "warn"],
   ["배송비 규칙: 지금 적용 중인 규칙이 정확히 1개 (없으면 주문 불가)",
     `SELECT count(*) AS n FROM "ShippingPolicy" WHERE "validFrom" <= ${NOW} AND ("validTo" IS NULL OR "validTo" > ${NOW}) HAVING count(*) <> 1`, "error"],
   ["주문: 출고 후 결제가 전액 취소된 주문 없음 (토스 상점관리자에서 취소?) → 상품 회수·반품 확인 필요",

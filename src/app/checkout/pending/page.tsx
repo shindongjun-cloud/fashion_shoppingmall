@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { getCurrentCustomer } from "@/lib/current-customer";
+import { getOwners } from "@/lib/current-owner";
+import { ownsOrder } from "@/lib/order-rules";
 import { prisma } from "@/lib/prisma";
 import AutoRefresh from "@/components/AutoRefresh";
 import { loginPath } from "@/lib/safe-redirect";
@@ -14,11 +15,12 @@ const MAX_TRIES = 20;
 
 export default async function PendingPage({ searchParams }: PageProps<"/checkout/pending">) {
   const { orderNo, try: tryParam } = await searchParams;
-  const customer = await getCurrentCustomer();
-  if (!customer) redirect(loginPath("/orders"));
+  const owners = await getOwners();
+  if (owners.length === 0) redirect(loginPath("/orders"));
   if (typeof orderNo !== "string") notFound();
-  const order = await prisma.order.findFirst({ where: { orderNo, customerId: customer.id } });
-  if (!order) notFound();
+  const order = await prisma.order.findUnique({ where: { orderNo } });
+  if (!order || !owners.some((o) => ownsOrder(o, order))) notFound();
+  const guest = order.customerId === null;
   const tries = Math.max(0, Number(tryParam) || 0);
   const keepChecking = tries < MAX_TRIES;
 
@@ -39,7 +41,7 @@ export default async function PendingPage({ searchParams }: PageProps<"/checkout
             다시 확인
           </Link>
         )}
-        <Link href="/orders" className="rounded-lg border border-gray-300 px-6 py-3 font-medium text-gray-700 hover:bg-gray-50">
+        <Link href={guest ? `/guest/orders/${order.orderNo}` : "/orders"} className="rounded-lg border border-gray-300 px-6 py-3 font-medium text-gray-700 hover:bg-gray-50">
           주문 내역
         </Link>
       </div>

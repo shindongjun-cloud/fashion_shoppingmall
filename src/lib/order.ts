@@ -13,9 +13,9 @@
 // 트리거가 막은 경우(동시에 일어난 일 등)도 안내 문구로 바꿉니다.
 import type { OrderActor, Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
-import { recipientPhoneHash } from "@/lib/checkout";
+import { guestAddressSnapshot, recipientPhoneHash, type GuestAddressInput } from "@/lib/checkout";
 import { isBusyError, isConstraintError, withBusyRetry } from "@/lib/inventory";
-import { findZone, itemStatusData, OrderError, ORDER_NO_PATTERN, piiPurgeCutoff } from "@/lib/order-rules";
+import { findZone, itemStatusData, OrderError, ORDER_NO_PATTERN, ownerRef, ownsOrder, piiPurgeCutoff, toOwner, type OwnerArg } from "@/lib/order-rules";
 import { cancelWaitingDepositOrder, defaultPaymentDeps, PaymentError, requestPaymentCancel, type PaymentDeps } from "@/lib/payment";
 
 export { OrderError } from "@/lib/order-rules";
@@ -41,10 +41,11 @@ function friendly(e: unknown): never {
   throw e;
 }
 
-async function findCustomerOrder(customerId: number, orderNo: string) {
+/** 주인(회원 또는 비회원 출입증)의 주문만. 남의 주문은 "없음"과 똑같이 (존재 여부도 알려 주지 않음) */
+async function findCustomerOrder(owner: OwnerArg, orderNo: string) {
   if (!ORDER_NO_PATTERN.test(orderNo)) return null;
   const order = await prisma.order.findUnique({ where: { orderNo }, include: { items: true } });
-  return order && order.customerId === customerId ? order : null; // 남의 주문은 "없음"과 똑같이 (존재 여부도 알려 주지 않음)
+  return order && ownsOrder(owner, order) ? order : null;
 }
 async function findOrderByNo(orderNo: string) {
   if (!ORDER_NO_PATTERN.test(orderNo)) throw new OrderError("주문번호 형식이 올바르지 않아요. (예: 20261118-48213907)");
@@ -68,15 +69,15 @@ export type CustomerCancelCode = "DONE" | "NOT_FOUND" | "NOT_CANCELABLE" | "PREP
  * 토스 전액 취소가 끝나면 settleOrder가 할당을 풀고 주문·상품을 취소로 바꿈.
  */
 export async function cancelPaidOrder(
-  customerId: number,
+  owner: OwnerArg,
   orderNo: string,
   input: { reason: string; refundAccount?: RefundAccountInput },
   deps: PaymentDeps = defaultPaymentDeps,
 ): Promise<CustomerCancelCode> {
-  const order = await findCustomerOrder(customerId, orderNo);
+  const order = await findCustomerOrder(owner, orderNo);
   if (!order) return "NOT_FOUND";
   if (order.status === "WAITING_DEPOSIT") {
-    const code = await cancelWaitingDepositOrder(customerId, order.id, deps);
+    const code = await cancelWaitingDepositOrder(owner, order.id, deps);
     return code === "DONE" ? "DONE" : code === "RESULT_PENDING" ? "RESULT_PENDING" : code === "NOT_FOUND" ? "NOT_FOUND" : "FAILED";
   }
   if (order.status !== "PAID") return "NOT_CANCELABLE";
@@ -88,7 +89,7 @@ export async function cancelPaidOrder(
   try {
     const r = await requestPaymentCancel(
       payment.id,
-      { reasonCode: "CUSTOMER_REQUEST", reasonText: `고객 요청: ${reason}`, requestedBy: "CUSTOMER", requestedByRef: String(customerId), refundAccount: input.refundAccount },
+      { reasonCode: "CUSTOMER_REQUEST", reasonText: `고객 요청: ${reason}`, requestedBy: "CUSTOMER", requestedByRef: ownerRef(owner), refundAccount: input.refundAccount },
       deps,
     );
     if (r.status === "DONE") return "DONE";
@@ -104,18 +105,23 @@ export async function cancelPaidOrder(
 // ---------------------------------------------------------------
 // 고객: 배송지 변경 (주소록에서 골라 복사)
 // ---------------------------------------------------------------
-export async function changeOrderAddress(customerId: number, orderNo: string, addressId: number, now = new Date()) {
-  const order = await findCustomerOrder(customerId, orderNo);
+/** 배송지 변경 공통: 준비 전·같은 추가 배송비 지역만, 버전 확인 */
+async function applyAddressChange(
+  owner: OwnerArg,
+  orderNo: string,
+  next: { sourceAddressId: number | null; recipientEnc: string; phoneEnc: string; phoneHash: string | null; zipCode: string; address1Enc: string; address2Enc: string | null; deliveryMemoEnc: string | null },
+  reason: string,
+  now: Date,
+) {
+  const order = await findCustomerOrder(owner, orderNo);
   if (!order) throw new OrderError("주문을 찾을 수 없어요.");
   if (!["PENDING", "WAITING_DEPOSIT", "PAID"].includes(order.status)) throw new OrderError("취소·만료된 주문의 배송지는 바꿀 수 없어요.");
   if (order.items.some((i) => ["PREPARING", "SHIPPED", "DELIVERED", "CONFIRMED"].includes(i.status))) {
     throw new OrderError("상품 준비가 시작되어 배송지를 바꿀 수 없어요. 고객센터로 문의해 주세요.");
   }
-  const address = await prisma.customerAddress.findFirst({ where: { id: addressId, customerId } });
-  if (!address) throw new OrderError("선택한 배송지를 찾을 수 없어요.");
   const current = await prisma.orderShippingAddress.findUnique({ where: { orderId: order.id } });
   if (!current) throw new OrderError("이 주문에는 배송지 기록이 없어요. (배송지 저장 전 주문) 고객센터로 문의해 주세요.");
-  const zone = await findZone(prisma, order.shippingPolicyId, address.zipCode);
+  const zone = await findZone(prisma, order.shippingPolicyId, next.zipCode);
   if ((zone?.extraFee ?? 0) !== order.shippingExtraFee) {
     throw new OrderError("배송비가 달라지는 지역(제주·도서산간)으로는 바꿀 수 없어요. 고객센터로 문의해 주세요.");
   }
@@ -123,21 +129,7 @@ export async function changeOrderAddress(customerId: number, orderNo: string, ad
     await withBusyRetry(() =>
       prisma.orderShippingAddress.update({
         where: { id: current.id, version: current.version }, // 동시에 두 번 바꾸면 한쪽만 (버전 확인)
-        data: {
-          sourceAddressId: address.id,
-          recipientEnc: address.recipientEnc,
-          phoneEnc: address.phoneEnc,
-          phoneHash: recipientPhoneHash(address.phoneEnc),
-          zipCode: address.zipCode,
-          address1Enc: address.address1Enc,
-          address2Enc: address.address2Enc,
-          deliveryMemoEnc: address.deliveryMemoEnc,
-          region: zone?.region ?? "NORMAL",
-          version: current.version + 1,
-          changedBy: "CUSTOMER",
-          changeReason: "고객이 주문 상세에서 변경",
-          updatedAt: now,
-        },
+        data: { ...next, region: zone?.region ?? "NORMAL", version: current.version + 1, changedBy: "CUSTOMER", changeReason: reason, updatedAt: now },
       }),
     );
   } catch (e) {
@@ -146,11 +138,42 @@ export async function changeOrderAddress(customerId: number, orderNo: string, ad
   }
 }
 
+/** 회원: 주소록에서 골라 변경 */
+export async function changeOrderAddress(owner: OwnerArg, orderNo: string, addressId: number, now = new Date()) {
+  const o = toOwner(owner);
+  if (o.customerId === undefined) throw new OrderError("주소록은 회원만 쓸 수 있어요.");
+  const address = await prisma.customerAddress.findFirst({ where: { id: addressId, customerId: o.customerId } });
+  if (!address) throw new OrderError("선택한 배송지를 찾을 수 없어요.");
+  await applyAddressChange(
+    owner,
+    orderNo,
+    {
+      sourceAddressId: address.id,
+      recipientEnc: address.recipientEnc,
+      phoneEnc: address.phoneEnc,
+      phoneHash: recipientPhoneHash(address.phoneEnc),
+      zipCode: address.zipCode,
+      address1Enc: address.address1Enc,
+      address2Enc: address.address2Enc,
+      deliveryMemoEnc: address.deliveryMemoEnc,
+    },
+    "고객이 주문 상세에서 변경",
+    now,
+  );
+}
+
+/** 비회원(또는 회원): 직접 입력해서 변경 */
+export async function changeOrderAddressDirect(owner: OwnerArg, orderNo: string, input: GuestAddressInput, now = new Date()) {
+  const snap = guestAddressSnapshot(input);
+  if ("error" in snap) throw new OrderError(snap.error);
+  await applyAddressChange(owner, orderNo, snap, "고객이 주문 상세에서 직접 입력해 변경", now);
+}
+
 // ---------------------------------------------------------------
 // 고객: 구매확정 (배송중·배송 완료 상품)
 // ---------------------------------------------------------------
-export async function confirmPurchase(customerId: number, orderNo: string, orderItemId: number, now = new Date()) {
-  const order = await findCustomerOrder(customerId, orderNo);
+export async function confirmPurchase(owner: OwnerArg, orderNo: string, orderItemId: number, now = new Date()) {
+  const order = await findCustomerOrder(owner, orderNo);
   const item = order?.items.find((i) => i.id === orderItemId);
   if (!order || !item) throw new OrderError("주문 상품을 찾을 수 없어요.");
   if (item.status === "CONFIRMED") return; // 이미 확정 (두 번 눌러도 같은 결과)
@@ -297,6 +320,8 @@ export async function purgeExpiredOrderPii(now = new Date()) {
     await withBusyRetry(() =>
       prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         await tx.order.update({ where: { id }, data: { ordererNameEnc: null, ordererPhoneEnc: null, ordererPhoneHash: null, ordererEmailEnc: null, piiPurgedAt: now, updatedAt: now } });
+        await tx.guestOrderAccess.updateMany({ where: { orderId: id, passwordHash: { not: null } }, data: { passwordHash: null } }); // 비회원 조회도 끝
+        await tx.guestOrderSession.updateMany({ where: { orderId: id, revokedAt: null }, data: { revokedAt: now } });
         const a = await tx.orderShippingAddress.findUnique({ where: { orderId: id } });
         if (a && !a.piiPurgedAt) {
           await tx.orderShippingAddress.update({ where: { id: a.id }, data: { recipientEnc: null, phoneEnc: null, phoneHash: null, address1Enc: null, address2Enc: null, deliveryMemoEnc: null, piiPurgedAt: now } });

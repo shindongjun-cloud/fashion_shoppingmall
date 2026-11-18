@@ -15,7 +15,7 @@ import type { Order, Payment, PaymentActor, PaymentCancelReason, PaymentMethod, 
 import { prisma } from "@/lib/prisma";
 import { blindIndex, decrypt, encrypt, maskAccountNumber, maskName } from "@/lib/crypto";
 import { allocateOrder, ensureOrderReserved, ensureReservedTx, InsufficientStockError, isConstraintError, releaseAllocated, releaseOrder, withBusyRetry } from "@/lib/inventory";
-import { orderStatusData } from "@/lib/order-rules";
+import { orderStatusData, ownerRef, ownsOrder, toOwner, type OwnerArg } from "@/lib/order-rules";
 import { maskForLog, tossApi, type TossApi, type TossPayment, type TossResult } from "@/lib/toss";
 
 type Tx = Prisma.TransactionClient;
@@ -49,7 +49,7 @@ async function defaultFinalizeOrder(tx: Tx, order: Order, payment: Payment, now:
   await allocateOrder(tx, order.id, now); // 예약 → 할당 (출고 대기. 실재고는 출고할 때 감소)
   // 주문 결제 완료 → 트리거가 상품들도 결제 완료로 바꾸고 이력을 남김
   await tx.order.update({ where: { id: order.id }, data: { ...orderStatusData("PAID", now, "SYSTEM"), paidAt: payment.approvedAt ?? now } });
-  await tx.customer.update({ where: { id: order.customerId }, data: { lastOrderAt: now } }); // 휴면·등급 산정 참고
+  if (order.customerId !== null) await tx.customer.update({ where: { id: order.customerId }, data: { lastOrderAt: now } }); // 휴면·등급 산정 참고 (회원만)
 }
 
 export const defaultPaymentDeps: PaymentDeps = {
@@ -434,7 +434,8 @@ async function closeOrderIfNoLivePayment(orderId: number, to: "CANCELED" | "EXPI
 // ---------------------------------------------------------------
 // 결제 승인 (successUrl)
 // ---------------------------------------------------------------
-export type ConfirmInput = { customerId: number; paymentOrderId: unknown; paymentKey: unknown; amount: unknown };
+/** 주문의 주인: customerId(회원) 또는 guestOrderId(비회원 출입증으로 확인한 주문) */
+export type ConfirmInput = ({ customerId: number; guestOrderId?: undefined } | { guestOrderId: number; customerId?: undefined }) & { paymentOrderId: unknown; paymentKey: unknown; amount: unknown };
 export type ConfirmOutcome =
   | { kind: "PAID"; orderId: number }
   | { kind: "WAITING_DEPOSIT"; orderId: number }
@@ -477,7 +478,8 @@ export async function confirmOrderPayment(input: ConfirmInput, deps: PaymentDeps
 
   // ② 주문 확인 (내 주문만)
   const order = await prisma.order.findUnique({ where: { paymentOrderId } });
-  if (!order || order.customerId !== input.customerId) return { kind: "FAILED", code: "ORDER_NOT_FOUND" };
+  const owner = input.customerId !== undefined ? { customerId: input.customerId } : { guestOrderId: input.guestOrderId };
+  if (!order || !ownsOrder(owner, order)) return { kind: "FAILED", code: "ORDER_NOT_FOUND" };
 
   // 이미 이 결제 키로 처리한 적 있음 (새로고침·뒤로 가기) → 토스를 다시 부르지 않음
   const same = await prisma.payment.findUnique({ where: { paymentKey } });
@@ -684,20 +686,22 @@ const FAIL_CODE = /^[A-Z0-9_]{1,64}$/;
  * 그때는 이 고객의 "가장 최근 결제 대기 주문"(30분 이내, 진행 중 결제 없음)을 대상으로 합니다.
  */
 export async function recordCheckoutFailure(
-  customerId: number,
+  ownerArg: OwnerArg,
   input: { paymentOrderId?: unknown; code?: unknown; message?: unknown },
   now = new Date(),
 ): Promise<{ code: string; orderId: number | null }> {
   const code = typeof input.code === "string" && FAIL_CODE.test(input.code) ? input.code : "PAY_PROCESS_ABORTED";
   const message = typeof input.message === "string" ? input.message.slice(0, 510) : null;
   let order: Order | null = null;
+  const owner = toOwner(ownerArg);
   if (typeof input.paymentOrderId === "string" && PG_ORDER_ID.test(input.paymentOrderId)) {
     order = await prisma.order.findUnique({ where: { paymentOrderId: input.paymentOrderId } });
-    if (order && order.customerId !== customerId) order = null;
+    if (order && !ownsOrder(owner, order)) order = null;
   } else {
     order = await prisma.order.findFirst({
       where: {
-        customerId,
+        // 비회원은 출입증의 그 주문, 회원은 그 회원의 주문 중
+        ...(owner.customerId !== undefined ? { customerId: owner.customerId } : { id: owner.guestOrderId, customerId: null }),
         status: "PENDING",
         createdAt: { gte: new Date(now.getTime() - 30 * 60 * 1000) },
         payments: { none: { status: { in: ["IN_PROGRESS", "UNKNOWN", "WAITING_FOR_DEPOSIT", "DONE", "PARTIAL_CANCELED"] } } },
@@ -714,9 +718,9 @@ export async function recordCheckoutFailure(
 }
 
 /** 결제를 진행하지 않기로 한 주문 정리 (가격 변경으로 중단, 결제창 띄우기 실패) */
-export async function abandonOrder(customerId: number, paymentOrderId: string, reason: "PRICE_CHANGED" | "PAYMENT_FAILED", now = new Date(), windowCode?: string) {
+export async function abandonOrder(owner: OwnerArg, paymentOrderId: string, reason: "PRICE_CHANGED" | "PAYMENT_FAILED", now = new Date(), windowCode?: string) {
   const order = await prisma.order.findUnique({ where: { paymentOrderId } });
-  if (!order || order.customerId !== customerId || order.status !== "PENDING") return false;
+  if (!order || !ownsOrder(owner, order) || order.status !== "PENDING") return false;
   const live = await prisma.payment.count({ where: { orderId: order.id, status: { in: ["IN_PROGRESS", "UNKNOWN", "WAITING_FOR_DEPOSIT", "DONE", "PARTIAL_CANCELED"] } } });
   if (live > 0) return false;
   // 결제창을 닫음(PC 팝업은 failUrl 대신 브라우저에서 오류로 끝남) → failUrl 경우와 똑같이 시도를 기록 (이탈 통계·CS 확인용)
@@ -873,14 +877,14 @@ export async function syncFromToss(paymentId: number, source: PaymentStatusSourc
 
 /** 고객: 입금 전 가상계좌 주문 취소. code는 화면 안내 문구를 고르는 데 씀 (lib/payment-labels.ts DEPOSIT_CANCEL_NOTICE) */
 export type DepositCancelCode = "DONE" | "NOT_FOUND" | "NOT_WAITING" | "RESULT_PENDING" | "ALREADY_DEPOSITED" | "FAILED";
-export async function cancelWaitingDepositOrder(customerId: number, orderId: number, deps: PaymentDeps = defaultPaymentDeps): Promise<DepositCancelCode> {
+export async function cancelWaitingDepositOrder(owner: OwnerArg, orderId: number, deps: PaymentDeps = defaultPaymentDeps): Promise<DepositCancelCode> {
   const order = await prisma.order.findUnique({ where: { id: orderId } });
-  if (!order || order.customerId !== customerId) return "NOT_FOUND";
+  if (!order || !ownsOrder(owner, order)) return "NOT_FOUND";
   if (order.status !== "WAITING_DEPOSIT") return "NOT_WAITING";
   const payment = await prisma.payment.findFirst({ where: { orderId, status: "WAITING_FOR_DEPOSIT" } });
   if (!payment) return "NOT_WAITING";
   try {
-    const r = await requestPaymentCancel(payment.id, { reasonCode: "CUSTOMER_REQUEST", reasonText: "고객 요청: 입금 전 주문 취소", requestedBy: "CUSTOMER", requestedByRef: String(customerId) }, deps);
+    const r = await requestPaymentCancel(payment.id, { reasonCode: "CUSTOMER_REQUEST", reasonText: "고객 요청: 입금 전 주문 취소", requestedBy: "CUSTOMER", requestedByRef: ownerRef(owner) }, deps);
     if (r.status === "DONE") return "DONE";
     if (r.status === "UNKNOWN") return "RESULT_PENDING";
     // 그 사이 입금됨 등 → 토스 상태로 맞춘 뒤 안내
@@ -1096,9 +1100,9 @@ export async function purgeOldApiLogs(now = new Date()) {
 }
 
 /** 결제 확인 중 화면에서: 내 주문이면 바로 한 번 확인 */
-export async function refreshOrderPayment(customerId: number, orderId: number, deps: PaymentDeps = defaultPaymentDeps): Promise<ConfirmOutcome> {
+export async function refreshOrderPayment(owner: OwnerArg, orderId: number, deps: PaymentDeps = defaultPaymentDeps): Promise<ConfirmOutcome> {
   const order = await prisma.order.findUnique({ where: { id: orderId } });
-  if (!order || order.customerId !== customerId) return { kind: "FAILED", code: "ORDER_NOT_FOUND" };
+  if (!order || !ownsOrder(owner, order)) return { kind: "FAILED", code: "ORDER_NOT_FOUND" };
   const open = await prisma.payment.findFirst({ where: { orderId, status: { in: ["IN_PROGRESS", "UNKNOWN"] } }, orderBy: { attemptNo: "desc" } });
   // 방금 시작한 승인(IN_PROGRESS)은 처리 중인 요청이 있으므로 건드리지 않음
   // 같은 결제를 5초 안에 다시 토스에 묻지 않음 (확인 중 화면이 3초마다 부르므로, 토스 연속 조회 제한 방지)

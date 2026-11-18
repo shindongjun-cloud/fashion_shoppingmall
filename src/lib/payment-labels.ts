@@ -64,6 +64,7 @@ const FAIL_MESSAGES: Record<string, string> = {
   OUT_OF_STOCK: "결제를 기다리는 동안 재고가 소진되었어요. 결제는 진행되지 않았어요.",
   AMOUNT_MISMATCH: "결제 금액이 주문 금액과 달라 결제를 중단했어요. 결제된 금액은 없어요.",
   ORDER_NOT_FOUND: "주문을 찾을 수 없어요.",
+  GUEST_SESSION_EXPIRED: "비회원 주문 확인 시간(1시간)이 지났거나 주문한 브라우저가 아니어서 결제를 마치지 않았어요. 돈은 빠져나가지 않았어요. 다시 주문해 주세요.",
   ORDER_CLOSED: "이미 취소되었거나 처리가 끝난 주문이에요. 다시 주문해 주세요.",
   INVALID_REQUEST: "결제 정보가 올바르지 않아요. 다시 시도해 주세요.",
   ORDER_ERROR_REFUNDED: "주문을 완료하지 못해 결제를 자동으로 취소했어요. 다시 시도해 주세요.",

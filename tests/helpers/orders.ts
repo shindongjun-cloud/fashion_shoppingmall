@@ -42,6 +42,7 @@ export async function makeRawOrder(customerId: number, items: { skuId: number; q
       paymentOrderId: `order_test_${++orderSeq}_${Date.now()}`,
       orderName: "테스트",
       customerId,
+      ordererType: "MEMBER",
       status: "PENDING",
       statusChangedAt: now,
       itemsListTotal: itemsTotal,

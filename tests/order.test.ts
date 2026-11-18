@@ -685,16 +685,16 @@ describe("주문 DB 제약 (앱을 거치지 않은 직접 수정도 막힘)", (
   });
   test("주문 시각에 적용 중인 배송비 규칙·금액이 아니면 주문 생성 거부", async () => {
     const c = await newShopper("규칙");
-    const cols = `"orderNo","paymentOrderId","orderName","customerId","status","statusChangedAt","itemsListTotal","itemsDiscountTotal","itemsTotal","shippingBaseFee","shippingFee","totalPrice","shippingPolicyId","freeShippingThreshold","createdAt","updatedAt"`;
+    const cols = `"ordererType","orderNo","paymentOrderId","orderName","customerId","status","statusChangedAt","itemsListTotal","itemsDiscountTotal","itemsTotal","shippingBaseFee","shippingFee","totalPrice","shippingPolicyId","freeShippingThreshold","createdAt","updatedAt"`;
     const std = `(SELECT id FROM "ShippingPolicy" WHERE code = 'STD-2611')`;
     // 1만원 주문인데 기본 배송비 0 (무료 기준 5만원 미만)
-    await rejects(`INSERT INTO "Order" (${cols}) VALUES ('20990101-00000101', 'order_rule_1', 'x', ${c}, 'PENDING', ${NOW()}, 10000, 0, 10000, 0, 0, 10000, ${std}, 50000, ${NOW()}, ${NOW()})`, "기본 배송비가 배송비 규칙과 다릅니다");
+    await rejects(`INSERT INTO "Order" (${cols}) VALUES ('MEMBER', '20990101-00000101', 'order_rule_1', 'x', ${c}, 'PENDING', ${NOW()}, 10000, 0, 10000, 0, 0, 10000, ${std}, 50000, ${NOW()}, ${NOW()})`, "기본 배송비가 배송비 규칙과 다릅니다");
     // 도입 전 규칙(이미 끝남)으로 지금 주문
-    await rejects(`INSERT INTO "Order" (${cols}) VALUES ('20990101-00000102', 'order_rule_2', 'x', ${c}, 'PENDING', ${NOW()}, 10000, 0, 10000, 0, 0, 10000, (SELECT id FROM "ShippingPolicy" WHERE code = 'LEGACY-FREE'), NULL, ${NOW()}, ${NOW()})`, "적용 중인 배송비 규칙이 아닙니다");
+    await rejects(`INSERT INTO "Order" (${cols}) VALUES ('MEMBER', '20990101-00000102', 'order_rule_2', 'x', ${c}, 'PENDING', ${NOW()}, 10000, 0, 10000, 0, 0, 10000, (SELECT id FROM "ShippingPolicy" WHERE code = 'LEGACY-FREE'), NULL, ${NOW()}, ${NOW()})`, "적용 중인 배송비 규칙이 아닙니다");
     // 결제액 공식 위반 (CHECK)
-    await rejects(`INSERT INTO "Order" (${cols}) VALUES ('20990101-00000103', 'order_rule_3', 'x', ${c}, 'PENDING', ${NOW()}, 10000, 0, 10000, 3000, 3000, 12000, ${std}, 50000, ${NOW()}, ${NOW()})`, "Order_amount_math_ck");
+    await rejects(`INSERT INTO "Order" (${cols}) VALUES ('MEMBER', '20990101-00000103', 'order_rule_3', 'x', ${c}, 'PENDING', ${NOW()}, 10000, 0, 10000, 3000, 3000, 12000, ${std}, 50000, ${NOW()}, ${NOW()})`, "Order_amount_math_ck");
     // 주문번호 형식 (CHECK)
-    await rejects(`INSERT INTO "Order" (${cols}) VALUES ('2099-0101-1', 'order_rule_4', 'x', ${c}, 'PENDING', ${NOW()}, 10000, 0, 10000, 3000, 3000, 13000, ${std}, 50000, ${NOW()}, ${NOW()})`, "Order_no_ck");
+    await rejects(`INSERT INTO "Order" (${cols}) VALUES ('MEMBER', '2099-0101-1', 'order_rule_4', 'x', ${c}, 'PENDING', ${NOW()}, 10000, 0, 10000, 3000, 3000, 13000, ${std}, 50000, ${NOW()}, ${NOW()})`, "Order_no_ck");
   });
   test("주문자 정보 변경 금지 (평문·다른 값)", () => rejects(`UPDATE "Order" SET "ordererNameEnc" = 'v1:a:b:c' WHERE "id" = ${paid}`, "Order_orderer_fixed"));
 });

@@ -7,6 +7,7 @@ import { confirmOrderPayment } from "@/lib/payment";
 import { getTossConfigProblem } from "@/lib/toss";
 import { loginPath } from "@/lib/safe-redirect";
 import { prisma } from "@/lib/prisma";
+import { getGuestOrderId } from "@/lib/current-owner";
 
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
@@ -19,19 +20,23 @@ export async function GET(request: NextRequest) {
     return fail("PAYMENT_CONFIG");
   }
 
-  const customer = await getCurrentCustomer();
-  if (!customer) {
+  // 주인 확인: 비회원 출입증이 바로 이 주문의 것이면 비회원으로, 아니면 로그인한 회원으로
+  const paymentOrderId = params.get("orderId");
+  const guestOrderId = await getGuestOrderId();
+  const guestOrder = guestOrderId !== null ? await prisma.order.findUnique({ where: { id: guestOrderId }, select: { paymentOrderId: true } }) : null;
+  const isGuest = guestOrder !== null && guestOrder.paymentOrderId === paymentOrderId;
+  const customer = isGuest ? null : await getCurrentCustomer();
+  if (!isGuest && !customer) {
+    // 비회원 주문인데 출입증이 없음 (다른 브라우저에서 열었거나 1시간이 지남) → 승인하지 않음
+    const target = typeof paymentOrderId === "string" ? await prisma.order.findUnique({ where: { paymentOrderId }, select: { ordererType: true } }) : null;
+    if (target?.ordererType === "GUEST") return fail("GUEST_SESSION_EXPIRED");
     // 결제 도중 로그인이 만료됨 → 로그인한 뒤 이 주소로 돌아와서 승인을 이어서 진행 (토스 승인은 결제 후 10분 안에만 가능)
     const back = request.nextUrl.pathname + request.nextUrl.search;
     return goTo(loginPath(back));
   }
 
-  const result = await confirmOrderPayment({
-    customerId: customer.id,
-    paymentOrderId: params.get("orderId"),
-    paymentKey: params.get("paymentKey"),
-    amount: params.get("amount"),
-  });
+  const common = { paymentOrderId, paymentKey: params.get("paymentKey"), amount: params.get("amount") };
+  const result = await confirmOrderPayment(isGuest ? { ...common, guestOrderId: guestOrderId! } : { ...common, customerId: customer!.id });
   // 화면 주소에는 내부 번호(id) 대신 고객용 주문번호
   const orderNo = async (id: number) => (await prisma.order.findUniqueOrThrow({ where: { id }, select: { orderNo: true } })).orderNo;
   switch (result.kind) {

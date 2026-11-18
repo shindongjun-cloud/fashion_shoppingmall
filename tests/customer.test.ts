@@ -474,8 +474,8 @@ describe("고객 DB 제약 (앱을 거치지 않은 직접 수정도 막힘)", (
   });
   test("정상(ACTIVE)이 아닌 고객의 주문 금지", () =>
     rejects(
-      `INSERT INTO "Order" ("orderNo","paymentOrderId","orderName","totalPrice",status,"statusChangedAt","itemsListTotal","itemsDiscountTotal","itemsTotal","shippingBaseFee","shippingFee","shippingPolicyId","freeShippingThreshold","createdAt","updatedAt","customerId")
-       SELECT '20990101-00000009', 'order_x_${Date.now()}', 'x', 4000, 'PENDING', ${NOW()}, 1000, 0, 1000, 3000, 3000, sp."id", sp."freeShippingThreshold", ${NOW()}, ${NOW()}, ${withdrawn}
+      `INSERT INTO "Order" ("ordererType","orderNo","paymentOrderId","orderName","totalPrice",status,"statusChangedAt","itemsListTotal","itemsDiscountTotal","itemsTotal","shippingBaseFee","shippingFee","shippingPolicyId","freeShippingThreshold","createdAt","updatedAt","customerId")
+       SELECT 'MEMBER', '20990101-00000009', 'order_x_${Date.now()}', 'x', 4000, 'PENDING', ${NOW()}, 1000, 0, 1000, 3000, 3000, sp."id", sp."freeShippingThreshold", ${NOW()}, ${NOW()}, ${withdrawn}
        FROM "ShippingPolicy" sp WHERE sp."validTo" IS NULL`,
       "Order_customer_active",
     ));

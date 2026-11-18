@@ -13,11 +13,13 @@ import { REGION_LABEL } from "@/lib/order-labels";
 
 export const dynamic = "force-dynamic";
 
-// 주문서(결제) 페이지. 로그인한 사람만 들어올 수 있어요.
-export default async function CheckoutPage() {
+// 주문서(결제) 페이지. 회원은 로그인, 비회원은 로그인 화면에서 "비회원으로 주문하기"(?guest=1)를 고른 경우
+export default async function CheckoutPage({ searchParams }: PageProps<"/checkout">) {
   const session = await auth();
   const customer = await getCurrentCustomer();
+  const { guest } = await searchParams;
   if (!session?.user || !customer) {
+    if (guest === "1") return <GuestCheckout />;
     redirect(loginPath("/checkout"));
   }
 
@@ -86,6 +88,30 @@ export default async function CheckoutPage() {
       customerEmail={session.user.email ?? undefined}
       addresses={addressOptions}
       shippingRule={{ baseFee: policy.baseFee, freeShippingThreshold: policy.freeShippingThreshold }}
+    />
+  );
+}
+
+/** 비회원 주문서: 배송지는 직접 입력 → 우편번호로 추가 배송비를 화면에서 바로 계산하도록 지역 범위를 넘김 */
+async function GuestCheckout() {
+  const configProblem = getTossConfigProblem();
+  const policy = await currentShippingPolicy(prisma, new Date()).catch(() => null);
+  if (configProblem || !policy) {
+    console.error(`[결제 설정 오류] ${configProblem ?? "지금 적용 중인 배송비 규칙이 없습니다"}`);
+    return (
+      <main className="mx-auto w-full max-w-3xl px-4 py-20 text-center">
+        <p className="text-gray-700">지금은 주문할 수 없어요. 설정을 확인하고 있어요.</p>
+      </main>
+    );
+  }
+  const [skus, zones] = await Promise.all([getCartSkus(), prisma.shippingSurchargeZone.findMany({ where: { policyId: policy.id }, orderBy: { zipFrom: "asc" } })]);
+  return (
+    <CheckoutView
+      skus={skus}
+      customerKey="ANONYMOUS"
+      addresses={[]}
+      shippingRule={{ baseFee: policy.baseFee, freeShippingThreshold: policy.freeShippingThreshold }}
+      guest={{ zones: zones.map((z) => ({ zipFrom: z.zipFrom, zipTo: z.zipTo, extraFee: z.extraFee, label: `${REGION_LABEL[z.region]} · ${z.name}` })) }}
     />
   );
 }

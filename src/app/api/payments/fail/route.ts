@@ -6,15 +6,19 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getCurrentCustomer } from "@/lib/current-customer";
 import { recordCheckoutFailure } from "@/lib/payment";
+import { getGuestOrderId } from "@/lib/current-owner";
 
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const rawCode = params.get("code") ?? "";
   let code = /^[A-Z0-9_]{1,64}$/.test(rawCode) ? rawCode : "PAY_PROCESS_ABORTED";
 
+  // 회원이면 로그인으로, 비회원이면 출입증의 주문으로 (둘 다 없으면 기록 없이 안내만 — 재고는 20분 뒤 자동 해제)
   const customer = await getCurrentCustomer();
-  if (customer) {
-    const r = await recordCheckoutFailure(customer.id, { paymentOrderId: params.get("orderId"), code, message: params.get("message") });
+  const guestOrderId = customer ? null : await getGuestOrderId();
+  if (customer || guestOrderId !== null) {
+    const owner = customer ? { customerId: customer.id } : { guestOrderId: guestOrderId! };
+    const r = await recordCheckoutFailure(owner, { paymentOrderId: params.get("orderId"), code, message: params.get("message") });
     code = r.code;
   }
   return NextResponse.redirect(new URL(`/checkout/fail?code=${encodeURIComponent(code)}`, request.url));

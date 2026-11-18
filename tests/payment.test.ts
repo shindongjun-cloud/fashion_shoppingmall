@@ -876,7 +876,7 @@ describe("결제·주문 DB 제약 (앱을 거치지 않은 직접 수정도 막
 
   /** 결제 대기 주문을 복제하는 INSERT (필수 칸을 다 채워서, 시험하려는 규칙 하나만 어기게) */
   const cloneOrder = (set: Record<string, string>) => {
-    const cols = ["orderNo", "paymentOrderId", "orderName", "customerId", "channel", "status", "statusChangedAt", "statusChangedBy", "fulfillmentStatus", "itemsListTotal", "itemsDiscountTotal", "itemsTotal", "couponDiscountTotal", "shippingBaseFee", "shippingExtraFee", "shippingFee", "shippingDiscount", "pointUsed", "totalPrice", "shippingPolicyId", "freeShippingThreshold", "paidAt", "createdAt", "updatedAt"];
+    const cols = ["orderNo", "paymentOrderId", "orderName", "customerId", "ordererType", "channel", "status", "statusChangedAt", "statusChangedBy", "fulfillmentStatus", "itemsListTotal", "itemsDiscountTotal", "itemsTotal", "couponDiscountTotal", "shippingBaseFee", "shippingExtraFee", "shippingFee", "shippingDiscount", "pointUsed", "totalPrice", "shippingPolicyId", "freeShippingThreshold", "paidAt", "createdAt", "updatedAt"];
     return `INSERT INTO "Order" (${cols.map((c) => `"${c}"`).join(", ")}) SELECT ${cols.map((c) => set[c] ?? `"${c}"`).join(", ")} FROM "Order" WHERE "id" = ${pendingOrder}`;
   };
   test("주문을 결제 완료로 생성 금지", () =>

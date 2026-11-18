@@ -47,7 +47,7 @@ export const decryptOrNull = (value: string | null | undefined) => (value ? decr
  * 검색용 해시 (블라인드 인덱스). purpose를 섞어서 "전화번호 해시"와 "이메일 해시"가 서로 비교되지 않게 합니다.
  * 값은 미리 정규화해서 넣어야 같은 사람이 같은 해시가 됩니다 (normalizePhone, normalizeEmail).
  */
-export function blindIndex(purpose: "phone" | "email" | "rejoin" | "toss-secret", normalized: string): string {
+export function blindIndex(purpose: "phone" | "email" | "rejoin" | "toss-secret" | "ip", normalized: string): string {
   return createHmac("sha256", keyFrom("CUSTOMER_HASH_KEY")).update(`${purpose}:${normalized}`).digest("hex");
 }
 

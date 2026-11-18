@@ -3,11 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
+  ANONYMOUS,
   loadTossPayments,
   type TossPaymentsWidgets,
 } from "@tosspayments/tosspayments-sdk";
 import { useCart } from "@/context/CartContext";
-import { cancelPendingOrder, createOrder } from "@/app/checkout/actions";
+import { cancelPendingOrder, createGuestOrder, createOrder } from "@/app/checkout/actions";
 import type { CartSku } from "@/lib/catalog";
 import { formatPrice } from "@/lib/format";
 import { isKnownFailCode, paymentFailMessage } from "@/lib/payment-labels";
@@ -37,7 +38,12 @@ type Props = {
   addresses: CheckoutAddress[];
   /** 지금 적용 중인 배송비 규칙 (화면 표시용. 실제 금액은 서버가 다시 계산) */
   shippingRule: { baseFee: number; freeShippingThreshold: number | null };
+  /** 비회원 주문: 배송지를 직접 입력하므로 우편번호 → 추가 배송비 계산용 지역 범위 */
+  guest?: { zones: { zipFrom: string; zipTo: string; extraFee: number; label: string }[] };
 };
+
+/** 비회원 주문서 입력값 */
+const EMPTY_GUEST = { name: "", phone: "", email: "", recipient: "", recipientPhone: "", zipCode: "", address1: "", address2: "", memo: "", password: "", passwordConfirm: "", sameAsOrderer: true, consent: false };
 
 export default function CheckoutView({
   skus,
@@ -46,7 +52,11 @@ export default function CheckoutView({
   customerEmail,
   addresses,
   shippingRule,
+  guest,
 }: Props) {
+  const [g, setG] = useState(EMPTY_GUEST);
+  const setField = (key: keyof typeof EMPTY_GUEST) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setG((prev) => ({ ...prev, [key]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
   const { items } = useCart();
   const [widgets, setWidgets] = useState<TossPaymentsWidgets | null>(null);
   const [paying, setPaying] = useState(false);
@@ -55,12 +65,16 @@ export default function CheckoutView({
     (addresses.find((a) => a.isDefault) ?? addresses[0])?.id ?? null,
   );
   const startedRef = useRef(false);
+  const field = "min-w-0 rounded-lg border border-gray-300 px-3 py-2";
 
   const lines = items.flatMap((item) => {
     const sku = skus.find((s) => s.id === item.skuId);
     return sku ? [{ ...item, sku }] : [];
   });
   const address = addresses.find((a) => a.id === addressId) ?? null;
+  // 비회원: 우편번호 5자리를 다 입력하면 제주·도서산간 추가 배송비를 바로 보여 줌
+  const guestZone = guest && /^\d{5}$/.test(g.zipCode) ? (guest.zones.find((z) => z.zipFrom <= g.zipCode && g.zipCode <= z.zipTo) ?? null) : null;
+  const guestReady = Boolean(guest && g.name && g.phone && g.email && g.zipCode.length === 5 && g.address1 && g.password && g.passwordConfirm && g.consent && (g.sameAsOrderer || (g.recipient && g.recipientPhone)));
 
   // 화면 표시용 금액. 실제 결제 금액은 서버(createOrder)가 DB 가격·배송비 규칙으로 다시 계산합니다.
   const listTotal = lines.reduce((sum, l) => sum + l.sku.listPrice * l.quantity, 0);
@@ -69,7 +83,7 @@ export default function CheckoutView({
   const threshold = shippingRule.freeShippingThreshold;
   const freeShipping = threshold !== null && itemsTotal >= threshold;
   const baseFee = freeShipping ? 0 : shippingRule.baseFee;
-  const extraFee = address?.extraFee ?? 0;
+  const extraFee = guest ? (guestZone?.extraFee ?? 0) : (address?.extraFee ?? 0);
   const total = itemsTotal + baseFee + extraFee;
 
   // 1) 토스 결제 위젯(결제수단 선택 + 약관)을 화면에 한 번만 그립니다.
@@ -79,7 +93,8 @@ export default function CheckoutView({
 
     (async () => {
       const tossPayments = await loadTossPayments(clientKey);
-      const newWidgets = tossPayments.widgets({ customerKey });
+      // 비회원은 토스 규칙대로 ANONYMOUS (회원은 고객번호)
+      const newWidgets = tossPayments.widgets({ customerKey: customerKey === "ANONYMOUS" ? ANONYMOUS : customerKey });
       await newWidgets.setAmount({ currency: "KRW", value: total });
       await Promise.all([
         newWidgets.renderPaymentMethods({ selector: "#payment-method" }),
@@ -98,12 +113,28 @@ export default function CheckoutView({
 
   // 2) 결제 버튼
   async function handlePay() {
-    if (!widgets || !address) return;
+    if (!widgets || (!guest && !address)) return;
     setPaying(true);
     setError(null);
 
     // 서버에 주문을 만들고(배송지 스냅샷 + 재고 예약), 서버가 계산한 금액을 받아옵니다.
-    const order = await createOrder(items, address.id);
+    // (비회원: 입력값 검사·비밀번호 해시·동의 기록·출입증 쿠키도 서버가)
+    const order = guest
+      ? await createGuestOrder(items, {
+          orderer: { name: g.name, phone: g.phone, email: g.email },
+          address: {
+            recipient: g.sameAsOrderer ? g.name : g.recipient,
+            phone: g.sameAsOrderer ? g.phone : g.recipientPhone,
+            zipCode: g.zipCode,
+            address1: g.address1,
+            address2: g.address2,
+            deliveryMemo: g.memo,
+          },
+          password: g.password,
+          passwordConfirm: g.passwordConfirm,
+          privacyConsent: g.consent,
+        })
+      : await createOrder(items, address!.id);
     if ("error" in order) {
       setError(order.error);
       setPaying(false);
@@ -128,8 +159,8 @@ export default function CheckoutView({
       await widgets.requestPayment({
         orderId: order.paymentOrderId,
         orderName: order.orderName,
-        customerName,
-        customerEmail,
+        customerName: guest ? g.name : customerName,
+        customerEmail: guest ? g.email : customerEmail,
         successUrl: `${window.location.origin}/api/payments/confirm`,
         // 실패·취소 시 재고 예약을 풀고 실패 화면으로 보내는 라우트
         failUrl: `${window.location.origin}/api/payments/fail`,
@@ -173,7 +204,57 @@ export default function CheckoutView({
         테스트 모드예요. 실제로 돈이 나가지 않아요.
       </p>
 
+      {guest && (
+        <section className="mt-6 space-y-3 rounded-xl border border-gray-200 bg-white p-4 text-sm">
+          <div className="flex items-center justify-between">
+            <h2 className="font-bold text-gray-900">비회원 주문</h2>
+            <Link href="/login?callbackUrl=%2Fcheckout" className="text-gray-500 underline">
+              회원 로그인
+            </Link>
+          </div>
+          <p className="text-xs text-gray-500">비회원은 쿠폰·포인트를 쓸 수 없어요. 주문 내역은 주문번호와 아래 주문 비밀번호로 조회해요.</p>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <input value={g.name} onChange={setField("name")} maxLength={30} placeholder="주문자 이름" autoComplete="name" className={field} disabled={paying} />
+            <input value={g.phone} onChange={setField("phone")} inputMode="tel" placeholder="휴대폰 010-0000-0000" autoComplete="tel" className={field} disabled={paying} />
+            <input value={g.email} onChange={setField("email")} type="email" placeholder="이메일" autoComplete="email" className={field} disabled={paying} />
+          </div>
+          <h3 className="pt-2 font-bold text-gray-900">배송지</h3>
+          <label className="flex items-center gap-2 text-gray-700">
+            <input type="checkbox" checked={g.sameAsOrderer} onChange={setField("sameAsOrderer")} className="accent-gray-900" disabled={paying} /> 받는 분이 주문자와 같아요
+          </label>
+          {!g.sameAsOrderer && (
+            <div className="grid gap-2 sm:grid-cols-2">
+              <input value={g.recipient} onChange={setField("recipient")} maxLength={30} placeholder="받는 분" className={field} disabled={paying} />
+              <input value={g.recipientPhone} onChange={setField("recipientPhone")} inputMode="tel" placeholder="받는 분 휴대폰" className={field} disabled={paying} />
+            </div>
+          )}
+          <div className="grid gap-2 sm:grid-cols-3">
+            <input value={g.zipCode} onChange={setField("zipCode")} inputMode="numeric" maxLength={5} placeholder="우편번호 5자리" autoComplete="postal-code" className={field} disabled={paying} />
+            <input value={g.address1} onChange={setField("address1")} maxLength={100} placeholder="주소" autoComplete="address-line1" className={`${field} sm:col-span-2`} disabled={paying} />
+            <input value={g.address2} onChange={setField("address2")} maxLength={100} placeholder="상세 주소" autoComplete="address-line2" className={`${field} sm:col-span-2`} disabled={paying} />
+            <input value={g.memo} onChange={setField("memo")} maxLength={100} placeholder="배송 메모 (선택)" className={field} disabled={paying} />
+          </div>
+          {guestZone && <p className="text-xs text-amber-700">{guestZone.label} 추가 배송비 {formatPrice(guestZone.extraFee)}</p>}
+          <h3 className="pt-2 font-bold text-gray-900">주문 비밀번호</h3>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <input value={g.password} onChange={setField("password")} type="password" minLength={6} maxLength={20} placeholder="6~20자" autoComplete="new-password" className={field} disabled={paying} />
+            <input value={g.passwordConfirm} onChange={setField("passwordConfirm")} type="password" minLength={6} maxLength={20} placeholder="한 번 더" autoComplete="new-password" className={field} disabled={paying} />
+          </div>
+          <p className="text-xs text-gray-500">주문 조회·취소에 써요. 잊으면 고객센터로 문의해야 하니 꼭 기억해 주세요.</p>
+          <label className="flex items-start gap-2 rounded-lg bg-gray-50 p-3 text-gray-700">
+            <input type="checkbox" checked={g.consent} onChange={setField("consent")} className="mt-0.5 accent-gray-900" disabled={paying} />
+            <span>
+              (필수) 비회원 주문 개인정보 수집·이용 동의
+              <span className="mt-1 block text-xs text-gray-500">
+                수집 항목: 주문자 이름·휴대폰·이메일, 받는 분 이름·휴대폰·주소 / 목적: 주문·배송·결제·고객 상담 / 보관: 주문일로부터 5년 (전자상거래법) 후 파기
+              </span>
+            </span>
+          </label>
+        </section>
+      )}
+
       {/* 배송지: 주소록에서 선택. 주문에는 이 값을 복사해 저장 (나중에 주소록을 바꿔도 주문 배송지는 그대로) */}
+      {!guest && (
       <section className="mt-6 rounded-xl border border-gray-200 bg-white p-4 text-sm">
         <div className="flex items-center justify-between">
           <h2 className="font-bold text-gray-900">배송지</h2>
@@ -215,6 +296,7 @@ export default function CheckoutView({
           </div>
         )}
       </section>
+      )}
 
       {/* 주문 상품 요약 */}
       <ul className="mt-6 divide-y divide-gray-200 rounded-xl border border-gray-200 bg-white">
@@ -276,10 +358,16 @@ export default function CheckoutView({
 
       <button
         onClick={handlePay}
-        disabled={!widgets || paying || !address}
+        disabled={!widgets || paying || (guest ? !guestReady : !address)}
         className="mt-6 w-full rounded-lg bg-blue-600 py-4 text-lg font-bold text-white hover:bg-blue-700 disabled:opacity-50"
       >
-        {!address ? "배송지를 먼저 등록해 주세요" : paying ? "결제 진행 중..." : `${formatPrice(total)} 결제하기`}
+        {guest && !guestReady
+          ? "주문 정보를 모두 입력하고 동의해 주세요"
+          : !guest && !address
+            ? "배송지를 먼저 등록해 주세요"
+            : paying
+              ? "결제 진행 중..."
+              : `${formatPrice(total)} 결제하기`}
       </button>
     </main>
   );

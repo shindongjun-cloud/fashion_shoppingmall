@@ -1,6 +1,7 @@
 "use server";
 
-// 주문 상세 화면의 서버 액션 (로그인 고객만, 실제 처리는 lib/order.ts)
+// 주문 상세 화면의 서버 액션 (회원 /orders/[주문번호], 비회원 /guest/orders/[주문번호] 공통. 실제 처리는 lib/order.ts)
+// 주인 확인: mode=member → 로그인한 회원, mode=guest → 비회원 출입증 쿠키 (mode는 "어떤 증명을 볼지"만 고름 — 권한은 서버가 확인)
 // 결과: 정해진 안내는 주소의 ?notice=코드, 오류 문구는 1분짜리 쿠키(플래시)로 전달
 // ⚠️ 오류 문구를 주소(?error=문구)에 싣지 않음: 누구나 가짜 안내 문구를 넣은 링크를 만들어 보낼 수 있기 때문
 import { randomUUID } from "node:crypto";
@@ -8,9 +9,10 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { getCurrentCustomer } from "@/lib/current-customer";
+import { getGuestOrderId } from "@/lib/current-owner";
 import { loginPath } from "@/lib/safe-redirect";
-import { cancelPaidOrder, changeOrderAddress, confirmPurchase, OrderError } from "@/lib/order";
-import { ORDER_NO_PATTERN } from "@/lib/order-rules";
+import { cancelPaidOrder, changeOrderAddress, changeOrderAddressDirect, confirmPurchase, OrderError } from "@/lib/order";
+import { ORDER_NO_PATTERN, type OrderOwner } from "@/lib/order-rules";
 
 const text = (form: FormData, key: string) => {
   const v = form.get(key);
@@ -29,26 +31,34 @@ async function flashError(back: string, message: string) {
   return `${back}?e=${id}`;
 }
 
-/** 로그인 확인 + 주문번호 형식 확인 → 상세 화면 주소 */
-async function start(form: FormData) {
+/** 주인 확인 + 주문번호 형식 확인 → 상세 화면 주소 */
+async function start(form: FormData): Promise<{ owner: OrderOwner; orderNo: string; back: string }> {
   const orderNo = text(form, "orderNo");
-  const back = ORDER_NO_PATTERN.test(orderNo) ? `/orders/${orderNo}` : "/orders";
+  const guest = text(form, "mode") === "guest";
+  if (!ORDER_NO_PATTERN.test(orderNo)) redirect(guest ? "/guest/orders" : "/orders");
+  if (guest) {
+    const back = `/guest/orders/${orderNo}`;
+    const guestOrderId = await getGuestOrderId();
+    // 출입증이 없거나 만료 → 다시 조회 (출입증의 주문과 이 주문번호가 다르면 lib/order가 "없음"으로 처리)
+    if (guestOrderId === null) redirect(`/guest/orders?orderNo=${orderNo}&expired=1`);
+    return { owner: { guestOrderId }, orderNo, back };
+  }
+  const back = `/orders/${orderNo}`;
   const customer = await getCurrentCustomer();
   if (!customer) redirect(loginPath(back));
-  if (back === "/orders") redirect("/orders");
-  return { customer, orderNo, back };
+  return { owner: { customerId: customer.id }, orderNo, back };
 }
 
 /** 고객 주문 취소 (입금 전 가상계좌 / 결제 완료 후 상품 준비 전) */
 export async function cancelOrderAction(form: FormData) {
-  const { customer, orderNo, back } = await start(form);
+  const { owner, orderNo, back } = await start(form);
   const bankCode = text(form, "bankCode");
   const accountNumber = text(form, "accountNumber").replace(/[\s-]/g, "");
   const holderName = text(form, "holderName");
   if ((bankCode || accountNumber || holderName) && (!bankCode || !/^\d{6,20}$/.test(accountNumber) || !holderName || holderName.length > 30)) {
     redirect(await flashError(back, "환불 계좌(은행·숫자 계좌번호·예금주)를 정확히 입력해 주세요."));
   }
-  const code = await cancelPaidOrder(customer.id, orderNo, {
+  const code = await cancelPaidOrder(owner, orderNo, {
     reason: text(form, "reason").slice(0, 100),
     refundAccount: bankCode ? { bankCode, accountNumber, holderName } : undefined,
   });
@@ -56,25 +66,11 @@ export async function cancelOrderAction(form: FormData) {
   redirect(`${back}?notice=${code}`);
 }
 
-/** 배송지 변경 (주소록에서 선택) */
-export async function changeAddressAction(form: FormData) {
-  const { customer, orderNo, back } = await start(form);
-  let target = `${back}?notice=ADDRESS_CHANGED`;
+async function run(form: FormData, okNotice: string, work: (owner: OrderOwner, orderNo: string) => Promise<unknown>) {
+  const { owner, orderNo, back } = await start(form);
+  let target = `${back}?notice=${okNotice}`;
   try {
-    await changeOrderAddress(customer.id, orderNo, Number(text(form, "addressId")));
-  } catch (e) {
-    if (!(e instanceof OrderError)) throw e;
-    target = await flashError(back, e.message);
-  }
-  redirect(target);
-}
-
-/** 구매확정 (상품 줄 하나) */
-export async function confirmPurchaseAction(form: FormData) {
-  const { customer, orderNo, back } = await start(form);
-  let target = `${back}?notice=CONFIRMED`;
-  try {
-    await confirmPurchase(customer.id, orderNo, Number(text(form, "orderItemId")));
+    await work(owner, orderNo);
   } catch (e) {
     if (!(e instanceof OrderError)) throw e;
     target = await flashError(back, e.message);
@@ -82,3 +78,28 @@ export async function confirmPurchaseAction(form: FormData) {
   revalidatePath("/orders");
   redirect(target);
 }
+
+/** 배송지 변경 (회원: 주소록에서 선택) */
+export async function changeAddressAction(form: FormData) {
+  await run(form, "ADDRESS_CHANGED", (owner, orderNo) => changeOrderAddress(owner, orderNo, Number(text(form, "addressId"))));
+}
+
+/** 배송지 변경 (직접 입력: 비회원) */
+export async function changeAddressDirectAction(form: FormData) {
+  await run(form, "ADDRESS_CHANGED", (owner, orderNo) =>
+    changeOrderAddressDirect(owner, orderNo, {
+      recipient: text(form, "recipient"),
+      phone: text(form, "phone"),
+      zipCode: text(form, "zipCode"),
+      address1: text(form, "address1"),
+      address2: text(form, "address2"),
+      deliveryMemo: text(form, "deliveryMemo"),
+    }),
+  );
+}
+
+/** 구매확정 (상품 줄 하나) */
+export async function confirmPurchaseAction(form: FormData) {
+  await run(form, "CONFIRMED", (owner, orderNo) => confirmPurchase(owner, orderNo, Number(text(form, "orderItemId"))));
+}
+
