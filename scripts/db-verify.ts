@@ -10,7 +10,7 @@ import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
 import { prisma } from "../src/lib/prisma";
-import { allChecks, TRIGGERS, validateConstraints } from "../prisma/db-constraints";
+import { allChecks, FULFILLMENT_OF, TRIGGERS, validateConstraints } from "../prisma/db-constraints";
 
 type Row = Record<string, unknown>;
 const errors: string[] = [];
@@ -108,9 +108,9 @@ const RULES: [string, string, "error" | "warn"][] = [
     `SELECT b."skuId" AS skuId, b."locationId" AS loc, b."onHand" AS onHand, COALESCE(SUM(l."qty"), 0) AS ledgerSum
      FROM "InventoryBalance" b LEFT JOIN "InventoryLedger" l ON l."skuId" = b."skuId" AND l."locationId" = b."locationId"
      GROUP BY b."skuId", b."locationId" HAVING b."onHand" <> COALESCE(SUM(l."qty"), 0)`, "error"],
-  ["재고: 예약 수량 = RESERVED 예약 합계",
+  ["재고: 예약 수량 = 결제 대기(RESERVED) + 출고 대기(ALLOCATED) 예약 합계",
     `SELECT b."skuId" AS skuId, b."reserved" AS reserved, COALESCE(SUM(r."qty"), 0) AS reservationSum
-     FROM "InventoryBalance" b LEFT JOIN "InventoryReservation" r ON r."skuId" = b."skuId" AND r."locationId" = b."locationId" AND r."status" = 'RESERVED'
+     FROM "InventoryBalance" b LEFT JOIN "InventoryReservation" r ON r."skuId" = b."skuId" AND r."locationId" = b."locationId" AND r."status" IN ('RESERVED', 'ALLOCATED')
      GROUP BY b."skuId", b."locationId" HAVING b."reserved" <> COALESCE(SUM(r."qty"), 0)`, "error"],
   ["재고: 원장의 balanceAfter가 누적 합계와 일치 (중간 기록 위조·누락 없음)",
     `SELECT id, "skuId", "balanceAfter", running FROM (
@@ -127,13 +127,15 @@ const RULES: [string, string, "error" | "warn"][] = [
   ["재고: 판매 원장은 확정된 예약에서만 생김 (수량도 일치)",
     `SELECT l."id" AS ledgerId FROM "InventoryLedger" l LEFT JOIN "InventoryReservation" r ON r."id" = l."reservationId"
      WHERE l."type" = 'SALE' AND (r."id" IS NULL OR r."status" <> 'CONFIRMED' OR -l."qty" <> r."qty")`, "error"],
-  ["주문: 결제 완료 주문의 수량 = 확정된 예약 수량 (SKU별)",
-    `SELECT o."id" AS orderId, i."skuId" AS skuId, i.q AS ordered, COALESCE(c.q, 0) AS confirmed
-     FROM "Order" o
-     JOIN (SELECT "orderId", "skuId", SUM("quantity") AS q FROM "OrderItem" GROUP BY "orderId", "skuId") i ON i."orderId" = o."id"
-     LEFT JOIN (SELECT "orderId", "skuId", SUM("qty") AS q FROM "InventoryReservation" WHERE "status" = 'CONFIRMED' GROUP BY "orderId", "skuId") c
-       ON c."orderId" = o."id" AND c."skuId" = i."skuId"
-     WHERE o."status" = 'PAID' AND i.q <> COALESCE(c.q, 0)`, "error"],
+  ["주문: 결제 완료 주문의 상품마다 할당(출고 전)·확정(출고 후)된 재고가 수량만큼 (상품 줄별)",
+    `SELECT o."orderNo", i."lineNo", i."quantity" AS ordered, COALESCE(SUM(r."qty"), 0) AS held
+     FROM "Order" o JOIN "OrderItem" i ON i."orderId" = o."id"
+     LEFT JOIN "InventoryReservation" r ON r."orderItemId" = i."id" AND r."status" IN ('ALLOCATED', 'CONFIRMED')
+     WHERE o."status" = 'PAID' AND i."status" <> 'CANCELED' GROUP BY i."id" HAVING COALESCE(SUM(r."qty"), 0) <> i."quantity"`, "error"],
+  ["재고: 출고된 상품만 재고가 확정(차감)됨, 출고 전 상품은 할당 상태",
+    `SELECT o."orderNo", i."lineNo", i."status", r."status" AS reservation FROM "OrderItem" i JOIN "Order" o ON o."id" = i."orderId"
+     JOIN "InventoryReservation" r ON r."orderItemId" = i."id" AND r."status" IN ('ALLOCATED', 'CONFIRMED')
+     WHERE (r."status" = 'CONFIRMED') <> (i."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED'))`, "error"],
   ["재고: 만료 시각이 지난 RESERVED 예약 없음 (만료 정리 필요: npm run inventory:release-expired)",
     `SELECT r."id" AS reservationId, r."expiresAt" AS expiresAt FROM "InventoryReservation" r WHERE r."status" = 'RESERVED' AND r."expiresAt" <= ${NOW}`, "warn"],
   ["재고: 판매 중인 SKU는 온라인 판매 위치에 잔고 행이 있음",
@@ -189,8 +191,54 @@ const RULES: [string, string, "error" | "warn"][] = [
   ["주문: 취소·만료 주문에 돈이 걸린 결제(진행 중·완료·입금 대기)가 없음",
     `SELECT o."id", p."id" AS payment, p."status" FROM "Order" o JOIN "Payment" p ON p."orderId" = o."id"
      WHERE o."status" IN ('CANCELED', 'EXPIRED') AND p."status" IN ('IN_PROGRESS', 'UNKNOWN', 'WAITING_FOR_DEPOSIT', 'DONE', 'PARTIAL_CANCELED')`, "error"],
-  ["주문: 결제 완료·취소·만료 주문은 재고를 예약(RESERVED)으로 잡고 있지 않음",
+  ["주문: 결제 완료·취소·만료 주문은 재고를 결제 대기 예약(RESERVED)으로 잡고 있지 않음",
     `SELECT o."id", o."status" FROM "Order" o WHERE o."status" IN ('PAID', 'CANCELED', 'EXPIRED') AND EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderId" = o."id" AND r."status" = 'RESERVED')`, "error"],
+  ["주문: 취소·만료 주문은 출고 대기 재고(ALLOCATED)도 잡고 있지 않음",
+    `SELECT o."orderNo", o."status" FROM "Order" o WHERE o."status" IN ('CANCELED', 'EXPIRED') AND EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderId" = o."id" AND r."status" = 'ALLOCATED')`, "error"],
+  // ----- ⑦ 주문
+  ["주문: 금액 구성 = 상품 줄 합계 (정가·상품 할인·판매가·쿠폰 몫·포인트 몫)",
+    `SELECT o."orderNo" FROM "Order" o WHERE
+       o."itemsListTotal" IS NOT (SELECT SUM(i."lineListTotal") FROM "OrderItem" i WHERE i."orderId" = o."id")
+       OR o."itemsDiscountTotal" IS NOT (SELECT SUM(i."lineDiscountTotal") FROM "OrderItem" i WHERE i."orderId" = o."id")
+       OR o."itemsTotal" IS NOT (SELECT SUM(i."lineTotal") FROM "OrderItem" i WHERE i."orderId" = o."id")
+       OR o."couponDiscountTotal" IS NOT (SELECT SUM(i."couponAllocated") FROM "OrderItem" i WHERE i."orderId" = o."id")
+       OR o."pointUsed" IS NOT (SELECT SUM(i."pointAllocated") FROM "OrderItem" i WHERE i."orderId" = o."id")`, "error"],
+  ["주문: 진행 요약(fulfillmentStatus) = 상품 상태로 계산한 값",
+    `SELECT o."orderNo", o."fulfillmentStatus" AS stored, ${FULFILLMENT_OF(`o."id"`)} AS computed FROM "Order" o
+     WHERE EXISTS (SELECT 1 FROM "OrderItem" x WHERE x."orderId" = o."id") AND o."fulfillmentStatus" IS NOT ${FULFILLMENT_OF(`o."id"`)}`, "error"],
+  ["주문: 상품 상태가 주문(돈) 상태와 맞음 (결제 전 = 결제 대기, 취소·만료 = 취소, 결제 완료 = 결제 대기 없음)",
+    `SELECT o."orderNo", o."status", i."lineNo", i."status" AS item FROM "Order" o JOIN "OrderItem" i ON i."orderId" = o."id"
+     WHERE (o."status" IN ('PENDING', 'WAITING_DEPOSIT') AND i."status" <> 'AWAITING_PAYMENT')
+        OR (o."status" IN ('CANCELED', 'EXPIRED') AND i."status" <> 'CANCELED')
+        OR (o."status" = 'PAID' AND i."status" = 'AWAITING_PAYMENT')`, "error"],
+  ["주문: 현재 상태 = 상태 이력의 마지막 상태 (주문·상품)",
+    `SELECT 'order' AS kind, o."orderNo" AS ref, o."status" FROM "Order" o
+       WHERE o."status" IS NOT (SELECT h."toStatus" FROM "OrderStatusHistory" h WHERE h."orderId" = o."id" ORDER BY h."id" DESC LIMIT 1)
+     UNION ALL
+     SELECT 'item', CAST(i."id" AS TEXT), i."status" FROM "OrderItem" i
+       WHERE i."status" IS NOT (SELECT h."toStatus" FROM "OrderItemStatusHistory" h WHERE h."orderItemId" = i."id" ORDER BY h."id" DESC LIMIT 1)`, "error"],
+  ["주문: 배송중·배송 완료 상품은 출고된 상자에 담겨 있음",
+    `SELECT i."id", i."status" FROM "OrderItem" i WHERE i."status" IN ('SHIPPED', 'DELIVERED') AND NOT EXISTS (
+       SELECT 1 FROM "ShipmentItem" si JOIN "Shipment" s ON s."id" = si."shipmentId"
+       WHERE si."orderItemId" = i."id" AND s."type" = 'OUTBOUND' AND s."status" IN ('SHIPPED', 'DELIVERED'))`, "error"],
+  ["주문: 결제를 시작한 주문에는 배송지가 있음 (배송지 저장 전 도입 이전 주문 제외)",
+    `SELECT o."orderNo" FROM "Order" o JOIN "ShippingPolicy" sp ON sp."id" = o."shippingPolicyId"
+     WHERE sp."code" <> 'LEGACY-FREE' AND EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = o."id" AND p."status" <> 'ABORTED')
+       AND NOT EXISTS (SELECT 1 FROM "OrderShippingAddress" a WHERE a."orderId" = o."id")`, "error"],
+  ["배송비 규칙: 지금 적용 중인 규칙이 정확히 1개 (없으면 주문 불가)",
+    `SELECT count(*) AS n FROM "ShippingPolicy" WHERE "validFrom" <= ${NOW} AND ("validTo" IS NULL OR "validTo" > ${NOW}) HAVING count(*) <> 1`, "error"],
+  ["주문: 출고 후 결제가 전액 취소된 주문 없음 (토스 상점관리자에서 취소?) → 상품 회수·반품 확인 필요",
+    `SELECT o."orderNo" FROM "Order" o WHERE o."status" = 'PAID'
+       AND NOT EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = o."id" AND p."status" IN ('DONE', 'PARTIAL_CANCELED'))`, "warn"],
+  ["배송: 상품 준비중 3일 넘은 주문 없음 (출고 지연 → 고객 안내 필요)",
+    `SELECT o."orderNo", min(i."preparingAt") AS since FROM "OrderItem" i JOIN "Order" o ON o."id" = i."orderId"
+     WHERE i."status" = 'PREPARING' AND julianday(${NOW}) - julianday(i."preparingAt") > 3 GROUP BY o."id"`, "warn"],
+  ["배송: 출고 후 14일 넘게 배송중인 상자 없음 (배송 완료 처리 누락 또는 배송 사고)",
+    `SELECT s."id", s."trackingNo", s."shippedAt" FROM "Shipment" s WHERE s."status" = 'SHIPPED' AND julianday(${NOW}) - julianday(s."shippedAt") > 14`, "warn"],
+  ["구매확정: 자동 확정 예정일이 지난 배송 완료 상품 없음 → npm run orders:jobs -- auto-confirm",
+    `SELECT i."id", i."autoConfirmAt" FROM "OrderItem" i WHERE i."status" = 'DELIVERED' AND i."autoConfirmAt" <= ${NOW}`, "warn"],
+  ["개인정보: 5년 지난 주문의 주문자·배송지가 파기됨 → npm run orders:jobs -- purge",
+    `SELECT o."orderNo" FROM "Order" o WHERE o."piiPurgedAt" IS NULL AND julianday(${NOW}) - julianday(o."createdAt") > 365 * 5 + 1`, "warn"],
   ["결제: 결과 확인이 필요한 결제 없음 (응답 끊김·2분 넘은 승인 중) → npm run payments:jobs -- reconcile",
     `SELECT "id", "status", "statusChangedAt" FROM "Payment" WHERE "status" = 'UNKNOWN' OR ("status" = 'IN_PROGRESS' AND julianday(${NOW}) - julianday("statusChangedAt") > 2.0 / 1440)`, "warn"],
   ["가상계좌: 입금 기한이 지난 입금 대기 없음 → npm run payments:jobs -- deposits",

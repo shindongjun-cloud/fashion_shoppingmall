@@ -29,6 +29,10 @@ import {
 import { confirmOrderPayment, defaultPaymentDeps, placeOrder } from "../src/lib/checkout";
 import { createTossApi } from "../src/lib/toss";
 import { FakeToss } from "./helpers/fake-toss";
+import { giveAddress, makePayableOrder } from "./helpers/orders";
+import { confirmPurchase, deliverShipment, prepareOrder, registerShipment, shipShipment } from "../src/lib/order";
+import { allocateOrder, ensureReservedTx } from "../src/lib/inventory";
+import { orderStatusData } from "../src/lib/order-rules";
 
 class Rollback extends Error {}
 const DAY = 24 * 60 * 60 * 1000;
@@ -282,6 +286,15 @@ describe("탈퇴: 신청 → 7일 유예(철회 가능) → 익명화 + 로그�
     );
     assert.equal(paid.kind, "PAID");
     const account = await prisma.account.findFirstOrThrow({ where: { userId: user.id } });
+    // 배송이 끝나지 않은 주문이 있으면 탈퇴 불가 → 출고·배송 완료·구매확정까지 마친 뒤 탈퇴
+    await rejectsWith(() => requestWithdrawal(customer.id, { reasonCode: "PRIVACY" }), "구매확정 전인 주문");
+    await prepareOrder(order.orderNo, "ADMIN:test");
+    const box = await registerShipment(order.orderNo, { courierCode: "CJ", trackingNo: String(Date.now()).slice(-12) }, "ADMIN:test");
+    await shipShipment(box!.id);
+    await deliverShipment(box!.id);
+    await rejectsWith(() => requestWithdrawal(customer.id, { reasonCode: "PRIVACY" }), "구매확정 전인 주문");
+    const item = await prisma.orderItem.findFirstOrThrow({ where: { orderId: order.id } });
+    await confirmPurchase(customer.id, order.orderNo, item.id);
 
     const requested = new Date();
     await requestWithdrawal(customer.id, { reasonCode: "PRIVACY" }, requested);
@@ -302,6 +315,11 @@ describe("탈퇴: 신청 → 7일 유예(철회 가능) → 익명화 + 로그�
     const keptOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
     assert.equal(keptOrder.customerId, customer.id);
     assert.equal(keptOrder.status, "PAID");
+    assert.equal(keptOrder.fulfillmentStatus, "CONFIRMED");
+    assert.ok(keptOrder.ordererNameEnc, "주문자 정보 스냅샷은 탈퇴해도 5년 보관 (프로필은 파기)");
+    const keptAddress = await prisma.orderShippingAddress.findUniqueOrThrow({ where: { orderId: order.id } });
+    assert.ok(keptAddress.address1Enc, "주문 배송지 스냅샷도 남음 (주소록은 삭제)");
+    assert.equal(keptAddress.sourceAddressId, null, "지워진 주소록과의 연결만 비워짐 (SetNull)");
     // 재가입 제한: 30일 동안 같은 GitHub 계정 차단, 그 뒤 허용
     assert.equal(await isRejoinBlocked(account.provider, account.providerAccountId, later), true);
     assert.equal(await isRejoinBlocked(account.provider, account.providerAccountId, new Date(later.getTime() + 31 * DAY)), false);
@@ -311,6 +329,7 @@ describe("탈퇴: 신청 → 7일 유예(철회 가능) → 익명화 + 로그�
 
   test("결제 대기 중인 주문이 있으면 탈퇴 신청 불가", async () => {
     const { customer } = await signup();
+    await giveAddress(customer.id, { makeDefault: true });
     const sku = await prisma.sku.findFirstOrThrow({ where: { skuCode: "SH26S002-WH-L" } });
     const r = await placeOrder(customer.id, [{ skuId: sku.id, quantity: 1 }]);
     assert.ok(!("error" in r));
@@ -339,15 +358,15 @@ describe("등급 재산정 (최근 12개월 결제 금액)", () => {
     const { customer } = await signup("등급");
     const now = new Date();
     // 결제 완료 주문은 결제(Payment)를 거쳐야만 만들 수 있음 (DB 트리거) → 승인 흐름으로 만든 뒤 결제 시각만 10일 전으로
-    const order = await prisma.order.create({
-      data: { paymentOrderId: `order_grade_${Date.now()}`, orderName: "등급", totalPrice: 350000, customerId: customer.id, createdAt: new Date(now.getTime() - 10 * DAY) },
-    });
+    const order = await makePayableOrder(customer.id, { price: 350000, now: new Date(now.getTime() - 10 * DAY) });
     const fake = new FakeToss();
     const paymentKey = fake.authorize({ orderId: order.paymentOrderId, amount: 350000 });
     const paid = await confirmOrderPayment(
       { customerId: customer.id, paymentOrderId: order.paymentOrderId, paymentKey, amount: "350000" },
       { ...defaultPaymentDeps, toss: createTossApi({ transport: fake.transport, secretKey: () => "test_gsk_fake" }), finalizeOrder: async (tx, o, p, at) => {
-        await tx.order.update({ where: { id: o.id }, data: { status: "PAID", paidAt: new Date(at.getTime() - 10 * DAY) } });
+        await ensureReservedTx(tx, o.id, at);
+        await allocateOrder(tx, o.id, at);
+        await tx.order.update({ where: { id: o.id }, data: { ...orderStatusData("PAID", at), paidAt: new Date(at.getTime() - 10 * DAY) } });
       } },
     );
     assert.equal(paid.kind, "PAID");
@@ -454,5 +473,10 @@ describe("고객 DB 제약 (앱을 거치지 않은 직접 수정도 막힘)", (
     await rejects(`INSERT INTO "CustomerLoginHistory" ("customerId",provider,result,"ipMasked","loggedInAt") VALUES (${a}, 'github', 'SUCCESS', '123.45.67.89', ${NOW()})`, "CustomerLoginHistory_values_ck");
   });
   test("정상(ACTIVE)이 아닌 고객의 주문 금지", () =>
-    rejects(`INSERT INTO "Order" ("paymentOrderId","orderName","totalPrice",status,"createdAt","customerId") VALUES ('order_x_${Date.now()}', 'x', 1000, 'PENDING', ${NOW()}, ${withdrawn})`, "Order_customer_active"));
+    rejects(
+      `INSERT INTO "Order" ("orderNo","paymentOrderId","orderName","totalPrice",status,"statusChangedAt","itemsListTotal","itemsDiscountTotal","itemsTotal","shippingBaseFee","shippingFee","shippingPolicyId","freeShippingThreshold","createdAt","updatedAt","customerId")
+       SELECT '20990101-00000009', 'order_x_${Date.now()}', 'x', 4000, 'PENDING', ${NOW()}, 1000, 0, 1000, 3000, 3000, sp."id", sp."freeShippingThreshold", ${NOW()}, ${NOW()}, ${withdrawn}
+       FROM "ShippingPolicy" sp WHERE sp."validTo" IS NULL`,
+      "Order_customer_active",
+    ));
 });

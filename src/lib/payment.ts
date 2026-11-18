@@ -4,7 +4,7 @@
 //   successUrl → confirmOrderPayment
 //     ① 입력 검사 → ② 주문 확인 → ③ Payment(IN_PROGRESS) 생성 = "승인 권한 선점" (동시 요청은 DB 트리거가 1개만 통과)
 //     ④ 재고 예약 확인 → ⑤ 토스 승인 (멱등키)
-//     ⑥ 토스 결과를 Payment에 먼저 저장 (돈에 관한 사실이 우선) → ⑦ 주문 결제 완료 + 재고 확정
+//     ⑥ 토스 결과를 Payment에 먼저 저장 (돈에 관한 사실이 우선) → ⑦ 주문 결제 완료 + 재고 할당 (실재고는 출고 때 감소)
 //     ⑦이 실패하면 결제 취소(보상). 토스 응답을 못 받으면 UNKNOWN → 토스에 물어서 확정 (바로 1번, 이후 정기 작업)
 // 가상계좌
 //   ⑤에서 WAITING_FOR_DEPOSIT → 재고 예약을 입금 기한 + 1시간까지 연장, 주문 WAITING_DEPOSIT
@@ -14,7 +14,8 @@ import { createHash, randomUUID } from "crypto";
 import type { Order, Payment, PaymentActor, PaymentCancelReason, PaymentMethod, PaymentStatusSource, Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
 import { blindIndex, decrypt, encrypt, maskAccountNumber, maskName } from "@/lib/crypto";
-import { confirmOrder, ensureOrderReserved, ensureReservedTx, InsufficientStockError, isConstraintError, releaseOrder, withBusyRetry } from "@/lib/inventory";
+import { allocateOrder, ensureOrderReserved, ensureReservedTx, InsufficientStockError, isConstraintError, releaseAllocated, releaseOrder, withBusyRetry } from "@/lib/inventory";
+import { orderStatusData } from "@/lib/order-rules";
 import { maskForLog, tossApi, type TossApi, type TossPayment, type TossResult } from "@/lib/toss";
 
 type Tx = Prisma.TransactionClient;
@@ -36,7 +37,7 @@ export class PaymentError extends Error {}
 export type PaymentDeps = {
   toss: TossApi;
   now: () => Date;
-  /** ⑦ 주문 결제 완료 + 재고 확정. 테스트에서 실패를 흉내 낼 수 있게 바꿔 끼울 수 있음 */
+  /** ⑦ 주문 결제 완료 + 재고 할당. 테스트에서 실패를 흉내 낼 수 있게 바꿔 끼울 수 있음 */
   finalizeOrder: (tx: Tx, order: Order, payment: Payment, now: Date) => Promise<void>;
   /** 동시 요청이 끝나기를 기다리는 시간 (테스트에서 줄임) */
   waitForOtherMs: number;
@@ -45,8 +46,9 @@ export type PaymentDeps = {
 async function defaultFinalizeOrder(tx: Tx, order: Order, payment: Payment, now: Date) {
   // 입금 대기였다면 예약이 만료됐을 수 있음 → 있으면 다시 잡고, 없으면 InsufficientStockError
   await ensureReservedTx(tx, order.id, now);
-  await confirmOrder(tx, order.id, now); // 예약 확정 → 트리거가 판매 원장 생성, 실재고 감소
-  await tx.order.update({ where: { id: order.id }, data: { status: "PAID", paidAt: payment.approvedAt ?? now } });
+  await allocateOrder(tx, order.id, now); // 예약 → 할당 (출고 대기. 실재고는 출고할 때 감소)
+  // 주문 결제 완료 → 트리거가 상품들도 결제 완료로 바꾸고 이력을 남김
+  await tx.order.update({ where: { id: order.id }, data: { ...orderStatusData("PAID", now, "SYSTEM"), paidAt: payment.approvedAt ?? now } });
   await tx.customer.update({ where: { id: order.customerId }, data: { lastOrderAt: now } }); // 휴면·등급 산정 참고
 }
 
@@ -314,7 +316,7 @@ export async function settleOrder(paymentId: number, deps: PaymentDeps = default
           prisma.$transaction(async (tx) => {
             // 입금 기한 + 1시간까지 재고를 잡아 둠 (예약 만료 시각은 바꿀 수 없으므로 풀고 다시 잡음)
             await ensureReservedTx(tx, order.id, now, { expiresAt: new Date(due.getTime() + VA_RESERVATION_GRACE_MS) });
-            await tx.order.update({ where: { id: order.id }, data: { status: "WAITING_DEPOSIT" } });
+            await tx.order.update({ where: { id: order.id }, data: orderStatusData("WAITING_DEPOSIT", now, "SYSTEM", "가상계좌 발급") });
           }),
         );
         return { kind: "WAITING_DEPOSIT" };
@@ -360,7 +362,7 @@ export async function settleOrder(paymentId: number, deps: PaymentDeps = default
             await releaseOrder(tx, order.id, "COMPENSATED", now);
             const fresh = await tx.order.findUniqueOrThrow({ where: { id: order.id } });
             if (fresh.status !== "CANCEL_FAILED" && fresh.status !== "CANCELED") {
-              await tx.order.update({ where: { id: order.id }, data: { status: "CANCEL_FAILED" } });
+              await tx.order.update({ where: { id: order.id }, data: orderStatusData("CANCEL_FAILED", now, "SYSTEM", "주문 처리 실패 후 자동 환불 실패 — 수동 환불 필요") });
             }
           }),
         );
@@ -377,28 +379,53 @@ export async function settleOrder(paymentId: number, deps: PaymentDeps = default
     }
 
     case "CANCELED": {
+      // 누가 왜 취소했는지 (마지막 완료된 취소) → 주문 상태 이력에 남김
+      const lastCancel = await prisma.paymentCancel.findFirst({ where: { paymentId: payment.id, status: "DONE" }, orderBy: { id: "desc" } });
+      const by = lastCancel?.requestedBy ?? "SYSTEM";
       if (order.status === "PAID") {
-        // 결제 완료 후 전액 취소: 재고 되돌리기(반품 입고)는 ⑩ 클레임 단계에서. 여기서는 주문 상태만
-        await withBusyRetry(() => prisma.order.update({ where: { id: order.id }, data: { status: "CANCELED", canceledAt: payment.canceledAt ?? now } }));
+        // 결제 완료 후 출고 전 전액 취소(환불 완료): 할당된 재고를 풀고(원장 기록 없음) 주문 취소 → 트리거가 상품도 취소
+        try {
+          await withBusyRetry(() =>
+            prisma.$transaction(async (tx) => {
+              await releaseAllocated(tx, order.id, "ORDER_CANCELED", now);
+              await tx.order.update({ where: { id: order.id }, data: { ...orderStatusData("CANCELED", now, by, lastCancel?.reasonText ?? "결제 전액 취소"), canceledAt: payment.canceledAt ?? now } });
+            }),
+          );
+        } catch (e) {
+          if (!isConstraintError(e, "Order_shipped_guard")) throw e;
+          // 이미 출고한 뒤 토스 쪽(상점관리자 화면 등)에서 전액 취소됨 → 주문은 그대로 두고 사람이 회수·반품 확인 (db:verify가 알림)
+          console.error(`[결제 취소] 주문 ${order.orderNo}: 출고 후 결제가 전액 취소됨 — 상품 회수·반품 확인 필요`);
+        }
       } else {
-        await closeOrderIfNoLivePayment(order.id, "CANCELED", order.status === "CANCEL_FAILED" || payment.approvedAt ? "COMPENSATED" : "ORDER_CANCELED", now);
+        await closeOrderIfNoLivePayment(order.id, "CANCELED", order.status === "CANCEL_FAILED" || payment.approvedAt ? "COMPENSATED" : "ORDER_CANCELED", now, by);
       }
       return { kind: "CANCELED" };
     }
   }
 }
 
-/** 돈이 걸린 결제가 없으면 주문을 닫고(취소·만료) 재고 예약을 풂 */
-async function closeOrderIfNoLivePayment(orderId: number, to: "CANCELED" | "EXPIRED", reason: "PAYMENT_FAILED" | "DEPOSIT_EXPIRED" | "ORDER_CANCELED" | "COMPENSATED" | "SUPERSEDED" | "PRICE_CHANGED", now: Date) {
+type CloseReason = "PAYMENT_FAILED" | "DEPOSIT_EXPIRED" | "ORDER_CANCELED" | "COMPENSATED" | "SUPERSEDED" | "PRICE_CHANGED";
+const CLOSE_MEMO: Record<CloseReason, string> = {
+  PAYMENT_FAILED: "결제 실패·결제창 이탈",
+  DEPOSIT_EXPIRED: "입금 기한 만료",
+  ORDER_CANCELED: "결제 취소",
+  COMPENSATED: "주문 처리 실패로 결제 자동 취소",
+  SUPERSEDED: "새 주문으로 대체",
+  PRICE_CHANGED: "결제 직전 가격 변경",
+};
+
+/** 돈이 걸린 결제가 없으면 주문을 닫고(취소·만료) 재고 예약·할당을 풂 */
+async function closeOrderIfNoLivePayment(orderId: number, to: "CANCELED" | "EXPIRED", reason: CloseReason, now: Date, by: PaymentActor = "SYSTEM") {
   await withBusyRetry(() =>
     prisma.$transaction(async (tx) => {
       const order = await tx.order.findUniqueOrThrow({ where: { id: orderId } });
       const live = await tx.payment.count({ where: { orderId, status: { in: ["IN_PROGRESS", "UNKNOWN", "WAITING_FOR_DEPOSIT", "DONE", "PARTIAL_CANCELED"] } } });
       if (live > 0) return;
       await releaseOrder(tx, orderId, reason, now);
+      await releaseAllocated(tx, orderId, reason === "COMPENSATED" ? "COMPENSATED" : "ORDER_CANCELED", now);
       if (["PENDING", "WAITING_DEPOSIT", "CANCEL_FAILED"].includes(order.status)) {
         const target = to === "EXPIRED" && order.status !== "WAITING_DEPOSIT" ? "CANCELED" : to;
-        await tx.order.update({ where: { id: orderId }, data: { status: target, canceledAt: now } });
+        await tx.order.update({ where: { id: orderId }, data: { ...orderStatusData(target, now, by, CLOSE_MEMO[reason]), canceledAt: now } });
       }
     }),
   );

@@ -45,4 +45,5 @@ next-env.d.ts
 # database (SQLite 파일)
 /dev.db
 /dev.db-journal
+/backups/
 /conversation-*.txt

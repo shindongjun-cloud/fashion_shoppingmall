@@ -7,7 +7,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const source = path.join(__dirname, "..", "..", "dev.db");
+// TEST_SOURCE_DB: 다른 DB를 원본으로 (예: 트리거를 일부러 지운 복사본으로 "테스트가 정말 트리거를 시험하는지" 확인할 때)
+const source = process.env.TEST_SOURCE_DB ?? path.join(__dirname, "..", "..", "dev.db");
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "myshop-test-"));
 export const TEMP_DB_PATH = path.join(dir, "test.db");
 fs.copyFileSync(source, TEMP_DB_PATH);

@@ -6,6 +6,7 @@ import { getCurrentCustomer } from "@/lib/current-customer";
 import { confirmOrderPayment } from "@/lib/payment";
 import { getTossConfigProblem } from "@/lib/toss";
 import { loginPath } from "@/lib/safe-redirect";
+import { prisma } from "@/lib/prisma";
 
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
@@ -31,12 +32,14 @@ export async function GET(request: NextRequest) {
     paymentKey: params.get("paymentKey"),
     amount: params.get("amount"),
   });
+  // 화면 주소에는 내부 번호(id) 대신 고객용 주문번호
+  const orderNo = async (id: number) => (await prisma.order.findUniqueOrThrow({ where: { id }, select: { orderNo: true } })).orderNo;
   switch (result.kind) {
     case "PAID":
     case "WAITING_DEPOSIT":
-      return goTo(`/checkout/complete?orderId=${result.orderId}`);
+      return goTo(`/checkout/complete?orderNo=${await orderNo(result.orderId)}`);
     case "PROCESSING":
-      return goTo(`/checkout/pending?orderId=${result.orderId}`);
+      return goTo(`/checkout/pending?orderNo=${await orderNo(result.orderId)}`);
     case "FAILED":
       return fail(result.code);
   }

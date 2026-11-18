@@ -7,6 +7,9 @@ import { listAddresses } from "@/lib/customer";
 import CheckoutView from "@/components/CheckoutView";
 import { getTossConfigProblem } from "@/lib/toss";
 import { loginPath } from "@/lib/safe-redirect";
+import { prisma } from "@/lib/prisma";
+import { currentShippingPolicy, findZone } from "@/lib/order-rules";
+import { REGION_LABEL } from "@/lib/order-labels";
 
 export const dynamic = "force-dynamic";
 
@@ -47,35 +50,42 @@ export default async function CheckoutPage() {
     );
   }
 
-  const [skus, addresses] = await Promise.all([getCartSkus(), listAddresses(customer.id)]);
-  const shipTo = addresses.find((a) => a.isDefault);
+  const now = new Date();
+  const [skus, addresses, policy] = await Promise.all([getCartSkus(), listAddresses(customer.id), currentShippingPolicy(prisma, now).catch(() => null)]);
+  if (!policy) {
+    console.error("[주문 설정 오류] 지금 적용 중인 배송비 규칙(ShippingPolicy)이 없습니다");
+    return (
+      <main className="mx-auto w-full max-w-3xl px-4 py-20 text-center">
+        <p className="text-gray-700">지금은 주문할 수 없어요. 배송비 설정을 확인하고 있어요.</p>
+      </main>
+    );
+  }
+  // 배송지마다 제주·도서산간 추가 배송비를 미리 계산 (화면 표시용. 실제 금액은 주문할 때 서버가 다시 계산)
+  const addressOptions = await Promise.all(
+    addresses.map(async (a) => {
+      const zone = await findZone(prisma, policy.id, a.zipCode);
+      return {
+        id: a.id,
+        label: a.label,
+        isDefault: a.isDefault,
+        recipient: a.recipient,
+        phoneMasked: a.phoneMasked,
+        line: `(${a.zipCode}) ${a.address1} ${a.address2 ?? ""}`.trim(),
+        deliveryMemo: a.deliveryMemo,
+        extraFee: zone?.extraFee ?? 0,
+        regionLabel: zone ? `${REGION_LABEL[zone.region]} · ${zone.name}` : null,
+      };
+    }),
+  );
 
   return (
-    <>
-      {/* 기본 배송지 (주문서에 배송지 스냅샷을 저장하는 것은 ⑦ 주문 단계) */}
-      <section className="mx-auto mt-10 w-full max-w-3xl px-4">
-        <div className="rounded-xl border border-gray-200 bg-white p-4 text-sm">
-          <div className="flex items-center justify-between">
-            <h2 className="font-bold text-gray-900">배송지</h2>
-            <Link href="/my#addresses" className="text-gray-500 underline">변경</Link>
-          </div>
-          {shipTo ? (
-            <p className="mt-2 text-gray-700">
-              [{shipTo.label}] {shipTo.recipient} · {shipTo.phoneMasked}
-              <br />({shipTo.zipCode}) {shipTo.address1} {shipTo.address2}
-            </p>
-          ) : (
-            <p className="mt-2 text-red-600">등록된 배송지가 없어요. 내 정보에서 배송지를 추가해 주세요.</p>
-          )}
-        </div>
-      </section>
-      <CheckoutView
-        skus={skus}
-        customerKey={customer.customerNo} // 토스가 구매자를 구분하는 값 (로그인 계정이 아닌 고객번호: 탈퇴 후에도 바뀌지 않음)
-        customerName={session.user.name ?? undefined}
-        customerEmail={session.user.email ?? undefined}
-        hasAddress={Boolean(shipTo)}
-      />
-    </>
+    <CheckoutView
+      skus={skus}
+      customerKey={customer.customerNo} // 토스가 구매자를 구분하는 값 (로그인 계정이 아닌 고객번호: 탈퇴 후에도 바뀌지 않음)
+      customerName={session.user.name ?? undefined}
+      customerEmail={session.user.email ?? undefined}
+      addresses={addressOptions}
+      shippingRule={{ baseFee: policy.baseFee, freeShippingThreshold: policy.freeShippingThreshold }}
+    />
   );
 }

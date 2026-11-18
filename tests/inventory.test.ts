@@ -9,7 +9,7 @@ import { prisma } from "../src/lib/prisma";
 import {
   isBusyError,
   withBusyRetry,
-  confirmOrder,
+  allocateOrder,
   getAvailability,
   InsufficientStockError,
   recordMovement,
@@ -21,6 +21,7 @@ import { abandonOrder, confirmOrderPayment, defaultPaymentDeps, placeOrder, type
 import { createTossApi } from "../src/lib/toss";
 import { FakeToss } from "./helpers/fake-toss";
 import { ensureCustomerForUser } from "../src/lib/customer";
+import { giveAddress, linesOf, makeRawOrder } from "./helpers/orders";
 
 class Rollback extends Error {}
 const MIN = 60 * 1000;
@@ -54,7 +55,9 @@ let customerId = 0;
 /** 새 고객 (로그인 계정 + 가입) */
 async function newCustomer(name: string) {
   const user = await prisma.user.create({ data: { name } });
-  return (await ensureCustomerForUser(user.id)).id;
+  const id = (await ensureCustomerForUser(user.id)).id;
+  await giveAddress(id, { makeDefault: true }); // ⑦ 주문: 배송지가 있어야 주문 가능
+  return id;
 }
 const skuIdOf = new Map<string, number>();
 const sku = (code: string) => skuIdOf.get(code)!;
@@ -77,15 +80,9 @@ async function setAvailable(code: string, n: number) {
   );
   assert.equal(await available(code), n);
 }
-let orderSeq = 0;
-/** 테스트용 결제 대기 주문 (주문 항목 포함, 예약은 따로) */
+/** 테스트용 결제 대기 주문 (주문 상품 포함, 예약은 따로) — 금액·배송비 규칙을 지키는 행 */
 async function makeOrder(items: { code: string; qty: number }[], owner = customerId) {
-  return prisma.order.create({
-    data: {
-      paymentOrderId: `order_test_${++orderSeq}_${Date.now()}`, orderName: "테스트", totalPrice: 1000, customerId: owner,
-      items: { create: items.map((i) => ({ skuId: sku(i.code), quantity: i.qty, listPrice: 1000, discountAmount: 0, price: 1000, styleCode: "T", skuCode: i.code, styleName: "T", colorName: "T", sizeName: "T" })) },
-    },
-  });
+  return makeRawOrder(owner, items.map((i) => ({ skuId: sku(i.code), qty: i.qty })));
 }
 
 before(async () => {
@@ -116,32 +113,26 @@ describe("기본 흐름: 입고 → 예약 → 확정 / 해제 / 만료", () => 
     await setAvailable(CODE, 5);
     const before = await balance(CODE);
     const order = await makeOrder([{ code: CODE, qty: 2 }]);
-    await prisma.$transaction((tx) => reserveOrder(tx, order.id, [{ skuId: sku(CODE), qty: 2 }]));
+    await prisma.$transaction((tx) => reserveOrder(tx, order.id, linesOf(order)));
     const afterB = await balance(CODE);
     assert.equal(afterB.onHand, before.onHand);
     assert.equal(afterB.reserved, before.reserved + 2);
     assert.equal(await available(CODE), 3);
   });
 
-  test("확정: 예약이 판매 원장(SALE)으로 바뀌고 실재고 감소", async () => {
+  test("할당은 완료된 결제가 있어야 함: 결제 없이 할당하면 DB가 거부 (실제 할당·출고 차감은 order.test.ts)", async () => {
     await setAvailable(CODE, 5);
     const order = await makeOrder([{ code: CODE, qty: 2 }]);
-    await prisma.$transaction((tx) => reserveOrder(tx, order.id, [{ skuId: sku(CODE), qty: 2 }]));
-    const reservedState = await balance(CODE);
-    await prisma.$transaction((tx) => confirmOrder(tx, order.id));
-    const afterB = await balance(CODE);
-    assert.equal(afterB.onHand, reservedState.onHand - 2);
-    assert.equal(afterB.reserved, reservedState.reserved - 2);
-    assert.equal(await available(CODE), 3, "확정해도 판매 가능 수량은 예약 때와 같음");
-    const sale = await prisma.inventoryLedger.findFirstOrThrow({ where: { refType: "ORDER", refId: String(order.id), type: "SALE" } });
-    assert.equal(sale.qty, -2);
-    assert.equal(sale.balanceAfter, afterB.onHand);
+    await prisma.$transaction((tx) => reserveOrder(tx, order.id, linesOf(order)));
+    await assert.rejects(prisma.$transaction((tx) => allocateOrder(tx, order.id)), (e) => errorText(e).includes("InventoryReservation_allocate_guard"));
+    assert.equal(await prisma.inventoryLedger.count({ where: { refType: "ORDER", refId: String(order.id) } }), 0, "판매 원장 없음");
+    await releaseOrder(prisma, order.id, "PAYMENT_FAILED");
   });
 
   test("해제: 판매 가능 수량이 돌아오고 원장은 생기지 않음", async () => {
     await setAvailable(CODE, 5);
     const order = await makeOrder([{ code: CODE, qty: 2 }]);
-    await prisma.$transaction((tx) => reserveOrder(tx, order.id, [{ skuId: sku(CODE), qty: 2 }]));
+    await prisma.$transaction((tx) => reserveOrder(tx, order.id, linesOf(order)));
     assert.equal(await releaseOrder(prisma, order.id, "PAYMENT_FAILED"), 1);
     assert.equal(await available(CODE), 5);
     assert.equal(await prisma.inventoryLedger.count({ where: { refType: "ORDER", refId: String(order.id) } }), 0);
@@ -152,7 +143,7 @@ describe("기본 흐름: 입고 → 예약 → 확정 / 해제 / 만료", () => 
     const reservedBefore = (await balance(CODE)).reserved; // 앞 테스트의 예약이 남아 있을 수 있으므로 기준값을 잡아 둠
     const order = await makeOrder([{ code: CODE, qty: 2 }]);
     const past = new Date(Date.now() - 30 * MIN);
-    await prisma.$transaction((tx) => reserveOrder(tx, order.id, [{ skuId: sku(CODE), qty: 2 }], past)); // 30분 전 예약 → 10분 전 만료
+    await prisma.$transaction((tx) => reserveOrder(tx, order.id, linesOf(order), past)); // 30분 전 예약 → 10분 전 만료
     assert.equal(await available(CODE), 5, "만료된 예약은 안내 수량에서 제외");
     assert.equal(await releaseExpired(prisma, new Date(), [sku(CODE)]), 1);
     const r = await prisma.inventoryReservation.findFirstOrThrow({ where: { orderId: order.id } });
@@ -160,11 +151,11 @@ describe("기본 흐름: 입고 → 예약 → 확정 / 해제 / 만료", () => 
     assert.equal((await balance(CODE)).reserved, reservedBefore);
   });
 
-  test("만료된 예약은 확정할 수 없음 (DB 트리거)", async () => {
+  test("만료된 예약은 할당할 수 없음 (DB 트리거)", async () => {
     await setAvailable(CODE, 5);
     const order = await makeOrder([{ code: CODE, qty: 1 }]);
-    await prisma.$transaction((tx) => reserveOrder(tx, order.id, [{ skuId: sku(CODE), qty: 1 }], new Date(Date.now() - 30 * MIN)));
-    await assert.rejects(prisma.$transaction((tx) => confirmOrder(tx, order.id)), (e) => errorText(e).includes("만료된 예약은 확정할 수 없습니다"));
+    await prisma.$transaction((tx) => reserveOrder(tx, order.id, linesOf(order), new Date(Date.now() - 30 * MIN)));
+    await assert.rejects(prisma.$transaction((tx) => allocateOrder(tx, order.id)), (e) => errorText(e).includes("만료된 예약은 할당할 수 없습니다"));
     await releaseExpired();
   });
 
@@ -174,7 +165,7 @@ describe("기본 흐름: 입고 → 예약 → 확정 / 해제 / 만료", () => 
     const b = await balance(code);
     assert.equal(b.onHand - b.reserved - b.safetyStock, 2);
     const order = await makeOrder([{ code, qty: 3 }]);
-    await assert.rejects(prisma.$transaction((tx) => reserveOrder(tx, order.id, [{ skuId: sku(code), qty: 3 }])), InsufficientStockError);
+    await assert.rejects(prisma.$transaction((tx) => reserveOrder(tx, order.id, linesOf(order))), InsufficientStockError);
   });
 });
 
@@ -186,7 +177,7 @@ describe("동시 주문: 마지막 1개", () => {
     await setAvailable(CODE, 1);
     const orders = await Promise.all([1, 2, 3, 4, 5].map(() => makeOrder([{ code: CODE, qty: 1 }])));
     const results = await Promise.allSettled(
-      orders.map((o) => prisma.$transaction((tx) => reserveOrder(tx, o.id, [{ skuId: sku(CODE), qty: 1 }]))),
+      orders.map((o) => prisma.$transaction((tx) => reserveOrder(tx, o.id, linesOf(o)))),
     );
     assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
     assert.ok(results.filter((r) => r.status === "rejected").every((r) => (r as PromiseRejectedResult).reason instanceof InsufficientStockError));
@@ -204,8 +195,8 @@ describe("동시 주문: 마지막 1개", () => {
       // 두 번째 고객은 "다른 연결"에서 주문 (lib의 placeOrder는 기본 연결을 쓰므로 같은 로직을 다른 연결로 흉내)
       const [o1, o2] = await Promise.all([makeOrder([{ code: CODE, qty: 1 }], buyers[0]), makeOrder([{ code: CODE, qty: 1 }], buyers[1])]);
       const results = await Promise.allSettled([
-        withBusyRetry(() => prisma.$transaction((tx) => reserveOrder(tx, o1.id, [{ skuId: sku(CODE), qty: 1 }]))),
-        withBusyRetry(() => otherDb.$transaction((tx) => reserveOrder(tx, o2.id, [{ skuId: sku(CODE), qty: 1 }]))),
+        withBusyRetry(() => prisma.$transaction((tx) => reserveOrder(tx, o1.id, linesOf(o1)))),
+        withBusyRetry(() => otherDb.$transaction((tx) => reserveOrder(tx, o2.id, linesOf(o2)))),
       ]);
       assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
       const failed = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
@@ -223,8 +214,8 @@ describe("동시 주문: 마지막 1개", () => {
     try {
       const [o1, o2] = await Promise.all([makeOrder([{ code: CODE, qty: 1 }]), makeOrder([{ code: CODE, qty: 1 }])]);
       const results = await Promise.allSettled([
-        prisma.$transaction((tx) => reserveOrder(tx, o1.id, [{ skuId: sku(CODE), qty: 1 }])),
-        other.$transaction((tx) => reserveOrder(tx, o2.id, [{ skuId: sku(CODE), qty: 1 }])),
+        prisma.$transaction((tx) => reserveOrder(tx, o1.id, linesOf(o1))),
+        other.$transaction((tx) => reserveOrder(tx, o2.id, linesOf(o2))),
       ]);
       const ok = results.filter((r) => r.status === "fulfilled").length;
       assert.equal(ok, 1, `성공 ${ok}개: ${results.map((r) => (r.status === "rejected" ? errorText(r.reason).slice(0, 120) : "ok")).join(" | ")}`);
@@ -309,7 +300,7 @@ describe("결제 승인 직전 재고 확인 (confirmOrderPayment) — 토스는
   const deps = (fake: FakeToss): PaymentDeps => ({ ...defaultPaymentDeps, toss: createTossApi({ transport: fake.transport, secretKey: () => "test_gsk_fake" }) });
   const reservationsOf = (orderId: number) => prisma.inventoryReservation.findMany({ where: { orderId }, orderBy: { id: "asc" } });
 
-  test("성공: 주문 PAID, 예약 확정, 판매 원장 생성, 실재고 감소", async () => {
+  test("성공: 주문 PAID, 예약 할당(ALLOCATED), 판매 원장 없음, 실재고 그대로 (출고 때 감소)", async () => {
     await setAvailable(CODE, 3);
     const fake = new FakeToss();
     const { order, input } = await newPendingOrder(fake);
@@ -317,9 +308,10 @@ describe("결제 승인 직전 재고 확인 (confirmOrderPayment) — 토스는
     const r = await confirmOrderPayment(input, deps(fake));
     assert.deepEqual(r, { kind: "PAID", orderId: order.id });
     assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).status, "PAID");
-    assert.equal((await reservationsOf(order.id))[0].status, "CONFIRMED");
-    assert.equal(await prisma.inventoryLedger.count({ where: { refType: "ORDER", refId: String(order.id), type: "SALE" } }), 1);
-    assert.equal((await balance(CODE)).onHand, onHandBefore - 1);
+    assert.equal((await reservationsOf(order.id))[0].status, "ALLOCATED");
+    assert.equal(await prisma.inventoryLedger.count({ where: { refType: "ORDER", refId: String(order.id), type: "SALE" } }), 0);
+    assert.equal((await balance(CODE)).onHand, onHandBefore, "실재고는 출고할 때 줄어듦");
+    assert.equal(await available(CODE), 2, "판매 가능 수량에서는 계속 빠져 있음");
   });
 
   test("예약이 만료됐어도 재고가 있으면 다시 잡고(RENEWED) 결제 성공", async () => {
@@ -328,7 +320,7 @@ describe("결제 승인 직전 재고 확인 (confirmOrderPayment) — 토스는
     const { order, input } = await newPendingOrder(fake, 1, new Date(Date.now() - 30 * MIN)); // 이미 만료된 예약
     const r = await confirmOrderPayment(input, deps(fake));
     assert.equal(r.kind, "PAID", JSON.stringify(r));
-    assert.deepEqual((await reservationsOf(order.id)).map((x) => x.status), ["EXPIRED", "CONFIRMED"]);
+    assert.deepEqual((await reservationsOf(order.id)).map((x) => x.status), ["EXPIRED", "ALLOCATED"]);
   });
 
   test("만료 1분 전 예약은 승인 전에 갱신 (승인 도중 만료 방지)", async () => {
@@ -337,7 +329,7 @@ describe("결제 승인 직전 재고 확인 (confirmOrderPayment) — 토스는
     const { order, input } = await newPendingOrder(fake, 1, new Date(Date.now() - 19 * MIN)); // 1분 남음
     const r = await confirmOrderPayment(input, deps(fake));
     assert.equal(r.kind, "PAID", JSON.stringify(r));
-    assert.deepEqual((await reservationsOf(order.id)).map((x) => [x.status, x.releaseReason]), [["RELEASED", "RENEWED"], ["CONFIRMED", null]]);
+    assert.deepEqual((await reservationsOf(order.id)).map((x) => [x.status, x.releaseReason]), [["RELEASED", "RENEWED"], ["ALLOCATED", null]]);
   });
 
   test("예약이 만료됐고 그 사이 재고가 팔렸으면 토스 승인 없이 실패 (고객 돈이 나가지 않음)", async () => {
@@ -346,7 +338,7 @@ describe("결제 승인 직전 재고 확인 (confirmOrderPayment) — 토스는
     const { order, input } = await newPendingOrder(fake, 1, new Date(Date.now() - 30 * MIN));
     // 다른 고객이 마지막 1개를 가져감 (만료된 예약을 정리하고 예약)
     const thief = await makeOrder([{ code: CODE, qty: 1 }]);
-    await prisma.$transaction((tx) => reserveOrder(tx, thief.id, [{ skuId: sku(CODE), qty: 1 }]));
+    await prisma.$transaction((tx) => reserveOrder(tx, thief.id, linesOf(thief)));
     const r = await confirmOrderPayment(input, deps(fake));
     assert.equal(r.kind === "FAILED" && r.code, "OUT_OF_STOCK");
     assert.equal(fake.count("confirm"), 0, "토스 승인을 부르면 안 됨");
@@ -360,13 +352,21 @@ describe("재고 DB 제약 (앱을 거치지 않은 직접 수정도 막힘)", (
   const now = () => ISO(new Date());
   const later = () => ISO(new Date(Date.now() + 20 * MIN));
   let orderId = 0;
+  let itemId = 0;
   before(async () => {
     await setAvailable(CODE, 5);
-    orderId = (await makeOrder([{ code: CODE, qty: 1 }])).id;
+    const o = await makeOrder([{ code: CODE, qty: 1 }]);
+    orderId = o.id;
+    itemId = o.items[0].id;
   });
   const bal = () => `"skuId" = ${sku(CODE)} AND "locationId" = ${dc}`;
-  const reserve = (qty = 1, loc = dc, status = "RESERVED") =>
-    `INSERT INTO "InventoryReservation" ("orderId","skuId","locationId",qty,status,"expiresAt","createdAt") VALUES (${orderId}, ${sku(CODE)}, ${loc}, ${qty}, '${status}', ${later()}, ${now()})`;
+  // 기본 주문 상품 줄은 1개짜리. 다른 수량을 시험할 때는 그 수량의 주문을 새로 만들어 씀 (줄과 수량이 다르면 DB가 막으므로)
+  const reserve = (qty = 1, loc = dc, status = "RESERVED", item = itemId, order = orderId) =>
+    `INSERT INTO "InventoryReservation" ("orderId","orderItemId","skuId","locationId",qty,status,"expiresAt","createdAt") VALUES (${order}, ${item}, ${sku(CODE)}, ${loc}, ${qty}, '${status}', ${later()}, ${now()})`;
+  const orderOfQty = async (qty: number) => {
+    const o = await makeOrder([{ code: CODE, qty }]);
+    return { order: o.id, item: o.items[0].id };
+  };
   const ledger = (type: string, qty: number, balanceAfter: string, extra = "") =>
     `INSERT INTO "InventoryLedger" ("skuId","locationId",type,qty,"balanceAfter","refType","refId","occurredAt","createdAt"${extra ? ",reason" : ""}) VALUES (${sku(CODE)}, ${dc}, '${type}', ${qty}, ${balanceAfter}, 'INBOUND_ORDER', 'T', ${now()}, ${now()}${extra ? `, '${extra}'` : ""})`;
   const onHandPlus = (q: number) => `(SELECT "onHand" + ${q} FROM "InventoryBalance" WHERE ${bal()})`;
@@ -404,19 +404,27 @@ describe("재고 DB 제약 (앱을 거치지 않은 직접 수정도 막힘)", (
   test("조정 출고는 사유 필수", () => rejects(ledger("ADJUST_OUT", -1, onHandPlus(-1)), "InventoryLedger_reason_ck"));
   test("예약된 수량보다 실재고를 적게 만들 수 없음", async () => {
     // 5개 중 5개 예약 후 1개 조정 출고 시도
-    await rejects([reserve(5), ledger("ADJUST_OUT", -1, onHandPlus(-1), "분실")], "결제 대기 예약보다 실재고가 적어집니다");
+    const o = await orderOfQty(5);
+    await rejects([reserve(5, dc, "RESERVED", o.item, o.order), ledger("ADJUST_OUT", -1, onHandPlus(-1), "분실")], "결제 대기 예약보다 실재고가 적어집니다");
   });
-  test("판매 가능 수량보다 많이 예약 금지", () => rejects(reserve(999), "InventoryReservation_insufficient"));
+  test("판매 가능 수량보다 많이 예약 금지", async () => {
+    const o = await orderOfQty(999);
+    await rejects(reserve(999, dc, "RESERVED", o.item, o.order), "InventoryReservation_insufficient");
+  });
   test("안전재고는 실재고 안에 있어도 예약 금지 (CHECK 예약≤실재고로는 못 잡고 트리거만 잡는 경우)", async () => {
     // 실재고 5, 안전재고 2 → 판매 가능 3. 4개 예약은 '예약 ≤ 실재고'(4 ≤ 5)는 통과하지만 판매 가능 수량을 넘음
-    await rejects([`UPDATE "InventoryBalance" SET "safetyStock" = 2 WHERE ${bal()}`, reserve(4)], "InventoryReservation_insufficient");
+    const o = await orderOfQty(4);
+    await rejects([`UPDATE "InventoryBalance" SET "safetyStock" = 2 WHERE ${bal()}`, reserve(4, dc, "RESERVED", o.item, o.order)], "InventoryReservation_insufficient");
   });
+  test("예약의 수량이 주문 상품 줄과 다르면 거부", () => rejects(reserve(2), "InventoryReservation_item_match"));
   test("온라인 판매 위치가 아닌 곳(반품센터)에서 예약 금지", () => rejects(reserve(1, returnCenter), "온라인 판매 위치가 아닙니다"));
   test("처음부터 확정 상태로 예약 생성 금지", () => rejects(reserve(1, dc, "CONFIRMED"), "RESERVED 상태로만"));
   test("같은 주문·SKU에 활성 예약 중복 금지", () => rejects([reserve(1), reserve(1)], "이미 있습니다"));
-  test("확정된 예약을 다시 RESERVED로 되돌리기 금지", () =>
-    rejects([reserve(1), `UPDATE "InventoryReservation" SET status = 'CONFIRMED', "confirmedAt" = ${now()} WHERE "orderId" = ${orderId} AND status = 'RESERVED'`,
-      `UPDATE "InventoryReservation" SET status = 'RESERVED', "confirmedAt" = NULL WHERE "orderId" = ${orderId}`], "이미 처리된 예약"));
+  test("결제 대기 예약을 출고 없이 바로 확정(실재고 차감)하기 금지", () =>
+    rejects([reserve(1), `UPDATE "InventoryReservation" SET status = 'CONFIRMED', "allocatedAt" = ${now()}, "confirmedAt" = ${now()} WHERE "orderId" = ${orderId} AND status = 'RESERVED'`], "허용되지 않은 예약 상태 변경"));
+  test("해제된 예약을 다시 살리기 금지", () =>
+    rejects([reserve(1), `UPDATE "InventoryReservation" SET status = 'RELEASED', "releasedAt" = ${now()}, "releaseReason" = 'ADMIN' WHERE "orderId" = ${orderId} AND status = 'RESERVED'`,
+      `UPDATE "InventoryReservation" SET status = 'RESERVED', "releasedAt" = NULL, "releaseReason" = NULL WHERE "orderId" = ${orderId}`], "허용되지 않은 예약 상태 변경"));
   test("예약 수량 변경 금지 (해제 후 새로 예약)", () =>
     rejects([reserve(1), `UPDATE "InventoryReservation" SET qty = 3 WHERE "orderId" = ${orderId}`], "InventoryReservation_immutable"));
   test("예약 삭제 금지", () => rejects([reserve(1), `DELETE FROM "InventoryReservation" WHERE "orderId" = ${orderId}`], "InventoryReservation_no_delete"));

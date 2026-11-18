@@ -172,14 +172,15 @@ const MANUAL_CHECKS: CheckConstraint[] = [
     table: "InventoryReservation",
     name: "InventoryReservation_state_ck",
     expr: [
-      `("status" = 'RESERVED'  AND "confirmedAt" IS NULL     AND "releasedAt" IS NULL     AND "releaseReason" IS NULL)`,
-      `("status" = 'CONFIRMED' AND "confirmedAt" IS NOT NULL AND "releasedAt" IS NULL     AND "releaseReason" IS NULL)`,
-      `("status" = 'RELEASED'  AND "confirmedAt" IS NULL     AND "releasedAt" IS NOT NULL AND "releaseReason" IS NOT NULL)`,
-      `("status" = 'EXPIRED'   AND "confirmedAt" IS NULL     AND "releasedAt" IS NOT NULL AND "releaseReason" IS NULL)`,
+      `("status" = 'RESERVED'  AND "allocatedAt" IS NULL     AND "confirmedAt" IS NULL     AND "shipmentId" IS NULL     AND "releasedAt" IS NULL     AND "releaseReason" IS NULL)`,
+      `("status" = 'ALLOCATED' AND "allocatedAt" IS NOT NULL AND "confirmedAt" IS NULL     AND "shipmentId" IS NULL     AND "releasedAt" IS NULL     AND "releaseReason" IS NULL)`,
+      `("status" = 'CONFIRMED' AND "allocatedAt" IS NOT NULL AND "confirmedAt" IS NOT NULL AND "shipmentId" IS NOT NULL AND "releasedAt" IS NULL     AND "releaseReason" IS NULL)`,
+      `("status" = 'RELEASED'  AND "confirmedAt" IS NULL     AND "shipmentId" IS NULL     AND "releasedAt" IS NOT NULL AND "releaseReason" IS NOT NULL)`,
+      `("status" = 'EXPIRED'   AND "allocatedAt" IS NULL     AND "confirmedAt" IS NULL     AND "shipmentId" IS NULL     AND "releasedAt" IS NOT NULL AND "releaseReason" IS NULL)`,
     ].join(" OR "),
-    why: "상태별 필수 칸 (확정이면 확정 시각, 해제면 해제 시각+사유, 만료면 해제 시각)",
+    why: "상태별 필수 칸 (할당이면 할당 시각, 확정이면 출고 시각+출고 상자, 해제면 해제 시각+사유, 만료면 해제 시각. 만료는 결제 전 예약만)",
   },
-  { table: "InventoryReservation", name: "InventoryReservation_dates_ck", expr: `(${isoDate("createdAt")}) AND (${isoDate("expiresAt")}) AND (${isoDateOrNull("confirmedAt")}) AND (${isoDateOrNull("releasedAt")})`, why: "날짜 형식 (만료 비교가 깨지지 않게)" },
+  { table: "InventoryReservation", name: "InventoryReservation_dates_ck", expr: `(${isoDate("createdAt")}) AND (${isoDate("expiresAt")}) AND (${isoDateOrNull("allocatedAt")}) AND (${isoDateOrNull("confirmedAt")}) AND (${isoDateOrNull("releasedAt")})`, why: "날짜 형식 (만료 비교가 깨지지 않게)" },
 
   // ----- 고객
   { table: "Customer", name: "Customer_no_ck", expr: `"customerNo" GLOB 'C[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'`, why: "고객번호는 C + 숫자 10자리" },
@@ -209,7 +210,7 @@ const MANUAL_CHECKS: CheckConstraint[] = [
   { table: "CustomerAddress", name: "CustomerAddress_label_ck", expr: `${notBlank("label")} AND length("label") <= 20`, why: "배송지 이름 1~20자" },
   { table: "CustomerAddress", name: "CustomerAddress_zip_ck", expr: `length("zipCode") = 5 AND "zipCode" NOT GLOB '*[^0-9]*'`, why: "우편번호는 숫자 5자리" },
   { table: "CustomerAddress", name: "CustomerAddress_enc_ck", expr: ["recipientEnc", "phoneEnc", "address1Enc", "address2Enc"].map((c) => `(${encOrNull(c)})`).join(" AND "), why: "주소·수령인·연락처는 암호문으로만 저장" },
-  { table: "CustomerAddress", name: "CustomerAddress_memo_ck", expr: `"deliveryMemo" IS NULL OR length("deliveryMemo") <= 100`, why: "배송 메모 100자 이내" },
+  { table: "CustomerAddress", name: "CustomerAddress_memo_ck", expr: encOrNull("deliveryMemoEnc"), why: "배송 메모는 암호문으로만 (공동현관 비밀번호 등이 들어감. 100자 제한은 앱에서)" },
 
   { table: "CustomerStatusHistory", name: "CustomerStatusHistory_change_ck", expr: `"fromStatus" IS NULL OR "fromStatus" <> "toStatus"`, why: "상태가 실제로 바뀐 경우만 기록" },
   { table: "CustomerStatusHistory", name: "CustomerStatusHistory_dates_ck", expr: isoDate("changedAt"), why: "날짜 형식" },
@@ -423,8 +424,131 @@ const PAYMENT_CHECKS: CheckConstraint[] = [
   { table: "CashReceipt", name: "CashReceipt_values_ck", expr: `${int("amount", ">= 0")} AND ${int("taxFreeAmount", ">= 0")} AND "taxFreeAmount" <= "amount" AND (${httpsOrNull("receiptUrl")}) AND ${dates(["issuedAt", true], ["createdAt", false])}`, why: "금액 0 이상, 영수증 주소 https, 날짜 형식" },
 ];
 
+// ---------------------------------------------------------------
+// ⑦ 주문 CHECK (금액 공식·상태별 필수 칸·형식)
+// ---------------------------------------------------------------
+const zip5 = (col: string) => `length(${q(col)}) = 5 AND ${q(col)} NOT GLOB '*[^0-9]*'`;
+const memoOk = (col: string, max = 200) => `${q(col)} IS NULL OR (trim(${q(col)}) <> '' AND length(${q(col)}) <= ${max})`;
+/** 주소 암호문 칸들 (파기하면 전부 null) */
+const ADDRESS_ENC_COLS = ["recipientEnc", "phoneEnc", "address1Enc", "address2Enc", "deliveryMemoEnc"];
+const ORDERER_COLS = ["ordererNameEnc", "ordererPhoneEnc", "ordererPhoneHash", "ordererEmailEnc"];
+
+const ORDER_CHECKS: CheckConstraint[] = [
+  // ----- 주문 (금액은 앱이 계산해 넣지만, 공식이 어긋나면 DB가 거부)
+  { table: "Order", name: "Order_no_ck", expr: `"orderNo" GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'`, why: "고객용 주문번호 형식: 날짜 8자리-숫자 8자리" },
+  {
+    table: "Order",
+    name: "Order_amounts_ck",
+    expr: ["itemsListTotal", "itemsDiscountTotal", "itemsTotal", "couponDiscountTotal", "shippingBaseFee", "shippingExtraFee", "shippingFee", "shippingDiscount", "pointUsed"].map((c) => `(${int(c, ">= 0")})`).join(" AND ") + ` AND (${intOrNull("freeShippingThreshold", "> 0")})`,
+    why: "금액 칸은 0 이상의 정수 (무료배송 기준은 비우거나 1원 이상)",
+  },
+  {
+    table: "Order",
+    name: "Order_amount_math_ck",
+    expr: [
+      `"itemsTotal" = "itemsListTotal" - "itemsDiscountTotal"`,
+      `"shippingFee" = "shippingBaseFee" + "shippingExtraFee"`,
+      `"couponDiscountTotal" <= "itemsTotal"`,
+      `"shippingDiscount" <= "shippingFee"`,
+      `"totalPrice" = "itemsTotal" - "couponDiscountTotal" + "shippingFee" - "shippingDiscount" - "pointUsed"`,
+    ].join(" AND "),
+    why: "판매가 합계 = 정가 − 할인, 배송비 = 기본 + 추가, 결제액 = 판매가 − 쿠폰 + 배송비 − 배송비 할인 − 포인트 (할인이 원금을 넘지 않음)",
+  },
+  { table: "Order", name: "Order_status_meta_ck", expr: `(${memoOk("statusMemo")}) AND ${dates(["statusChangedAt", false], ["confirmedAt", true], ["piiPurgedAt", true], ["updatedAt", false])}`, why: "상태 사유 200자 이내, 날짜 형식" },
+  {
+    table: "Order",
+    name: "Order_orderer_ck",
+    expr: `(${encOrNull("ordererNameEnc")}) AND (${encOrNull("ordererPhoneEnc")}) AND (${encOrNull("ordererEmailEnc")}) AND (${hashOrNull("ordererPhoneHash")}) AND ("piiPurgedAt" IS NULL OR (${ORDERER_COLS.map((c) => `"${c}" IS NULL`).join(" AND ")}))`,
+    why: "주문자 정보는 암호문·해시로만 저장, 파기하면 전부 비움",
+  },
+  { table: "Order", name: "Order_confirmed_ck", expr: `("fulfillmentStatus" = 'CONFIRMED') = ("confirmedAt" IS NOT NULL)`, why: "전체 구매확정 시각은 모두 확정됐을 때만" },
+
+  // ----- 주문 상품 (줄 금액·상태별 시각)
+  { table: "OrderItem", name: "OrderItem_line_no_ck", expr: int("lineNo", ">= 1"), why: "순번은 1부터" },
+  {
+    table: "OrderItem",
+    name: "OrderItem_line_math_ck",
+    expr: [
+      `(${int("lineListTotal", ">= 0")}) AND (${int("lineDiscountTotal", ">= 0")}) AND (${int("lineTotal", ">= 0")}) AND (${int("couponAllocated", ">= 0")}) AND (${int("pointAllocated", ">= 0")}) AND (${int("payAmount", ">= 0")})`,
+      `"lineListTotal" = "listPrice" * "quantity"`,
+      `"lineDiscountTotal" = "discountAmount" * "quantity"`,
+      `"lineTotal" = "price" * "quantity"`,
+      `"payAmount" = "lineTotal" - "couponAllocated" - "pointAllocated"`,
+    ].join(" AND "),
+    why: "줄 금액 = 단가 × 수량, 실결제액 = 판매가 합계 − 쿠폰 몫 − 포인트 몫 (0 이상)",
+  },
+  {
+    table: "OrderItem",
+    name: "OrderItem_state_ck",
+    expr: "(" + [
+      `("status" = 'AWAITING_PAYMENT' AND "paidAt" IS NULL AND "preparingAt" IS NULL AND "shippedAt" IS NULL AND "deliveredAt" IS NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'PAID' AND "paidAt" IS NOT NULL AND "preparingAt" IS NULL AND "shippedAt" IS NULL AND "deliveredAt" IS NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'PREPARING' AND "paidAt" IS NOT NULL AND "preparingAt" IS NOT NULL AND "shippedAt" IS NULL AND "deliveredAt" IS NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'SHIPPED' AND "paidAt" IS NOT NULL AND "preparingAt" IS NOT NULL AND "shippedAt" IS NOT NULL AND "deliveredAt" IS NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'DELIVERED' AND "paidAt" IS NOT NULL AND "preparingAt" IS NOT NULL AND "shippedAt" IS NOT NULL AND "deliveredAt" IS NOT NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'CONFIRMED' AND "paidAt" IS NOT NULL AND "preparingAt" IS NOT NULL AND "shippedAt" IS NOT NULL AND "confirmedAt" IS NOT NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'CANCELED' AND "shippedAt" IS NULL AND "deliveredAt" IS NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NOT NULL)`,
+    ].join(" OR ") + `) AND (("status" = 'CONFIRMED') = ("confirmType" IS NOT NULL)) AND ("autoConfirmAt" IS NULL OR "status" IN ('DELIVERED', 'CONFIRMED')) AND ("status" <> 'DELIVERED' OR "autoConfirmAt" IS NOT NULL)`,
+    why: "단계별 시각: 그 단계까지 거친 시각은 필수, 아직 안 간 단계는 비어 있음. 구매확정이면 확정 방식, 배송 완료면 자동확정 예정일 필수",
+  },
+  { table: "OrderItem", name: "OrderItem_dates_ck", expr: `(${memoOk("statusMemo")}) AND ${dates(["statusChangedAt", false], ["paidAt", true], ["preparingAt", true], ["shippedAt", true], ["deliveredAt", true], ["confirmedAt", true], ["canceledAt", true], ["autoConfirmAt", true], ["createdAt", false])}`, why: "날짜 형식, 상태 사유 200자 이내" },
+
+  // ----- 주문 배송지 (암호문, 파기)
+  {
+    table: "OrderShippingAddress",
+    name: "OrderShippingAddress_values_ck",
+    expr: `(${zip5("zipCode")}) AND ${ADDRESS_ENC_COLS.map((c) => `(${encOrNull(c)})`).join(" AND ")} AND (${hashOrNull("phoneHash")}) AND (${int("version", ">= 1")}) AND (${memoOk("changeReason")})`,
+    why: "우편번호 5자리, 주소·연락처·메모는 암호문으로만, 버전 1 이상",
+  },
+  {
+    table: "OrderShippingAddress",
+    name: "OrderShippingAddress_purge_ck",
+    expr: `("piiPurgedAt" IS NULL AND "recipientEnc" IS NOT NULL AND "phoneEnc" IS NOT NULL AND "address1Enc" IS NOT NULL) OR ("piiPurgedAt" IS NOT NULL AND ${[...ADDRESS_ENC_COLS, "phoneHash"].map((c) => `"${c}" IS NULL`).join(" AND ")})`,
+    why: "파기 전에는 받는 분·연락처·주소 필수, 파기 후에는 전부 비어 있음",
+  },
+  { table: "OrderShippingAddress", name: "OrderShippingAddress_change_ck", expr: `("version" = 1) = ("changedBy" IS NULL)`, why: "처음 저장(1버전)은 변경자 없음, 바꾼 버전은 변경자 필수" },
+  { table: "OrderShippingAddress", name: "OrderShippingAddress_dates_ck", expr: dates(["createdAt", false], ["updatedAt", false], ["piiPurgedAt", true]), why: "날짜 형식" },
+  {
+    table: "OrderShippingAddressHistory",
+    name: "OrderShippingAddressHistory_values_ck",
+    expr: `(${zip5("zipCode")}) AND ${ADDRESS_ENC_COLS.map((c) => `(${encOrNull(c)})`).join(" AND ")} AND (${int("version", ">= 1")}) AND (${memoOk("changeReason")}) AND ${dates(["changedAt", false])}`,
+    why: "이전 주소도 암호문으로만",
+  },
+
+  // ----- 이력
+  { table: "OrderStatusHistory", name: "OrderStatusHistory_ck", expr: `("fromStatus" IS NULL OR "fromStatus" <> "toStatus") AND (${memoOk("memo")}) AND ${dates(["changedAt", false])}`, why: "실제로 바뀐 경우만, 날짜 형식" },
+  { table: "OrderItemStatusHistory", name: "OrderItemStatusHistory_ck", expr: `("fromStatus" IS NULL OR "fromStatus" <> "toStatus") AND (${memoOk("memo")}) AND ${dates(["changedAt", false])}`, why: "실제로 바뀐 경우만, 날짜 형식" },
+
+  // ----- 배송비 규칙
+  { table: "ShippingPolicy", name: "ShippingPolicy_values_ck", expr: `${q("code")} <> '' AND ${q("code")} NOT GLOB '*[^A-Z0-9_-]*' AND ${notBlank("name")} AND (${int("baseFee", ">= 0")}) AND (${intOrNull("freeShippingThreshold", "> 0")}) AND (${memoOk("memo")})`, why: "코드 형식, 배송비 0 이상, 무료 기준 1원 이상" },
+  { table: "ShippingPolicy", name: "ShippingPolicy_period_ck", expr: `${dates(["validFrom", false], ["validTo", true], ["createdAt", false])} AND ("validTo" IS NULL OR "validTo" > "validFrom")`, why: "적용 기간: 끝은 시작 이후" },
+  { table: "ShippingSurchargeZone", name: "ShippingSurchargeZone_values_ck", expr: `"region" <> 'NORMAL' AND ${notBlank("name")} AND (${zip5("zipFrom")}) AND (${zip5("zipTo")}) AND "zipFrom" <= "zipTo" AND (${int("extraFee", "> 0")})`, why: "제주·도서산간만, 우편번호 범위 시작 ≤ 끝, 추가 배송비 1원 이상" },
+
+  // ----- 택배사·출고
+  {
+    table: "Courier",
+    name: "Courier_values_ck",
+    expr: `${upperCode("code")} AND ${notBlank("name")} AND "trackingUrlTemplate" GLOB 'https://?*{no}*' AND (${int("trackingNoMinLength", "BETWEEN 6 AND 30")}) AND (${int("trackingNoMaxLength", "BETWEEN 6 AND 30")}) AND "trackingNoMinLength" <= "trackingNoMaxLength" AND (${int("sortOrder", ">= 0")})`,
+    why: "배송조회 주소는 https + 송장 자리 {no}, 송장 자릿수 6~30",
+  },
+  { table: "Shipment", name: "Shipment_tracking_ck", expr: `length("trackingNo") BETWEEN 6 AND 30 AND "trackingNo" NOT GLOB '*[^0-9]*'`, why: "송장번호는 숫자만 (하이픈 없이 저장)" },
+  {
+    table: "Shipment",
+    name: "Shipment_state_ck",
+    expr: [
+      `("status" = 'READY' AND "shippedAt" IS NULL AND "deliveredAt" IS NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'SHIPPED' AND "shippedAt" IS NOT NULL AND "deliveredAt" IS NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'DELIVERED' AND "shippedAt" IS NOT NULL AND "deliveredAt" IS NOT NULL AND "deliveredAt" >= "shippedAt" AND "canceledAt" IS NULL)`,
+      `("status" = 'CANCELED' AND "shippedAt" IS NULL AND "deliveredAt" IS NULL AND "canceledAt" IS NOT NULL)`,
+    ].join(" OR "),
+    why: "출고면 출고 시각, 배송 완료면 완료 시각(출고 이후), 취소는 출고 전에만",
+  },
+  { table: "Shipment", name: "Shipment_meta_ck", expr: `${notBlank("createdBy")} AND (${memoOk("memo")}) AND ${dates(["statusChangedAt", false], ["shippedAt", true], ["deliveredAt", true], ["canceledAt", true], ["createdAt", false], ["updatedAt", false])}`, why: "처리자 필수, 날짜 형식" },
+  { table: "ShipmentItem", name: "ShipmentItem_qty_ck", expr: int("qty", ">= 1"), why: "수량 1개 이상" },
+];
+
 export function allChecks(schemaText: string): CheckConstraint[] {
-  return [...autoChecks(schemaText), ...MANUAL_CHECKS, ...PAYMENT_CHECKS];
+  return [...autoChecks(schemaText), ...MANUAL_CHECKS, ...PAYMENT_CHECKS, ...ORDER_CHECKS];
 }
 
 // ---------------------------------------------------------------
@@ -545,7 +669,11 @@ const BAL = (alias: string, rec: "NEW" | "OLD") =>
 const LEDGER_SUM = (rec: "NEW" | "OLD") =>
   `(SELECT COALESCE(SUM(l."qty"), 0) FROM "InventoryLedger" l WHERE ${BAL("l", rec)})`;
 const RESERVED_SUM = (rec: "NEW" | "OLD") =>
-  `(SELECT COALESCE(SUM(r."qty"), 0) FROM "InventoryReservation" r WHERE ${BAL("r", rec)} AND r."status" = 'RESERVED')`;
+  `(SELECT COALESCE(SUM(r."qty"), 0) FROM "InventoryReservation" r WHERE ${BAL("r", rec)} AND r."status" IN ('RESERVED', 'ALLOCATED'))`; // 결제 대기 + 출고 대기
+/** 돈이 걸린(진행 중·입금 대기·완료) 결제 상태 */
+const LIVE_PAYMENT_STATES = `('IN_PROGRESS', 'UNKNOWN', 'WAITING_FOR_DEPOSIT', 'DONE', 'PARTIAL_CANCELED')`;
+/** 자동 구매확정까지 걸리는 날 (lib/order.ts AUTO_CONFIRM_DAYS와 같아야 함 — 테스트가 비교) */
+export const AUTO_CONFIRM_DAYS = 7;
 const syncReserved = (rec: "NEW" | "OLD") =>
   `UPDATE "InventoryBalance" SET "reserved" = ${RESERVED_SUM(rec)}, "updatedAt" = ${NOW} WHERE "skuId" = ${rec}."skuId" AND "locationId" = ${rec}."locationId";`;
 
@@ -647,8 +775,10 @@ SELECT CASE
     THEN RAISE(ABORT, 'InventoryReservation_reserve: 예약은 RESERVED 상태로만 만들 수 있습니다')
   WHEN NOT EXISTS (SELECT 1 FROM "InventoryLocation" loc WHERE loc."id" = NEW."locationId" AND loc."isOnlineSellable" = 1 AND loc."isActive" = 1)
     THEN RAISE(ABORT, 'InventoryReservation_reserve: 온라인 판매 위치가 아닙니다')
-  WHEN EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderId" = NEW."orderId" AND r."skuId" = NEW."skuId" AND r."status" = 'RESERVED')
+  WHEN EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderId" = NEW."orderId" AND r."skuId" = NEW."skuId" AND r."status" IN ('RESERVED', 'ALLOCATED'))
     THEN RAISE(ABORT, 'InventoryReservation_reserve: 같은 주문에 이 SKU의 예약이 이미 있습니다')
+  WHEN NOT EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."id" = NEW."orderItemId" AND i."orderId" = NEW."orderId" AND i."skuId" = NEW."skuId" AND i."quantity" = NEW."qty")
+    THEN RAISE(ABORT, 'InventoryReservation_item_match: 예약의 주문·SKU·수량이 주문 상품 줄과 다릅니다')
   WHEN COALESCE((SELECT b."onHand" - b."reserved" - b."safetyStock" FROM "InventoryBalance" b WHERE ${BAL("b", "NEW")}), 0) < NEW."qty"
     THEN RAISE(ABORT, 'InventoryReservation_insufficient: 판매 가능 재고가 부족합니다')
 END;
@@ -666,37 +796,47 @@ END;`,
   {
     table: "InventoryReservation",
     name: "InventoryReservation_transition",
-    why: "RESERVED에서만 상태 변경 가능 (확정된 예약을 되돌리기 금지), 만료 시각이 지난 예약은 확정 금지",
+    why: "정해진 길로만: RESERVED → ALLOCATED(완료된 결제가 있을 때, 만료 전) / RELEASED / EXPIRED, ALLOCATED → CONFIRMED(출고 상자가 출고됐을 때) / RELEASED(환불이 끝나 돈이 걸린 결제가 없을 때만). 할당은 만료되지 않음",
     sql: `CREATE TRIGGER "InventoryReservation_transition" BEFORE UPDATE OF "status" ON "InventoryReservation"
 WHEN NEW."status" IS NOT OLD."status"
 BEGIN
 SELECT CASE
-  WHEN OLD."status" <> 'RESERVED'
-    THEN RAISE(ABORT, 'InventoryReservation_transition: 이미 처리된 예약은 상태를 바꿀 수 없습니다')
-  WHEN NEW."status" = 'CONFIRMED' AND OLD."expiresAt" <= ${NOW}
-    THEN RAISE(ABORT, 'InventoryReservation_transition: 만료된 예약은 확정할 수 없습니다')
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN ('RESERVED>ALLOCATED', 'RESERVED>RELEASED', 'RESERVED>EXPIRED', 'ALLOCATED>CONFIRMED', 'ALLOCATED>RELEASED')
+    THEN RAISE(ABORT, 'InventoryReservation_transition: 허용되지 않은 예약 상태 변경입니다 (할당은 만료되지 않고, 확정·해제·만료된 예약은 되돌릴 수 없음)')
+  WHEN NEW."status" = 'ALLOCATED' AND OLD."expiresAt" <= ${NOW}
+    THEN RAISE(ABORT, 'InventoryReservation_transition: 만료된 예약은 할당할 수 없습니다')
+  WHEN NEW."status" = 'ALLOCATED' AND NOT EXISTS (SELECT 1 FROM "Payment" p JOIN "Order" o ON o."id" = p."orderId" WHERE p."orderId" = NEW."orderId" AND p."status" IN ('DONE', 'PARTIAL_CANCELED') AND p."amount" = o."totalPrice")
+    THEN RAISE(ABORT, 'InventoryReservation_allocate_guard: 완료된 결제가 없어 재고를 할당할 수 없습니다')
+  WHEN NEW."status" = 'CONFIRMED' AND NOT EXISTS (
+      SELECT 1 FROM "Shipment" s JOIN "ShipmentItem" si ON si."shipmentId" = s."id"
+      WHERE s."id" = NEW."shipmentId" AND s."type" = 'OUTBOUND' AND s."status" IN ('SHIPPED', 'DELIVERED') AND si."orderItemId" = NEW."orderItemId")
+    THEN RAISE(ABORT, 'InventoryReservation_confirm_guard: 출고된 상자에 담긴 상품만 재고를 확정(차감)할 수 있습니다')
+  WHEN OLD."status" = 'ALLOCATED' AND NEW."status" = 'RELEASED'
+      AND EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."orderId" AND p."status" IN ${LIVE_PAYMENT_STATES})
+    THEN RAISE(ABORT, 'InventoryReservation_release_guard: 환불이 끝나기 전에는 할당된 재고를 풀 수 없습니다')
 END;
 END;`,
   },
   {
     table: "InventoryReservation",
     name: "InventoryReservation_immutable",
-    why: "예약의 주문·SKU·위치·수량·만료 시각은 바꿀 수 없음 (바꾸려면 해제 후 새로 예약)",
-    sql: `CREATE TRIGGER "InventoryReservation_immutable" BEFORE UPDATE OF "orderId", "skuId", "locationId", "qty", "expiresAt", "createdAt" ON "InventoryReservation"
-WHEN NEW."orderId" IS NOT OLD."orderId" OR NEW."skuId" IS NOT OLD."skuId" OR NEW."locationId" IS NOT OLD."locationId"
+    why: "예약의 주문·상품 줄·SKU·위치·수량·만료 시각은 바꿀 수 없음 (바꾸려면 해제 후 새로 예약). 출고 상자는 한 번 정하면 고정",
+    sql: `CREATE TRIGGER "InventoryReservation_immutable" BEFORE UPDATE OF "orderId", "orderItemId", "skuId", "locationId", "qty", "expiresAt", "createdAt", "shipmentId" ON "InventoryReservation"
+WHEN NEW."orderId" IS NOT OLD."orderId" OR NEW."orderItemId" IS NOT OLD."orderItemId" OR NEW."skuId" IS NOT OLD."skuId" OR NEW."locationId" IS NOT OLD."locationId"
   OR NEW."qty" IS NOT OLD."qty" OR NEW."expiresAt" IS NOT OLD."expiresAt" OR NEW."createdAt" IS NOT OLD."createdAt"
+  OR (OLD."shipmentId" IS NOT NULL AND NEW."shipmentId" IS NOT OLD."shipmentId")
 BEGIN ${raise("InventoryReservation_immutable", "예약 내용은 바꿀 수 없습니다. 해제 후 새로 예약하세요")} END;`,
   },
   {
     table: "InventoryReservation",
     name: "InventoryReservation_sync_upd",
-    why: "상태가 바뀌면 예약 수량을 다시 맞추고, 확정(CONFIRMED)이면 판매 원장(SALE)을 자동 생성 → 실재고 감소",
+    why: "상태가 바뀌면 예약 수량을 다시 맞추고, 확정(CONFIRMED = 출고)이면 판매 원장(SALE)을 자동 생성 → 실재고 감소 (일어난 시각 = 출고 시각)",
     sql: `CREATE TRIGGER "InventoryReservation_sync_upd" AFTER UPDATE OF "status" ON "InventoryReservation"
 WHEN NEW."status" IS NOT OLD."status"
 BEGIN
   ${syncReserved("NEW")}
   INSERT INTO "InventoryLedger" ("skuId", "locationId", "type", "qty", "balanceAfter", "refType", "refId", "reservationId", "createdBy", "occurredAt", "createdAt")
-  SELECT NEW."skuId", NEW."locationId", 'SALE', -NEW."qty", b."onHand" - NEW."qty", 'ORDER', CAST(NEW."orderId" AS TEXT), NEW."id", 'SYSTEM', ${NOW}, ${NOW}
+  SELECT NEW."skuId", NEW."locationId", 'SALE', -NEW."qty", b."onHand" - NEW."qty", 'ORDER', CAST(NEW."orderId" AS TEXT), NEW."id", 'SYSTEM', NEW."confirmedAt", ${NOW}
   FROM "InventoryBalance" b
   WHERE NEW."status" = 'CONFIRMED' AND ${BAL("b", "NEW")};
 END;`,
@@ -711,11 +851,11 @@ BEGIN ${raise("InventoryReservation_no_delete", "예약 기록은 지울 수 없
   {
     table: "InventoryLocation",
     name: "InventoryLocation_deactivate_guard",
-    why: "결제 대기 예약이 남아 있는 위치를 판매 중지·비활성화하면 확정할 재고가 사라짐",
+    why: "결제 대기·출고 대기 예약이 남아 있는 위치를 판매 중지·비활성화하면 출고할 재고가 사라짐",
     sql: `CREATE TRIGGER "InventoryLocation_deactivate_guard" BEFORE UPDATE OF "isActive", "isOnlineSellable" ON "InventoryLocation"
 WHEN (NEW."isActive" = 0 OR NEW."isOnlineSellable" = 0)
-  AND EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."locationId" = NEW."id" AND r."status" = 'RESERVED')
-BEGIN ${raise("InventoryLocation_deactivate_guard", "결제 대기 예약이 있는 위치는 판매 중지할 수 없습니다")} END;`,
+  AND EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."locationId" = NEW."id" AND r."status" IN ('RESERVED', 'ALLOCATED'))
+BEGIN ${raise("InventoryLocation_deactivate_guard", "결제 대기·출고 대기 예약이 있는 위치는 판매 중지할 수 없습니다")} END;`,
   },
 ];
 
@@ -1004,26 +1144,41 @@ const PAYMENT_TRIGGERS: TriggerConstraint[] = [
   {
     table: "Order",
     name: "Order_insert_pending",
-    why: "주문은 결제 대기(PENDING)로만 생성. 결제 완료는 결제(Payment)를 거쳐야 함",
+    why: "주문은 결제 대기(PENDING)·미결제 요약(UNPAID)·확정 전으로만 생성. 결제 완료는 결제(Payment)를 거쳐야 함",
     sql: `CREATE TRIGGER "Order_insert_pending" BEFORE INSERT ON "Order"
-WHEN NEW."status" IS NOT 'PENDING'
+WHEN NEW."status" IS NOT 'PENDING' OR NEW."fulfillmentStatus" IS NOT 'UNPAID' OR NEW."confirmedAt" IS NOT NULL OR NEW."piiPurgedAt" IS NOT NULL
 BEGIN ${raise("Order_insert_pending", "주문은 PENDING 상태로만 만들 수 있습니다")} END;`,
   },
-  fixedColumns("Order", "Order_total_fixed", ["totalPrice", "paymentOrderId", "customerId"], "주문 금액·주문번호·고객은 바꿀 수 없습니다", "결제 금액 비교 기준과 토스 주문번호가 바뀌면 결제와 어긋남"),
+  fixedColumns(
+    "Order",
+    "Order_total_fixed",
+    ["totalPrice", "paymentOrderId", "customerId", "orderNo", "channel", "itemsListTotal", "itemsDiscountTotal", "itemsTotal", "couponDiscountTotal", "shippingBaseFee", "shippingExtraFee", "shippingFee", "shippingDiscount", "pointUsed", "shippingPolicyId", "freeShippingThreshold", "createdAt"],
+    "주문 금액·주문번호·고객·배송비 규칙은 바꿀 수 없습니다",
+    "결제 금액 비교 기준·토스 주문번호·금액 구성이 바뀌면 결제·환불 계산과 어긋남",
+  ),
   {
     table: "Order",
     name: "Order_status_transition",
-    why: "허용된 주문 상태 변경만 + 결제 상태와 맞아야 함 (결제 없이 결제 완료 금지, 돈이 걸린 결제가 있는데 취소 금지)",
+    why: "허용된 주문 상태 변경만 + 결제·재고·배송과 맞아야 함 (결제 없이 결제 완료 금지, 돈이 걸린 결제·남은 재고 예약이 있는데 취소 금지, 출고된 상품이 있으면 전체 취소 금지), 바꿀 때 변경 시각도 새로",
     sql: `CREATE TRIGGER "Order_status_transition" BEFORE UPDATE OF "status" ON "Order"
 WHEN NEW."status" IS NOT OLD."status"
 BEGIN
 SELECT CASE
   WHEN (OLD."status" || '>' || NEW."status") NOT IN (${inList(ORDER_STATUS_CHANGES)})
     THEN RAISE(ABORT, 'Order_status_transition: 허용되지 않은 주문 상태 변경입니다')
+  WHEN NEW."statusChangedAt" < OLD."statusChangedAt"
+    THEN RAISE(ABORT, 'Order_status_transition: 상태 변경 시각(statusChangedAt)이 이전 변경보다 앞설 수 없습니다')
   WHEN NEW."status" = 'PAID' AND NOT EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."id" AND p."status" IN ('DONE', 'PARTIAL_CANCELED') AND p."amount" = NEW."totalPrice")
     THEN RAISE(ABORT, 'Order_paid_guard: 주문 금액과 같은 완료된 결제가 없어 결제 완료로 바꿀 수 없습니다')
   WHEN NEW."status" = 'PAID' AND EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderId" = NEW."id" AND r."status" = 'RESERVED')
-    THEN RAISE(ABORT, 'Order_paid_guard: 재고 예약을 먼저 확정해야 결제 완료로 바꿀 수 있습니다')
+    THEN RAISE(ABORT, 'Order_paid_guard: 재고 예약을 먼저 할당해야 결제 완료로 바꿀 수 있습니다')
+  WHEN NEW."status" = 'PAID' AND EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = NEW."id" AND i."status" = 'AWAITING_PAYMENT'
+      AND NOT EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderItemId" = i."id" AND r."status" = 'ALLOCATED'))
+    THEN RAISE(ABORT, 'Order_paid_guard: 재고가 할당되지 않은 상품이 있어 결제 완료로 바꿀 수 없습니다')
+  WHEN NEW."status" IN ('CANCELED', 'EXPIRED') AND EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderId" = NEW."id" AND r."status" IN ('RESERVED', 'ALLOCATED'))
+    THEN RAISE(ABORT, 'Order_cancel_guard: 남은 재고 예약·할당을 먼저 풀어야 주문을 닫을 수 있습니다')
+  WHEN NEW."status" = 'CANCELED' AND EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = NEW."id" AND i."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED'))
+    THEN RAISE(ABORT, 'Order_shipped_guard: 출고된 상품이 있어 주문 전체를 취소할 수 없습니다 (반품으로 처리)')
   WHEN NEW."status" = 'WAITING_DEPOSIT' AND NOT EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."id" AND p."status" = 'WAITING_FOR_DEPOSIT')
     THEN RAISE(ABORT, 'Order_status_transition: 입금 대기 결제(가상계좌)가 없습니다')
   WHEN NEW."status" IN ('CANCELED', 'EXPIRED') AND EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."id" AND p."status" IN ${LIVE_PAYMENT})
@@ -1215,10 +1370,463 @@ BEGIN ${raise("PaymentApiLog_retention", "1년이 지나지 않은 API 기록은
   noDelete("CashReceipt", "현금영수증 기록은 삭제할 수 없습니다", "세무 기록 보관"),
 ];
 
+// ----- ⑦ 주문 도우미
+const ITEM_STATUS_CHANGES = [
+  "AWAITING_PAYMENT>PAID", "AWAITING_PAYMENT>CANCELED",
+  "PAID>PREPARING", "PAID>CANCELED",
+  "PREPARING>SHIPPED", "PREPARING>CANCELED",
+  "SHIPPED>DELIVERED", "SHIPPED>CONFIRMED",
+  "DELIVERED>CONFIRMED",
+];
+const SHIPMENT_STATUS_CHANGES = ["READY>SHIPPED", "READY>CANCELED", "SHIPPED>DELIVERED"];
+/** 개인정보 보관 기간 (전자상거래법: 계약·대금결제 기록 5년) */
+const PII_RETENTION_DAYS = 365 * 5;
+const orderStatusOf = (orderRef: string) => `(SELECT o."status" FROM "Order" o WHERE o."id" = ${orderRef})`;
+/** 주문의 상품 상태들 → 진행 요약 (취소된 상품은 빼고 판단) */
+export const FULFILLMENT_OF = (orderRef: string) => {
+  const has = (cond: string) => `EXISTS (SELECT 1 FROM "OrderItem" fi WHERE fi."orderId" = ${orderRef} AND ${cond})`;
+  return `(CASE
+    WHEN NOT ${has(`fi."status" <> 'CANCELED'`)} THEN 'CANCELED'
+    WHEN ${has(`fi."status" = 'AWAITING_PAYMENT'`)} THEN 'UNPAID'
+    WHEN NOT ${has(`fi."status" NOT IN ('CONFIRMED', 'CANCELED')`)} THEN 'CONFIRMED'
+    WHEN NOT ${has(`fi."status" NOT IN ('DELIVERED', 'CONFIRMED', 'CANCELED')`)} THEN 'DELIVERED'
+    WHEN NOT ${has(`fi."status" IN ('PAID', 'PREPARING')`)} THEN 'SHIPPED'
+    WHEN ${has(`fi."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED')`)} THEN 'PARTIALLY_SHIPPED'
+    WHEN ${has(`fi."status" = 'PREPARING'`)} THEN 'PREPARING'
+    ELSE 'PAID' END)`;
+};
+/** 주문 배송지 우편번호 → 그 주문의 배송비 규칙에서 찾은 추가 배송 지역 칸 (없으면 NULL) */
+const zoneOf = (zipRef: string, orderRef: string, col: "extraFee" | "region") =>
+  `(SELECT z."${col}" FROM "ShippingSurchargeZone" z WHERE z."policyId" = (SELECT o."shippingPolicyId" FROM "Order" o WHERE o."id" = ${orderRef}) AND ${zipRef} BETWEEN z."zipFrom" AND z."zipTo")`;
+const ADDRESS_CHANGED = ["recipientEnc", "phoneEnc", "phoneHash", "zipCode", "address1Enc", "address2Enc", "deliveryMemoEnc", "region"].map((c) => `NEW."${c}" IS NOT OLD."${c}"`).join(" OR ");
+const SHIPMENT_ITEM_IDS = `(SELECT si."orderItemId" FROM "ShipmentItem" si WHERE si."shipmentId" = NEW."id")`;
+const SHIPMENT_ACTOR = `(CASE WHEN NEW."createdBy" = 'SYSTEM' THEN 'SYSTEM' ELSE 'ADMIN' END)`;
+const policyOverlap = (excludeSelf: boolean) => `EXISTS (SELECT 1 FROM "ShippingPolicy" sp WHERE ${excludeSelf ? `sp."id" <> NEW."id" AND ` : ""}NEW."validFrom" < COALESCE(sp."validTo", ${FOREVER}) AND sp."validFrom" < COALESCE(NEW."validTo", ${FOREVER}))`;
+const zoneOverlap = (excludeSelf: boolean) => `EXISTS (SELECT 1 FROM "ShippingSurchargeZone" sz WHERE sz."policyId" = NEW."policyId"${excludeSelf ? ` AND sz."id" <> NEW."id"` : ""} AND NEW."zipFrom" <= sz."zipTo" AND sz."zipFrom" <= NEW."zipTo")`;
+const policyUsed = (policyRef: string) => `EXISTS (SELECT 1 FROM "Order" o WHERE o."shippingPolicyId" = ${policyRef})`;
+const historyInsert = (table: "OrderStatusHistory" | "OrderItemStatusHistory", fk: "orderId" | "orderItemId", from: string) =>
+  `INSERT INTO "${table}" ("${fk}", "fromStatus", "toStatus", "changedBy", "memo", "changedAt") VALUES (NEW."id", ${from}, NEW."status", NEW."statusChangedBy", NEW."statusMemo", NEW."statusChangedAt");`;
+
+const ORDER_TRIGGERS: TriggerConstraint[] = [
+  // --- 주문: 배송비 규칙, 진행 요약, 상태 연쇄, 이력, 주문자 정보 파기
+  {
+    table: "Order",
+    name: "Order_shipping_rule",
+    why: "주문 시각에 적용 중인 배송비 규칙만, 기본 배송비·무료 기준은 규칙과 같아야 함 (무료 기준 이상이면 기본 배송비 0)",
+    sql: `CREATE TRIGGER "Order_shipping_rule" BEFORE INSERT ON "Order"
+BEGIN
+SELECT CASE
+  WHEN NOT EXISTS (SELECT 1 FROM "ShippingPolicy" sp WHERE sp."id" = NEW."shippingPolicyId" AND sp."validFrom" <= NEW."createdAt" AND NEW."createdAt" < COALESCE(sp."validTo", ${FOREVER}))
+    THEN RAISE(ABORT, 'Order_shipping_rule: 주문 시각에 적용 중인 배송비 규칙이 아닙니다')
+  WHEN NEW."freeShippingThreshold" IS NOT (SELECT sp."freeShippingThreshold" FROM "ShippingPolicy" sp WHERE sp."id" = NEW."shippingPolicyId")
+    THEN RAISE(ABORT, 'Order_shipping_rule: 무료배송 기준이 배송비 규칙과 다릅니다')
+  WHEN NEW."shippingBaseFee" IS NOT (SELECT CASE WHEN sp."freeShippingThreshold" IS NOT NULL AND NEW."itemsTotal" >= sp."freeShippingThreshold" THEN 0 ELSE sp."baseFee" END FROM "ShippingPolicy" sp WHERE sp."id" = NEW."shippingPolicyId")
+    THEN RAISE(ABORT, 'Order_shipping_rule: 기본 배송비가 배송비 규칙과 다릅니다')
+END;
+END;`,
+  },
+  {
+    table: "Order",
+    name: "Order_fulfillment_guard",
+    why: "진행 요약은 상품 상태들로 계산한 값만 (앱이 임의로 바꾸지 못함 — 상품 상태가 바뀌면 트리거가 맞춤)",
+    sql: `CREATE TRIGGER "Order_fulfillment_guard" BEFORE UPDATE OF "fulfillmentStatus" ON "Order"
+WHEN NEW."fulfillmentStatus" IS NOT ${FULFILLMENT_OF(`NEW."id"`)}
+BEGIN ${raise("Order_fulfillment_guard", "진행 요약(fulfillmentStatus)은 상품 상태로만 바뀝니다")} END;`,
+  },
+  {
+    table: "Order",
+    name: "Order_status_cascade",
+    why: "주문이 결제 완료되면 상품도 결제 완료, 주문이 취소·만료되면 출고 전 상품은 취소 (주문과 상품 상태가 어긋나지 않게)",
+    sql: `CREATE TRIGGER "Order_status_cascade" AFTER UPDATE OF "status" ON "Order"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  UPDATE "OrderItem" SET "status" = 'PAID', "paidAt" = NEW."paidAt", "statusChangedAt" = NEW."statusChangedAt", "statusChangedBy" = NEW."statusChangedBy", "statusMemo" = NULL
+  WHERE NEW."status" = 'PAID' AND "orderId" = NEW."id" AND "status" = 'AWAITING_PAYMENT';
+  UPDATE "OrderItem" SET "status" = 'CANCELED', "canceledAt" = NEW."canceledAt", "statusChangedAt" = NEW."statusChangedAt", "statusChangedBy" = NEW."statusChangedBy", "statusMemo" = NEW."statusMemo"
+  WHERE NEW."status" IN ('CANCELED', 'EXPIRED') AND "orderId" = NEW."id" AND "status" IN ('AWAITING_PAYMENT', 'PAID', 'PREPARING');
+END;`,
+  },
+  {
+    table: "Order",
+    name: "Order_status_history_ins",
+    why: "주문 생성을 상태 이력 첫 줄로 자동 기록",
+    sql: `CREATE TRIGGER "Order_status_history_ins" AFTER INSERT ON "Order"
+BEGIN
+  ${historyInsert("OrderStatusHistory", "orderId", "NULL")}
+END;`,
+  },
+  {
+    table: "Order",
+    name: "Order_status_history_upd",
+    why: "주문 상태가 바뀌면 이력 자동 기록 (누가·언제·왜)",
+    sql: `CREATE TRIGGER "Order_status_history_upd" AFTER UPDATE OF "status" ON "Order"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  ${historyInsert("OrderStatusHistory", "orderId", `OLD."status"`)}
+END;`,
+  },
+  {
+    table: "Order",
+    name: "Order_orderer_fixed",
+    why: "주문자 정보는 바꿀 수 없고, 5년 보관 뒤 파기(비우기)만 가능. 파기는 되돌릴 수 없음",
+    sql: `CREATE TRIGGER "Order_orderer_fixed" BEFORE UPDATE OF ${[...ORDERER_COLS, "piiPurgedAt"].map(q).join(", ")} ON "Order"
+WHEN (OLD."piiPurgedAt" IS NOT NULL AND NEW."piiPurgedAt" IS NOT OLD."piiPurgedAt")
+  OR ${ORDERER_COLS.map((c) => `(NEW."${c}" IS NOT OLD."${c}" AND NEW."${c}" IS NOT NULL)`).join(" OR ")}
+  OR (NEW."piiPurgedAt" IS NOT NULL AND julianday(NEW."piiPurgedAt") - julianday(OLD."createdAt") < ${PII_RETENTION_DAYS})
+BEGIN ${raise("Order_orderer_fixed", "주문자 정보는 바꿀 수 없고, 주문 5년 뒤 파기만 할 수 있습니다")} END;`,
+  },
+
+  // --- 주문 상품: 생성 규칙, 스냅샷 고정, 상태 길, 이력, 진행 요약
+  {
+    table: "OrderItem",
+    name: "OrderItem_insert_guard",
+    why: "결제 대기 주문에만 추가, 결제 대기 상태로, 순번은 1부터 차례로",
+    sql: `CREATE TRIGGER "OrderItem_insert_guard" BEFORE INSERT ON "OrderItem"
+BEGIN
+SELECT CASE
+  WHEN ${orderStatusOf(`NEW."orderId"`)} IS NOT 'PENDING'
+    THEN RAISE(ABORT, 'OrderItem_insert_guard: 결제 대기 주문에만 상품을 추가할 수 있습니다')
+  WHEN NEW."status" <> 'AWAITING_PAYMENT'
+    THEN RAISE(ABORT, 'OrderItem_insert_guard: 주문 상품은 결제 대기 상태로만 만들 수 있습니다')
+  WHEN NEW."lineNo" IS NOT (SELECT COALESCE(MAX(i."lineNo"), 0) + 1 FROM "OrderItem" i WHERE i."orderId" = NEW."orderId")
+    THEN RAISE(ABORT, 'OrderItem_insert_guard: 순번은 1부터 차례로 붙입니다')
+END;
+END;`,
+  },
+  fixedColumns(
+    "OrderItem",
+    "OrderItem_immutable",
+    ["orderId", "lineNo", "skuId", "quantity", "listPrice", "discountAmount", "price", "promotionName", "lineListTotal", "lineDiscountTotal", "lineTotal", "couponAllocated", "pointAllocated", "payAmount", "styleCode", "skuCode", "styleName", "colorName", "sizeName", "imageUrl", "createdAt"],
+    "주문 상품의 수량·가격·금액 배분·스냅샷은 바꿀 수 없습니다",
+    "주문 당시 기록·환불 기준이 바뀌면 안 됨",
+  ),
+  {
+    table: "OrderItem",
+    name: "OrderItem_status_transition",
+    why: "정해진 길로만 (건너뛰기·되돌리기 금지). 준비중은 결제 완료 주문 + 재고 할당 + 진행 중인 결제 취소 없음, 배송중·배송완료는 출고 상자로만, 취소는 주문 취소로만",
+    sql: `CREATE TRIGGER "OrderItem_status_transition" BEFORE UPDATE OF "status" ON "OrderItem"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN (${inList(ITEM_STATUS_CHANGES)})
+    THEN RAISE(ABORT, 'OrderItem_status_transition: 허용되지 않은 상품 상태 변경입니다')
+  WHEN NEW."statusChangedAt" < OLD."statusChangedAt"
+    THEN RAISE(ABORT, 'OrderItem_status_transition: 상태 변경 시각이 이전 변경보다 앞설 수 없습니다')
+  WHEN NEW."status" IN ('PAID', 'PREPARING', 'CONFIRMED') AND ${orderStatusOf(`NEW."orderId"`)} IS NOT 'PAID'
+    THEN RAISE(ABORT, 'OrderItem_order_paid: 결제 완료된 주문의 상품만 처리할 수 있습니다')
+  WHEN NEW."status" = 'PREPARING' AND EXISTS (SELECT 1 FROM "PaymentCancel" c JOIN "Payment" p ON p."id" = c."paymentId" WHERE p."orderId" = NEW."orderId" AND c."status" IN ('REQUESTED', 'UNKNOWN'))
+    THEN RAISE(ABORT, 'OrderItem_prepare_guard: 결제 취소가 처리 중인 주문은 상품 준비를 시작할 수 없습니다')
+  WHEN NEW."status" = 'PREPARING' AND NOT EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderItemId" = NEW."id" AND r."status" = 'ALLOCATED')
+    THEN RAISE(ABORT, 'OrderItem_prepare_guard: 재고가 할당되지 않은 상품은 준비할 수 없습니다')
+  WHEN NEW."status" = 'SHIPPED' AND NOT EXISTS (SELECT 1 FROM "ShipmentItem" si JOIN "Shipment" s ON s."id" = si."shipmentId" WHERE si."orderItemId" = NEW."id" AND s."type" = 'OUTBOUND' AND s."status" IN ('SHIPPED', 'DELIVERED'))
+    THEN RAISE(ABORT, 'OrderItem_shipment_only: 배송중은 출고 상자를 출고 처리해서만 바뀝니다')
+  WHEN NEW."status" = 'DELIVERED' AND NOT EXISTS (SELECT 1 FROM "ShipmentItem" si JOIN "Shipment" s ON s."id" = si."shipmentId" WHERE si."orderItemId" = NEW."id" AND s."type" = 'OUTBOUND' AND s."status" = 'DELIVERED')
+    THEN RAISE(ABORT, 'OrderItem_shipment_only: 배송 완료는 출고 상자를 배송 완료 처리해서만 바뀝니다')
+  WHEN NEW."status" = 'CANCELED' AND ${orderStatusOf(`NEW."orderId"`)} NOT IN ('CANCELED', 'EXPIRED')
+    THEN RAISE(ABORT, 'OrderItem_cancel_guard: 상품 단위 취소는 ⑩ 클레임에서 합니다 (지금은 주문 전체 취소로만)')
+END;
+END;`,
+  },
+  {
+    table: "OrderItem",
+    name: "OrderItem_status_history_ins",
+    why: "주문 상품 생성을 상태 이력 첫 줄로 자동 기록",
+    sql: `CREATE TRIGGER "OrderItem_status_history_ins" AFTER INSERT ON "OrderItem"
+BEGIN
+  ${historyInsert("OrderItemStatusHistory", "orderItemId", "NULL")}
+END;`,
+  },
+  {
+    table: "OrderItem",
+    name: "OrderItem_status_history_upd",
+    why: "상품 상태가 바뀌면 이력 자동 기록",
+    sql: `CREATE TRIGGER "OrderItem_status_history_upd" AFTER UPDATE OF "status" ON "OrderItem"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  ${historyInsert("OrderItemStatusHistory", "orderItemId", `OLD."status"`)}
+END;`,
+  },
+  {
+    table: "OrderItem",
+    name: "OrderItem_fulfillment",
+    why: "상품 상태가 바뀌면 주문의 진행 요약·전체 구매확정 시각을 다시 계산",
+    sql: `CREATE TRIGGER "OrderItem_fulfillment" AFTER UPDATE OF "status" ON "OrderItem"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  UPDATE "Order" SET
+    "fulfillmentStatus" = ${FULFILLMENT_OF(`NEW."orderId"`)},
+    "confirmedAt" = CASE WHEN ${FULFILLMENT_OF(`NEW."orderId"`)} = 'CONFIRMED' THEN COALESCE("confirmedAt", NEW."confirmedAt") ELSE NULL END,
+    "updatedAt" = ${NOW}
+  WHERE "id" = NEW."orderId";
+END;`,
+  },
+  noDelete("OrderItem", "주문 상품은 삭제할 수 없습니다", "주문 기록 보관"),
+  ...appendOnly("OrderStatusHistory"),
+  ...appendOnly("OrderItemStatusHistory"),
+
+  // --- 결제와의 연결: 결제 시작 전 마지막 검사, 출고 후 취소 막기
+  {
+    table: "Payment",
+    name: "Payment_order_ready",
+    why: "결제를 시작하려면 배송지가 있어야 하고, 상품별 금액 합계가 주문 금액 구성과 맞아야 함 (돈이 오가기 전 마지막 검사)",
+    sql: `CREATE TRIGGER "Payment_order_ready" BEFORE INSERT ON "Payment"
+WHEN NEW."status" = 'IN_PROGRESS'
+BEGIN
+SELECT CASE
+  WHEN NOT EXISTS (SELECT 1 FROM "OrderShippingAddress" a WHERE a."orderId" = NEW."orderId" AND a."piiPurgedAt" IS NULL)
+    THEN RAISE(ABORT, 'Payment_order_ready: 배송지가 없는 주문은 결제할 수 없습니다')
+  WHEN EXISTS (SELECT 1 FROM "Order" o WHERE o."id" = NEW."orderId" AND (
+      o."itemsListTotal" IS NOT (SELECT SUM(i."lineListTotal") FROM "OrderItem" i WHERE i."orderId" = o."id")
+      OR o."itemsDiscountTotal" IS NOT (SELECT SUM(i."lineDiscountTotal") FROM "OrderItem" i WHERE i."orderId" = o."id")
+      OR o."itemsTotal" IS NOT (SELECT SUM(i."lineTotal") FROM "OrderItem" i WHERE i."orderId" = o."id")
+      OR o."couponDiscountTotal" IS NOT (SELECT SUM(i."couponAllocated") FROM "OrderItem" i WHERE i."orderId" = o."id")
+      OR o."pointUsed" IS NOT (SELECT SUM(i."pointAllocated") FROM "OrderItem" i WHERE i."orderId" = o."id")))
+    THEN RAISE(ABORT, 'Payment_order_ready: 상품별 금액 합계가 주문 금액과 다릅니다')
+END;
+END;`,
+  },
+  {
+    table: "PaymentCancel",
+    name: "PaymentCancel_fulfillment_guard",
+    why: "고객은 상품 준비가 시작되면 직접 취소 불가, 출고된 상품이 있으면 전액 취소 불가(반품으로). 토스에서 이미 일어난 취소를 반영(PG_SYNC)하는 것은 사실 기록이라 막지 않음",
+    sql: `CREATE TRIGGER "PaymentCancel_fulfillment_guard" BEFORE INSERT ON "PaymentCancel"
+WHEN NEW."reasonCode" <> 'PG_SYNC'
+BEGIN
+SELECT CASE
+  WHEN NEW."requestedBy" = 'CUSTOMER' AND EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = (SELECT p."orderId" FROM "Payment" p WHERE p."id" = NEW."paymentId") AND i."status" IN ('PREPARING', 'SHIPPED', 'DELIVERED', 'CONFIRMED'))
+    THEN RAISE(ABORT, 'PaymentCancel_customer_preparing: 상품 준비가 시작되어 직접 취소할 수 없습니다')
+  WHEN EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = (SELECT p."orderId" FROM "Payment" p WHERE p."id" = NEW."paymentId") AND i."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED'))
+      AND NEW."cancelAmount" >= (SELECT p."balanceAmount" FROM "Payment" p WHERE p."id" = NEW."paymentId")
+    THEN RAISE(ABORT, 'PaymentCancel_shipped: 출고된 상품이 있어 전액 취소할 수 없습니다 (반품으로 처리)')
+END;
+END;`,
+  },
+
+  // --- 주문 배송지: 결제 전 1개, 준비 전까지만 변경(배송비 같은 지역으로), 변경 이력, 5년 뒤 파기
+  {
+    table: "OrderShippingAddress",
+    name: "OrderShippingAddress_insert_guard",
+    why: "결제 대기 주문에만, 처음 버전으로, 배송 지역·추가 배송비가 우편번호와 맞아야 함",
+    sql: `CREATE TRIGGER "OrderShippingAddress_insert_guard" BEFORE INSERT ON "OrderShippingAddress"
+BEGIN
+SELECT CASE
+  WHEN ${orderStatusOf(`NEW."orderId"`)} IS NOT 'PENDING'
+    THEN RAISE(ABORT, 'OrderShippingAddress_insert_guard: 결제 대기 주문에만 배송지를 저장할 수 있습니다')
+  WHEN NEW."version" <> 1 OR NEW."changedBy" IS NOT NULL OR NEW."piiPurgedAt" IS NOT NULL
+    THEN RAISE(ABORT, 'OrderShippingAddress_insert_guard: 처음 저장은 1버전으로 합니다')
+  WHEN NEW."region" IS NOT COALESCE(${zoneOf(`NEW."zipCode"`, `NEW."orderId"`, "region")}, 'NORMAL')
+    THEN RAISE(ABORT, 'OrderShippingAddress_region: 배송 지역이 우편번호와 맞지 않습니다')
+  WHEN (SELECT o."shippingExtraFee" FROM "Order" o WHERE o."id" = NEW."orderId") IS NOT COALESCE(${zoneOf(`NEW."zipCode"`, `NEW."orderId"`, "extraFee")}, 0)
+    THEN RAISE(ABORT, 'OrderShippingAddress_fee: 주문의 추가 배송비가 배송지 지역과 맞지 않습니다')
+END;
+END;`,
+  },
+  {
+    table: "OrderShippingAddress",
+    name: "OrderShippingAddress_update_guard",
+    why: "주소를 바꾸면 버전 +1, 모든 상품이 준비 전이고 주문이 살아 있을 때만, 추가 배송비가 달라지는 지역으로는 불가. 파기는 5년 뒤에만, 되돌릴 수 없음",
+    sql: `CREATE TRIGGER "OrderShippingAddress_update_guard" BEFORE UPDATE ON "OrderShippingAddress"
+BEGIN
+SELECT CASE
+  WHEN NEW."orderId" IS NOT OLD."orderId" OR NEW."createdAt" IS NOT OLD."createdAt"
+    THEN RAISE(ABORT, 'OrderShippingAddress_fixed: 주문 배송지의 주문은 바꿀 수 없습니다')
+  WHEN OLD."piiPurgedAt" IS NOT NULL AND (NEW."piiPurgedAt" IS NOT OLD."piiPurgedAt" OR NEW."version" IS NOT OLD."version" OR ${ADDRESS_CHANGED})
+    THEN RAISE(ABORT, 'OrderShippingAddress_purged: 파기한 배송지는 바꿀 수 없습니다')
+  WHEN OLD."piiPurgedAt" IS NULL AND NEW."piiPurgedAt" IS NOT NULL
+      AND (NEW."zipCode" IS NOT OLD."zipCode" OR NEW."region" IS NOT OLD."region" OR NEW."version" IS NOT OLD."version" OR julianday(NEW."piiPurgedAt") - julianday(OLD."createdAt") < ${PII_RETENTION_DAYS})
+    THEN RAISE(ABORT, 'OrderShippingAddress_purge: 배송지 개인정보는 주문 5년 뒤에 비우기만 할 수 있습니다')
+  WHEN NEW."piiPurgedAt" IS NULL AND NEW."version" IS OLD."version" AND (${ADDRESS_CHANGED} OR (NEW."sourceAddressId" IS NOT OLD."sourceAddressId" AND NEW."sourceAddressId" IS NOT NULL))
+    THEN RAISE(ABORT, 'OrderShippingAddress_version: 배송지를 바꾸면 version을 1 올려야 합니다 (이력 기록용)')
+  WHEN NEW."piiPurgedAt" IS NULL AND NEW."version" IS NOT OLD."version" AND NEW."version" IS NOT OLD."version" + 1
+    THEN RAISE(ABORT, 'OrderShippingAddress_version: version은 1씩 올립니다')
+  WHEN NEW."piiPurgedAt" IS NULL AND NEW."version" IS NOT OLD."version" AND ${orderStatusOf(`NEW."orderId"`)} NOT IN ('PENDING', 'WAITING_DEPOSIT', 'PAID')
+    THEN RAISE(ABORT, 'OrderShippingAddress_locked: 취소·만료된 주문의 배송지는 바꿀 수 없습니다')
+  WHEN NEW."piiPurgedAt" IS NULL AND NEW."version" IS NOT OLD."version" AND EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = NEW."orderId" AND i."status" IN ('PREPARING', 'SHIPPED', 'DELIVERED', 'CONFIRMED'))
+    THEN RAISE(ABORT, 'OrderShippingAddress_locked: 상품 준비가 시작되어 배송지를 바꿀 수 없습니다')
+  WHEN NEW."piiPurgedAt" IS NULL AND NEW."version" IS NOT OLD."version" AND COALESCE(${zoneOf(`NEW."zipCode"`, `NEW."orderId"`, "extraFee")}, 0) IS NOT (SELECT o."shippingExtraFee" FROM "Order" o WHERE o."id" = NEW."orderId")
+    THEN RAISE(ABORT, 'OrderShippingAddress_fee_changed: 배송비가 달라지는 지역(제주·도서산간)으로는 바꿀 수 없습니다')
+  WHEN NEW."piiPurgedAt" IS NULL AND NEW."region" IS NOT COALESCE(${zoneOf(`NEW."zipCode"`, `NEW."orderId"`, "region")}, 'NORMAL')
+    THEN RAISE(ABORT, 'OrderShippingAddress_region: 배송 지역이 우편번호와 맞지 않습니다')
+END;
+END;`,
+  },
+  {
+    table: "OrderShippingAddress",
+    name: "OrderShippingAddress_history",
+    why: "배송지를 바꾸면 바뀌기 전 주소를 이력에 자동 저장",
+    sql: `CREATE TRIGGER "OrderShippingAddress_history" AFTER UPDATE OF "version" ON "OrderShippingAddress"
+WHEN NEW."version" IS NOT OLD."version"
+BEGIN
+  INSERT INTO "OrderShippingAddressHistory" ("orderShippingAddressId", "version", "recipientEnc", "phoneEnc", "zipCode", "address1Enc", "address2Enc", "deliveryMemoEnc", "region", "changedBy", "changeReason", "changedAt")
+  VALUES (OLD."id", OLD."version", OLD."recipientEnc", OLD."phoneEnc", OLD."zipCode", OLD."address1Enc", OLD."address2Enc", OLD."deliveryMemoEnc", OLD."region", NEW."changedBy", NEW."changeReason", NEW."updatedAt");
+END;`,
+  },
+  noDelete("OrderShippingAddress", "주문 배송지는 삭제할 수 없습니다 (파기는 암호문 비우기)", "주문 기록 보관"),
+  {
+    table: "OrderShippingAddressHistory",
+    name: "OrderShippingAddressHistory_wipe_only",
+    why: "배송지 이력은 수정 금지. 5년 뒤 개인정보 파기(암호문 비우기)만 가능",
+    sql: `CREATE TRIGGER "OrderShippingAddressHistory_wipe_only" BEFORE UPDATE ON "OrderShippingAddressHistory"
+WHEN NEW."orderShippingAddressId" IS NOT OLD."orderShippingAddressId" OR NEW."version" IS NOT OLD."version" OR NEW."zipCode" IS NOT OLD."zipCode"
+  OR NEW."region" IS NOT OLD."region" OR NEW."changedBy" IS NOT OLD."changedBy" OR NEW."changeReason" IS NOT OLD."changeReason" OR NEW."changedAt" IS NOT OLD."changedAt"
+  OR ${ADDRESS_ENC_COLS.map((c) => `(NEW."${c}" IS NOT OLD."${c}" AND NEW."${c}" IS NOT NULL)`).join(" OR ")}
+BEGIN ${raise("OrderShippingAddressHistory_wipe_only", "배송지 이력은 바꿀 수 없습니다 (개인정보 비우기만 가능)")} END;`,
+  },
+  noDelete("OrderShippingAddressHistory", "배송지 이력은 삭제할 수 없습니다", "변경 기록 보관"),
+
+  // --- 배송비 규칙: 기간 겹침 금지, 주문에 쓰인 규칙은 금액 고정
+  {
+    table: "ShippingPolicy",
+    name: "ShippingPolicy_no_overlap_ins",
+    why: "배송비 규칙 기간이 겹치면 어느 규칙을 쓸지 모호함",
+    sql: `CREATE TRIGGER "ShippingPolicy_no_overlap_ins" BEFORE INSERT ON "ShippingPolicy"
+WHEN ${policyOverlap(false)}
+BEGIN ${raise("ShippingPolicy_no_overlap", "적용 기간이 겹치는 배송비 규칙이 있습니다")} END;`,
+  },
+  {
+    table: "ShippingPolicy",
+    name: "ShippingPolicy_no_overlap_upd",
+    why: "배송비 규칙 기간이 겹치면 어느 규칙을 쓸지 모호함",
+    sql: `CREATE TRIGGER "ShippingPolicy_no_overlap_upd" BEFORE UPDATE OF "validFrom", "validTo" ON "ShippingPolicy"
+WHEN ${policyOverlap(true)}
+BEGIN ${raise("ShippingPolicy_no_overlap", "적용 기간이 겹치는 배송비 규칙이 있습니다")} END;`,
+  },
+  {
+    table: "ShippingPolicy",
+    name: "ShippingPolicy_used_fixed",
+    why: "주문에 쓰인 규칙의 금액·시작일은 바꿀 수 없고, 종료일을 당겨 이미 받은 주문을 기간 밖으로 밀어낼 수 없음 (새 규칙은 새 행으로)",
+    sql: `CREATE TRIGGER "ShippingPolicy_used_fixed" BEFORE UPDATE ON "ShippingPolicy"
+WHEN ${policyUsed(`OLD."id"`)} AND (NEW."code" IS NOT OLD."code" OR NEW."baseFee" IS NOT OLD."baseFee" OR NEW."freeShippingThreshold" IS NOT OLD."freeShippingThreshold" OR NEW."validFrom" IS NOT OLD."validFrom"
+  OR (NEW."validTo" IS NOT NULL AND EXISTS (SELECT 1 FROM "Order" o WHERE o."shippingPolicyId" = OLD."id" AND o."createdAt" >= NEW."validTo")))
+BEGIN ${raise("ShippingPolicy_used_fixed", "주문에 쓰인 배송비 규칙은 바꿀 수 없습니다. 종료일을 정하고 새 규칙을 추가하세요")} END;`,
+  },
+  {
+    table: "ShippingSurchargeZone",
+    name: "ShippingSurchargeZone_no_overlap_ins",
+    why: "같은 규칙 안에서 우편번호 범위가 겹치면 추가 배송비가 모호함",
+    sql: `CREATE TRIGGER "ShippingSurchargeZone_no_overlap_ins" BEFORE INSERT ON "ShippingSurchargeZone"
+WHEN ${zoneOverlap(false)} OR ${policyUsed(`NEW."policyId"`)}
+BEGIN ${raise("ShippingSurchargeZone_guard", "우편번호 범위가 겹치거나, 이미 주문에 쓰인 규칙입니다")} END;`,
+  },
+  {
+    table: "ShippingSurchargeZone",
+    name: "ShippingSurchargeZone_used_fixed",
+    why: "주문에 쓰인 규칙의 추가 배송 지역은 수정 금지, 범위 겹침 금지",
+    sql: `CREATE TRIGGER "ShippingSurchargeZone_used_fixed" BEFORE UPDATE ON "ShippingSurchargeZone"
+WHEN ${policyUsed(`OLD."policyId"`)} OR ${policyUsed(`NEW."policyId"`)} OR ${zoneOverlap(true)}
+BEGIN ${raise("ShippingSurchargeZone_guard", "우편번호 범위가 겹치거나, 이미 주문에 쓰인 규칙입니다")} END;`,
+  },
+  {
+    table: "ShippingSurchargeZone",
+    name: "ShippingSurchargeZone_no_delete",
+    why: "주문에 쓰인 규칙의 추가 배송 지역은 삭제 금지",
+    sql: `CREATE TRIGGER "ShippingSurchargeZone_no_delete" BEFORE DELETE ON "ShippingSurchargeZone"
+WHEN ${policyUsed(`OLD."policyId"`)}
+BEGIN ${raise("ShippingSurchargeZone_guard", "이미 주문에 쓰인 규칙의 추가 배송 지역은 지울 수 없습니다")} END;`,
+  },
+
+  // --- 출고: 결제 완료·준비중 상품만, 송장 형식, 상태 길, 상품·재고로 연쇄
+  {
+    table: "Shipment",
+    name: "Shipment_insert_guard",
+    why: "주문 출고만(반품·교환은 ⑩), 송장 등록 상태로, 결제 완료 주문에, 사용 중인 택배사의 송장 자릿수로",
+    sql: `CREATE TRIGGER "Shipment_insert_guard" BEFORE INSERT ON "Shipment"
+BEGIN
+SELECT CASE
+  WHEN NEW."type" <> 'OUTBOUND'
+    THEN RAISE(ABORT, 'Shipment_insert_guard: 지금은 주문 출고(OUTBOUND)만 만들 수 있습니다 (반품·교환은 ⑩ 클레임)')
+  WHEN NEW."status" <> 'READY'
+    THEN RAISE(ABORT, 'Shipment_insert_guard: 출고는 송장 등록(READY) 상태로 만듭니다')
+  WHEN ${orderStatusOf(`NEW."orderId"`)} IS NOT 'PAID'
+    THEN RAISE(ABORT, 'Shipment_insert_guard: 결제 완료된 주문만 출고할 수 있습니다')
+  WHEN NOT EXISTS (SELECT 1 FROM "Courier" c WHERE c."id" = NEW."courierId" AND c."isActive" = 1 AND length(NEW."trackingNo") BETWEEN c."trackingNoMinLength" AND c."trackingNoMaxLength")
+    THEN RAISE(ABORT, 'Shipment_tracking_format: 사용 중인 택배사가 아니거나 송장번호 자릿수가 맞지 않습니다')
+END;
+END;`,
+  },
+  {
+    table: "Shipment",
+    name: "Shipment_fixed",
+    why: "출고 상자의 주문·종류·창고는 바꿀 수 없고, 출고 뒤에는 택배사·송장도 고정",
+    sql: `CREATE TRIGGER "Shipment_fixed" BEFORE UPDATE ON "Shipment"
+WHEN NEW."orderId" IS NOT OLD."orderId" OR NEW."type" IS NOT OLD."type" OR NEW."locationId" IS NOT OLD."locationId" OR NEW."createdAt" IS NOT OLD."createdAt" OR NEW."createdBy" IS NOT OLD."createdBy"
+  OR (OLD."status" <> 'READY' AND (NEW."courierId" IS NOT OLD."courierId" OR NEW."trackingNo" IS NOT OLD."trackingNo"))
+BEGIN ${raise("Shipment_fixed", "출고 상자의 주문·창고는 바꿀 수 없고, 출고 후에는 송장도 바꿀 수 없습니다")} END;`,
+  },
+  {
+    table: "Shipment",
+    name: "Shipment_transition",
+    why: "송장 등록 → 출고 → 배송 완료, 취소는 출고 전에만. 출고하려면 상자에 상품이 있고, 모두 준비중이며 재고가 할당돼 있어야 함",
+    sql: `CREATE TRIGGER "Shipment_transition" BEFORE UPDATE OF "status" ON "Shipment"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN (${inList(SHIPMENT_STATUS_CHANGES)})
+    THEN RAISE(ABORT, 'Shipment_transition: 허용되지 않은 출고 상태 변경입니다')
+  WHEN NEW."statusChangedAt" < OLD."statusChangedAt"
+    THEN RAISE(ABORT, 'Shipment_transition: 상태 변경 시각이 이전 변경보다 앞설 수 없습니다')
+  WHEN NEW."status" = 'SHIPPED' AND NOT EXISTS (SELECT 1 FROM "ShipmentItem" si WHERE si."shipmentId" = NEW."id")
+    THEN RAISE(ABORT, 'Shipment_transition: 빈 상자는 출고할 수 없습니다')
+  WHEN NEW."status" = 'SHIPPED' AND ${orderStatusOf(`NEW."orderId"`)} IS NOT 'PAID'
+    THEN RAISE(ABORT, 'Shipment_transition: 결제 완료 상태가 아닌 주문(취소 등)은 출고할 수 없습니다')
+  WHEN NEW."status" = 'SHIPPED' AND EXISTS (SELECT 1 FROM "ShipmentItem" si JOIN "OrderItem" i ON i."id" = si."orderItemId" WHERE si."shipmentId" = NEW."id"
+      AND (i."status" <> 'PREPARING' OR NOT EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderItemId" = i."id" AND r."status" = 'ALLOCATED')))
+    THEN RAISE(ABORT, 'Shipment_transition: 상자 안 상품이 모두 상품 준비중이고 재고가 할당돼 있어야 출고할 수 있습니다')
+END;
+END;`,
+  },
+  {
+    table: "Shipment",
+    name: "Shipment_cascade",
+    why: "상자를 출고하면 안의 상품 = 배송중 + 재고 확정(판매 원장 → 실재고 감소), 배송 완료하면 상품 = 배송 완료 + 자동 구매확정 예정일",
+    sql: `CREATE TRIGGER "Shipment_cascade" AFTER UPDATE OF "status" ON "Shipment"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  UPDATE "OrderItem" SET "status" = 'SHIPPED', "shippedAt" = NEW."shippedAt", "statusChangedAt" = NEW."statusChangedAt", "statusChangedBy" = ${SHIPMENT_ACTOR}, "statusMemo" = NULL
+  WHERE NEW."status" = 'SHIPPED' AND "id" IN ${SHIPMENT_ITEM_IDS} AND "status" = 'PREPARING';
+  UPDATE "InventoryReservation" SET "status" = 'CONFIRMED', "confirmedAt" = NEW."shippedAt", "shipmentId" = NEW."id"
+  WHERE NEW."status" = 'SHIPPED' AND "orderItemId" IN ${SHIPMENT_ITEM_IDS} AND "status" = 'ALLOCATED';
+  UPDATE "OrderItem" SET "status" = 'DELIVERED', "deliveredAt" = NEW."deliveredAt", "autoConfirmAt" = strftime('%Y-%m-%dT%H:%M:%f+00:00', NEW."deliveredAt", '+${AUTO_CONFIRM_DAYS} days'),
+    "statusChangedAt" = NEW."statusChangedAt", "statusChangedBy" = ${SHIPMENT_ACTOR}, "statusMemo" = NULL
+  WHERE NEW."status" = 'DELIVERED' AND "id" IN ${SHIPMENT_ITEM_IDS} AND "status" = 'SHIPPED';
+END;`,
+  },
+  noDelete("Shipment", "출고 기록은 삭제할 수 없습니다 (송장 취소는 CANCELED)", "출고 기록 보관"),
+  {
+    table: "ShipmentItem",
+    name: "ShipmentItem_insert_guard",
+    why: "송장 등록 상태의 상자에만, 같은 주문의 준비중 상품을 수량 그대로, 한 상품 줄은 살아 있는 출고 상자 하나에만",
+    sql: `CREATE TRIGGER "ShipmentItem_insert_guard" BEFORE INSERT ON "ShipmentItem"
+BEGIN
+SELECT CASE
+  WHEN (SELECT s."status" FROM "Shipment" s WHERE s."id" = NEW."shipmentId") IS NOT 'READY'
+    THEN RAISE(ABORT, 'ShipmentItem_insert_guard: 송장 등록 상태의 상자에만 담을 수 있습니다')
+  WHEN NOT EXISTS (SELECT 1 FROM "OrderItem" i JOIN "Shipment" s ON s."orderId" = i."orderId" WHERE i."id" = NEW."orderItemId" AND s."id" = NEW."shipmentId")
+    THEN RAISE(ABORT, 'ShipmentItem_insert_guard: 다른 주문의 상품은 담을 수 없습니다')
+  WHEN (SELECT i."status" FROM "OrderItem" i WHERE i."id" = NEW."orderItemId") IS NOT 'PREPARING'
+    THEN RAISE(ABORT, 'ShipmentItem_insert_guard: 상품 준비중인 상품만 담을 수 있습니다')
+  WHEN NEW."qty" IS NOT (SELECT i."quantity" FROM "OrderItem" i WHERE i."id" = NEW."orderItemId")
+    THEN RAISE(ABORT, 'ShipmentItem_insert_guard: 상품 줄 수량 전체를 한 상자에 담습니다')
+  WHEN EXISTS (SELECT 1 FROM "ShipmentItem" x JOIN "Shipment" s ON s."id" = x."shipmentId" WHERE x."orderItemId" = NEW."orderItemId" AND s."type" = 'OUTBOUND' AND s."status" <> 'CANCELED')
+    THEN RAISE(ABORT, 'ShipmentItem_one_box: 이 상품은 이미 다른 출고 상자에 담겨 있습니다')
+END;
+END;`,
+  },
+  {
+    table: "ShipmentItem",
+    name: "ShipmentItem_no_update",
+    why: "상자에 담은 내용은 수정 금지 (잘못 담았으면 송장 취소 후 새 상자)",
+    sql: `CREATE TRIGGER "ShipmentItem_no_update" BEFORE UPDATE ON "ShipmentItem"
+BEGIN ${raise("ShipmentItem_no_update", "상자에 담은 상품은 바꿀 수 없습니다. 송장을 취소하고 새로 등록하세요")} END;`,
+  },
+  noDelete("ShipmentItem", "출고 상자 내용은 삭제할 수 없습니다", "출고 기록 보관"),
+];
+
 export const TRIGGERS: TriggerConstraint[] = [
   ...INVENTORY_TRIGGERS,
   ...CUSTOMER_TRIGGERS,
   ...PAYMENT_TRIGGERS,
+  ...ORDER_TRIGGERS,
   // ----- 판매 시작 검사 (⭐1)
   {
     table: "Style",

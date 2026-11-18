@@ -16,7 +16,9 @@
     "test": "tsx --test \"tests/**/*.test.ts\"",
     "inventory:release-expired": "tsx scripts/release-expired.ts",
     "customer:jobs": "tsx scripts/customer-jobs.ts",
-    "payments:jobs": "tsx scripts/payment-jobs.ts"
+    "payments:jobs": "tsx scripts/payment-jobs.ts",
+    "orders:ship": "tsx scripts/orders-ship.ts",
+    "orders:jobs": "tsx scripts/order-jobs.ts"
   },
   "dependencies": {
     "@auth/prisma-adapter": "^2.11.3",

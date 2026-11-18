@@ -6,20 +6,19 @@
 import { getCurrentCustomer } from "@/lib/current-customer";
 import type { CartItem } from "@/context/CartContext";
 import { abandonOrder, placeOrder, type PlaceOrderResult } from "@/lib/checkout";
-import { prisma } from "@/lib/prisma";
+import { headers } from "next/headers";
 
-// 주문 생성 + 재고 예약
-export async function createOrder(items: CartItem[]): Promise<PlaceOrderResult> {
+// 주문 생성 + 배송지 스냅샷 + 재고 예약
+// addressId: 주문서에서 고른 배송지 (내 주소록인지는 placeOrder가 확인. 없으면 기본 배송지)
+export async function createOrder(items: CartItem[], addressId?: number): Promise<PlaceOrderResult> {
   const customer = await getCurrentCustomer();
   if (!customer) {
     return { error: "로그인이 필요해요." };
   }
-  // 배송지 없이는 주문 불가 (화면에서 버튼을 막아도, 서버에서 한 번 더 확인)
-  const hasAddress = await prisma.customerAddress.count({ where: { customerId: customer.id, isDefault: true } });
-  if (!hasAddress) {
-    return { error: "배송지를 먼저 등록해 주세요. (내 정보 > 배송지)" };
-  }
-  return placeOrder(customer.id, items);
+  // 모바일 웹인지 (주문 경로 통계용. 정확할 필요는 없음)
+  const ua = (await headers()).get("user-agent") ?? "";
+  const channel = /Mobi|Android|iPhone|iPad/i.test(ua) ? "MOBILE_WEB" : "WEB";
+  return placeOrder(customer.id, items, new Date(), { addressId: typeof addressId === "number" ? addressId : undefined, channel });
 }
 
 // 결제를 진행하지 않기로 한 주문의 재고 예약을 바로 풀고 주문을 취소합니다. (안 풀면 20분 동안 재고가 묶임)

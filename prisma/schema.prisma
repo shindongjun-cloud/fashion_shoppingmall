@@ -706,12 +706,17 @@ enum LedgerRefType {
   MIGRATION // 시스템 이전 (Sku.stock → 원장)
 }
 
-// 예약 상태: RESERVED에서 한 번만 바뀝니다.
+// 예약 상태 (⑦ 주문: 재고는 "출고할 때" 줄어듭니다)
+//   RESERVED ─결제─▶ ALLOCATED ─출고─▶ CONFIRMED (원장 SALE → 실재고 감소)
+//      │               └─출고 전 취소(환불 완료 후)─▶ RELEASED (원장 기록 없음: 물건이 창고를 떠난 적 없음)
+//      └─결제 안 함─▶ RELEASED / EXPIRED
+// RESERVED·ALLOCATED는 판매 가능 수량에서 빠져 있음 (InventoryBalance.reserved = 둘의 합)
 enum ReservationStatus {
-  RESERVED // 결제 대기 중 (판매 가능 수량에서 빠져 있음)
-  CONFIRMED // 결제 승인 → 판매 확정 (원장 SALE 생성)
-  RELEASED // 해제 (결제 실패·이탈·새 주문으로 대체 등)
-  EXPIRED // 만료 (유효 시간 초과)
+  RESERVED // 결제 대기 중 (20분 등 기한이 있음)
+  ALLOCATED // 결제 완료, 출고 대기 (기한 없음: 만료되지 않음)
+  CONFIRMED // 출고 확정 → 원장 SALE 생성 (실재고 감소)
+  RELEASED // 해제 (결제 실패·이탈·새 주문으로 대체·출고 전 취소 등)
+  EXPIRED // 만료 (RESERVED만 만료됨)
 }
 
 // 예약 해제 사유
@@ -743,6 +748,7 @@ model InventoryLocation {
   balances     InventoryBalance[]
   ledgers      InventoryLedger[]
   reservations InventoryReservation[]
+  shipments    Shipment[] // 이 위치(창고)에서 나간 출고
 }
 
 // 위치별 재고 잔고 ("지금 몇 개")
@@ -751,7 +757,7 @@ model InventoryBalance {
   skuId         Int
   locationId    Int
   onHand        Int       @default(0) // 실재고: 창고에 실제로 있는 수량 (= 원장 합계)
-  reserved      Int       @default(0) // 예약: 결제 대기 중인 수량 (= RESERVED 예약 합계)
+  reserved      Int       @default(0) // 예약: 결제 대기 + 결제됐지만 출고 전인 수량 (= RESERVED·ALLOCATED 예약 합계)
   safetyStock   Int       @default(0) // 안전재고: 오차 대비로 팔지 않고 남겨 두는 수량
   lastCountedAt DateTime? // 마지막 실사 일시
   createdAt     DateTime  @default(now())
@@ -791,27 +797,35 @@ model InventoryLedger {
   @@index([reservationId])
 }
 
-// 재고 예약: 주문을 만들 때 잡고, 결제되면 확정, 아니면 해제·만료
+// 재고 예약: 주문을 만들 때 잡고 → 결제되면 할당 → 출고되면 확정 / 아니면 해제·만료
+// ⑦ 주문: 주문 상품 줄(OrderItem)과 1:1로 연결 (반품·부분 취소 때 "어느 상품의 재고인지" 알 수 있게)
 model InventoryReservation {
   id            Int               @id @default(autoincrement())
   orderId       Int
+  orderItemId   Int // ★ 주문 상품 줄 (orderId·skuId·qty가 그 줄과 같아야 함 — 트리거)
   skuId         Int
   locationId    Int
   qty           Int
   status        ReservationStatus @default(RESERVED)
-  expiresAt     DateTime // 이 시각까지 결제하지 않으면 만료
-  confirmedAt   DateTime?
+  expiresAt     DateTime // 이 시각까지 결제하지 않으면 만료 (RESERVED일 때만 의미 있음)
+  allocatedAt   DateTime? // ★ 결제 완료로 할당된 시각
+  confirmedAt   DateTime? // 출고로 확정된 시각 (= 출고 시각)
+  shipmentId    Int? // ★ 어느 출고 상자로 나갔는지 (CONFIRMED면 필수)
   releasedAt    DateTime? // 해제·만료된 시각
   releaseReason ReleaseReason? // 해제 사유 (만료는 상태로 구분하므로 비워 둠)
   createdAt     DateTime          @default(now())
 
-  order    Order             @relation(fields: [orderId], references: [id], onDelete: Restrict)
-  sku      Sku               @relation(fields: [skuId], references: [id], onDelete: Restrict)
-  location InventoryLocation @relation(fields: [locationId], references: [id], onDelete: Restrict)
-  ledgers  InventoryLedger[]
+  order     Order             @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  orderItem OrderItem         @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  sku       Sku               @relation(fields: [skuId], references: [id], onDelete: Restrict)
+  location  InventoryLocation @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  shipment  Shipment?         @relation(fields: [shipmentId], references: [id], onDelete: Restrict)
+  ledgers   InventoryLedger[]
 
   @@index([skuId, locationId, status]) // 예약 합계 계산
   @@index([orderId])
+  @@index([orderItemId])
+  @@index([shipmentId])
   @@index([status, expiresAt]) // 만료 대상 찾기
 }
 
@@ -972,21 +986,22 @@ model CustomerBodyProfile {
 
 // 배송지 (N개, 암호화). 주문에는 배송지 "스냅샷"을 복사하므로 주소록은 지워도 됨 (⑦ 주문 단계)
 model CustomerAddress {
-  id           Int       @id @default(autoincrement())
-  customerId   Int
-  label        String // 집 / 회사
-  recipientEnc String // 수령인 암호문
-  phoneEnc     String // 수령인 연락처 암호문
-  zipCode      String // 우편번호 5자리 (평문: 단독으로는 개인 식별 불가, 배송비 산정에 사용)
-  address1Enc  String // 기본 주소 암호문
-  address2Enc  String? // 상세 주소 암호문
-  deliveryMemo String? // 배송 요청 사항
-  isDefault    Boolean   @default(false) // 기본 배송지 (고객당 최대 1개, 트리거)
-  lastUsedAt   DateTime?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  id              Int       @id @default(autoincrement())
+  customerId      Int
+  label           String // 집 / 회사
+  recipientEnc    String // 수령인 암호문
+  phoneEnc        String // 수령인 연락처 암호문
+  zipCode         String // 우편번호 5자리 (평문: 단독으로는 개인 식별 불가, 배송비 산정에 사용)
+  address1Enc     String // 기본 주소 암호문
+  address2Enc     String? // 상세 주소 암호문
+  deliveryMemoEnc String? // ★ 배송 요청 사항 암호문 (⑦: "공동현관 비밀번호 1234#"처럼 민감한 내용이 자주 들어가서 평문 → 암호화)
+  isDefault       Boolean   @default(false) // 기본 배송지 (고객당 최대 1개, 트리거)
+  lastUsedAt      DateTime? // 마지막으로 주문에 쓴 시각 (주문서에서 최근 사용 순 정렬)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
-  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  customer       Customer               @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  orderAddresses OrderShippingAddress[] // 이 주소록에서 복사된 주문 배송지 (주소록을 지우면 연결만 비움)
 
   @@index([customerId])
 }
@@ -1081,36 +1096,334 @@ model CustomerLoginHistory {
   @@index([loggedInAt]) // 3개월 지난 기록 정리
 }
 
-// 주문 (5단계 결제에서 사용)
-// 주문 상태 (결제 기준. 배송·클레임 상태는 ⑦ 주문 / ⑨ 배송 / ⑩ 클레임 단계에서 확장)
+// ===============================================================
+// 주문 도메인 (⑦ B안: 주문 + 상품별 상태 + 출고 분리)
+//
+//   Customer 1 ──< Order ─── 1 OrderShippingAddress ──< OrderShippingAddressHistory
+//                   │  │            (배송지 스냅샷·암호화)         (변경 전 주소)
+//                   │  ├──< OrderStatusHistory          주문(돈) 상태 이력 — 트리거 기록
+//                   │  ├──< Payment …                   결제 도메인 (기존)
+//                   │  ├──> ShippingPolicy ──< ShippingSurchargeZone   배송비 규칙·제주/도서산간
+//                   │  └──< Shipment ──< ShipmentItem >── OrderItem    출고 상자·송장
+//                   │          ├──> Courier            택배사
+//                   │          └──> InventoryLocation  출고 창고 (기존)
+//                   └──< OrderItem ──< OrderItemStatusHistory          상품(물건) 상태 이력
+//                          ├──> Sku / PricePromotion (기존)
+//                          └──< InventoryReservation (기존, 1:1로 연결)
+//
+// 상태 두 가지를 섞지 않습니다:
+//   Order.status      = 돈의 상태  (결제대기·입금대기·결제완료·취소·만료·취소실패) ← 결제 도메인이 바꿈
+//   OrderItem.status  = 물건의 상태 (결제대기 → 결제완료 → 상품준비중 → 배송중 → 배송완료 → 구매확정 / 취소)
+//   Order.fulfillmentStatus = 상품 상태들의 요약 (목록·검색용, 트리거가 계산)
+//
+// 금액: 결제액 = 상품 판매가 합계 − 쿠폰 + 배송비 − 배송비 할인 − 포인트  (CHECK)
+//       상품별 실결제액(payAmount)의 합 = 상품 판매가 합계 − 쿠폰 − 포인트 (결제 시작 때 트리거가 검사)
+// 재고: 결제 → 할당(ALLOCATED), 출고 → 확정(CONFIRMED, 실재고 감소), 출고 전 취소 → 해제
+// 보관: 주문·주문 상품은 삭제 불가. 주문자·배송지 개인정보는 5년 뒤 파기 (piiPurgedAt)
+// ===============================================================
+
+// 주문 상태 = 돈의 상태 (결제 도메인)
 enum OrderStatus {
   PENDING // 결제 대기 (주문서에서 결제하기를 눌렀고 아직 결제 전)
   WAITING_DEPOSIT // 입금 대기 (가상계좌 발급됨)
   PAID // 결제 완료
-  CANCELED // 취소 (결제 전 취소, 입금 전 취소, 결제 후 전액 취소, 보상 취소)
+  CANCELED // 취소 (결제 전 취소, 입금 전 취소, 출고 전 전액 취소, 보상 취소)
   EXPIRED // 입금 기한 만료
   CANCEL_FAILED // 결제 취소(환불) 실패 → 사람이 확인 필요
 }
 
-model Order {
-  id             Int         @id @default(autoincrement())
-  paymentOrderId String      @unique // 토스페이먼츠에 보내는 주문번호 (영문/숫자/-_= 6~64자)
-  orderName      String // 결제창에 보이는 이름. 예: "러닝 스니커즈 외 2건"
-  totalPrice     Int // 서버가 DB 가격으로 계산한 금액 (만든 뒤 바꿀 수 없음: 결제 금액과 비교 기준)
-  status         OrderStatus @default(PENDING)
-  paidAt         DateTime? // 결제 완료 시각 (가상계좌는 입금 시각)
-  canceledAt     DateTime? // 취소·만료 시각
-  createdAt      DateTime    @default(now())
-  customerId     Int // 주문한 고객 (로그인 계정 User가 아니라 Customer를 가리킴 → 탈퇴해도 주문 기록은 남음)
+// 주문 상품 상태 = 물건의 상태 (⑩ 클레임에서 반품·교환 상태 추가 예정)
+enum OrderItemStatus {
+  AWAITING_PAYMENT // 결제 대기 (입금 대기 포함)
+  PAID // 결제 완료 (출고 준비 전 — 고객이 바로 취소 가능)
+  PREPARING // 상품 준비중 (포장 중일 수 있어 고객 직접 취소 불가)
+  SHIPPED // 배송중 (출고됨 — 취소 불가, 반품으로)
+  DELIVERED // 배송 완료
+  CONFIRMED // 구매 확정 (끝. 이후 포인트 적립·리뷰 작성 기준)
+  CANCELED // 취소 (결제 전 이탈, 출고 전 취소)
+}
 
-  customer     Customer               @relation(fields: [customerId], references: [id], onDelete: Restrict)
-  items        OrderItem[]
-  reservations InventoryReservation[]
-  payments     Payment[]
-  apiLogs      PaymentApiLog[]
+// 주문 전체 진행 요약 (상품 상태들로 트리거가 계산. 취소된 상품은 빼고 판단)
+enum FulfillmentStatus {
+  UNPAID // 결제 전
+  PAID // 결제 완료, 준비 전
+  PREPARING // 상품 준비중 (하나라도)
+  PARTIALLY_SHIPPED // 일부만 출고
+  SHIPPED // 전부 출고 (배송중 포함)
+  DELIVERED // 전부 배송 완료
+  CONFIRMED // 전부 구매 확정
+  CANCELED // 전부 취소
+}
+
+// 상태를 바꾼 주체 (이력에 기록)
+enum OrderActor {
+  CUSTOMER
+  ADMIN
+  SYSTEM
+}
+
+enum OrderChannel {
+  WEB // PC 웹
+  MOBILE_WEB // 모바일 웹
+}
+
+enum ConfirmType {
+  MANUAL // 고객이 구매확정 버튼을 누름
+  AUTO // 배송 완료 7일 뒤 자동
+}
+
+// 배송 지역 (배송비 계산)
+enum ShippingRegion {
+  NORMAL // 일반
+  JEJU // 제주
+  REMOTE // 도서산간
+}
+
+// 출고 상자 종류 (⑩ 클레임 값은 미리 정의, 지금은 OUTBOUND만 허용 — 트리거)
+enum ShipmentType {
+  OUTBOUND // 주문 출고
+  RETURN_PICKUP // 반품 회수 (⑩)
+  EXCHANGE_OUTBOUND // 교환 재출고 (⑩)
+}
+
+enum ShipmentStatus {
+  READY // 송장 등록 (아직 택배사에 넘기기 전)
+  SHIPPED // 출고 (택배사 인계 → 배송중)
+  DELIVERED // 배송 완료
+  CANCELED // 송장 취소 (출고 전에만)
+}
+
+model Order {
+  id             Int          @id @default(autoincrement()) // 내부 번호 (화면·주소에 노출하지 않음)
+  orderNo        String       @unique // ★ 고객용 주문번호 "20261118-48213907" (한국 날짜 + 무작위 8자리: 하루 주문 수 노출 방지)
+  paymentOrderId String       @unique // 토스페이먼츠에 보내는 주문번호 (영문/숫자/-_= 6~64자)
+  orderName      String // 결제창에 보이는 이름. 예: "러닝 스니커즈 외 2건"
+  customerId     Int // 주문한 고객 (로그인 계정 User가 아니라 Customer → 탈퇴해도 주문 기록은 남음)
+  channel        OrderChannel @default(WEB) // ★ 주문 경로
+
+  // 상태 (돈). 바꿀 때 statusChangedAt·statusChangedBy를 함께 바꾸면 트리거가 이력을 남김
+  status            OrderStatus       @default(PENDING)
+  statusChangedAt   DateTime // ★
+  statusChangedBy   OrderActor        @default(SYSTEM) // ★
+  statusMemo        String? // ★ 상태 변경 사유 (취소 사유 등)
+  fulfillmentStatus FulfillmentStatus @default(UNPAID) // ★ 상품 상태 요약 (트리거만 바꿈)
+
+  // 금액 (원, 전부 만든 뒤 바꿀 수 없음)
+  itemsListTotal        Int // ★ 정가 합계
+  itemsDiscountTotal    Int // ★ 상품 할인 합계 (할인 행사)
+  itemsTotal            Int // ★ 판매가 합계 = 정가 합계 − 상품 할인
+  couponDiscountTotal   Int  @default(0) // ★ 쿠폰 할인 (⑬ 쿠폰)
+  shippingBaseFee       Int // ★ 기본 배송비 (무료배송이면 0)
+  shippingExtraFee      Int  @default(0) // ★ 제주·도서산간 추가 배송비 (무료배송이어도 붙음)
+  shippingFee           Int // ★ 배송비 합계 = 기본 + 추가
+  shippingDiscount      Int  @default(0) // ★ 배송비 할인 (⑬ 무료배송 쿠폰)
+  pointUsed             Int  @default(0) // ★ 포인트 사용 (⑭ 포인트)
+  totalPrice            Int // 최종 결제액 = 판매가 합계 − 쿠폰 + 배송비 − 배송비 할인 − 포인트 (= Payment.amount)
+  shippingPolicyId      Int // ★ 적용한 배송비 규칙
+  freeShippingThreshold Int? // ★ 주문 당시 무료배송 기준 (스냅샷, 쿠폰 적용 전 판매가 합계 기준. null = 무료배송 없음)
+
+  // 주문자 스냅샷 (암호문 "v1:…"). 탈퇴해 프로필이 지워져도 주문 기록에는 남음. 프로필에 없으면 비어 있음
+  ordererNameEnc   String? // ★
+  ordererPhoneEnc  String? // ★
+  ordererPhoneHash String? // ★ 고객센터 전화번호 조회용 (HMAC)
+  ordererEmailEnc  String? // ★
+
+  paidAt      DateTime? // 결제 완료 시각 (가상계좌는 입금 시각)
+  canceledAt  DateTime? // 취소·만료 시각
+  confirmedAt DateTime? // ★ 모든 상품 구매확정 시각
+  piiPurgedAt DateTime? // ★ 개인정보(주문자·배송지) 파기 시각 (주문 5년 뒤)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @default(now()) // 앱이 갱신 (트리거가 바꾸는 요약 칸도 있어 @updatedAt 대신 직접)
+
+  customer        Customer               @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  shippingPolicy  ShippingPolicy         @relation(fields: [shippingPolicyId], references: [id], onDelete: Restrict)
+  shippingAddress OrderShippingAddress?
+  items           OrderItem[]
+  reservations    InventoryReservation[]
+  payments        Payment[]
+  apiLogs         PaymentApiLog[]
+  shipments       Shipment[]
+  statusHistory   OrderStatusHistory[]
 
   @@index([customerId, createdAt])
   @@index([status, createdAt])
+  @@index([fulfillmentStatus, createdAt]) // 관리: "준비 전 주문" 목록
+  @@index([ordererPhoneHash])
+  @@index([createdAt]) // 5년 지난 개인정보 파기 대상
+}
+
+// 주문 당시 배송지 (주문당 1개, 암호화). 주소록(CustomerAddress)을 바꾸거나 지워도 이 값은 그대로
+// 변경: 모든 상품이 "상품 준비중"이 되기 전까지만, 배송비가 달라지는 지역으로는 불가 (트리거)
+model OrderShippingAddress {
+  id              Int            @id @default(autoincrement())
+  orderId         Int            @unique
+  sourceAddressId Int? // 복사해 온 주소록 (주소록을 지우면 비움)
+  recipientEnc    String? // 받는 분 (파기 후 null)
+  phoneEnc        String? // 연락처
+  phoneHash       String? // 연락처 조회용 HMAC
+  zipCode         String // 우편번호 5자리 (평문: 배송비 지역 판단·통계, 파기 후에도 남김)
+  address1Enc     String? // 기본 주소
+  address2Enc     String? // 상세 주소
+  deliveryMemoEnc String? // 배송 요청 사항 (공동현관 비밀번호 등 → 암호화)
+  region          ShippingRegion // 배송 지역 (zipCode로 계산, 변경해도 같아야 함)
+  version         Int            @default(1) // 바꿀 때마다 +1 (트리거가 이전 값을 이력에 저장)
+  changedBy       OrderActor? // 마지막으로 바꾼 주체 (처음 저장 시 null)
+  changeReason    String?
+  piiPurgedAt     DateTime? // 개인정보 파기 시각 (파기하면 암호문 칸이 전부 null)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  order         Order                         @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  sourceAddress CustomerAddress?              @relation(fields: [sourceAddressId], references: [id], onDelete: SetNull)
+  history       OrderShippingAddressHistory[]
+
+  @@index([sourceAddressId])
+  @@index([phoneHash])
+}
+
+// 배송지 변경 이력 (추가만 가능, 트리거가 기록). 변경 "전" 값을 저장
+model OrderShippingAddressHistory {
+  id                     Int            @id @default(autoincrement())
+  orderShippingAddressId Int
+  version                Int // 이 값이 쓰이던 버전
+  recipientEnc           String?
+  phoneEnc               String?
+  zipCode                String
+  address1Enc            String?
+  address2Enc            String?
+  deliveryMemoEnc        String?
+  region                 ShippingRegion
+  changedBy              OrderActor // 이 값을 다음 버전으로 바꾼 주체
+  changeReason           String?
+  changedAt              DateTime
+
+  address OrderShippingAddress @relation(fields: [orderShippingAddressId], references: [id], onDelete: Restrict)
+
+  @@unique([orderShippingAddressId, version])
+}
+
+// 주문(돈) 상태 이력 (추가만 가능, 트리거가 기록)
+model OrderStatusHistory {
+  id         Int          @id @default(autoincrement())
+  orderId    Int
+  fromStatus OrderStatus? // 처음 생성은 null
+  toStatus   OrderStatus
+  changedBy  OrderActor
+  memo       String?
+  changedAt  DateTime
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([orderId, id])
+}
+
+// 주문 상품(물건) 상태 이력 (추가만 가능, 트리거가 기록)
+model OrderItemStatusHistory {
+  id          Int              @id @default(autoincrement())
+  orderItemId Int
+  fromStatus  OrderItemStatus?
+  toStatus    OrderItemStatus
+  changedBy   OrderActor
+  memo        String?
+  changedAt   DateTime
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+
+  @@index([orderItemId, id])
+}
+
+// 배송비 규칙 (기간별 버전. 기간이 겹치면 안 됨 — 트리거). 주문에 쓰인 규칙은 금액을 바꿀 수 없음
+model ShippingPolicy {
+  id                    Int       @id @default(autoincrement())
+  code                  String    @unique // STD-2611 / LEGACY-FREE
+  name                  String // "기본 배송비 3,000원 / 5만원 이상 무료"
+  baseFee               Int // 기본 배송비
+  freeShippingThreshold Int? // 이 금액 이상이면 기본 배송비 무료 (쿠폰 적용 전 판매가 합계 기준, null = 없음)
+  validFrom             DateTime
+  validTo               DateTime? // null = 현재 적용 중
+  memo                  String?
+  createdAt             DateTime  @default(now())
+
+  zones  ShippingSurchargeZone[]
+  orders Order[]
+
+  @@index([validFrom])
+}
+
+// 제주·도서산간 추가 배송비 (우편번호 범위, 규칙마다. 같은 규칙 안에서 범위가 겹치면 안 됨 — 트리거)
+model ShippingSurchargeZone {
+  id        Int            @id @default(autoincrement())
+  policyId  Int
+  region    ShippingRegion // JEJU / REMOTE (NORMAL 불가)
+  name      String // "제주 전역", "울릉군"
+  zipFrom   String // 우편번호 시작 (5자리, 포함)
+  zipTo     String // 우편번호 끝 (5자리, 포함)
+  extraFee  Int // 추가 배송비
+  createdAt DateTime       @default(now())
+
+  policy ShippingPolicy @relation(fields: [policyId], references: [id], onDelete: Restrict)
+
+  @@index([policyId, zipFrom])
+}
+
+// 택배사
+model Courier {
+  id                  Int      @id @default(autoincrement())
+  code                String   @unique // CJ / LOTTE / HANJIN / EPOST / LOGEN
+  name                String // CJ대한통운
+  trackingUrlTemplate String // 배송조회 주소, 송장 자리는 {no}
+  trackingNoMinLength Int // 송장번호 자릿수 (숫자만)
+  trackingNoMaxLength Int
+  isActive            Boolean  @default(true)
+  sortOrder           Int      @unique
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  shipments Shipment[]
+}
+
+// 출고 상자 1개 = 송장 1개. 한 주문을 여러 상자로 나눠 보낼 수 있음 (부분 출고)
+// 상자 상태가 바뀌면 트리거가 안의 상품 상태와 재고 예약을 함께 바꿈 (SHIPPED → 상품 배송중 + 재고 확정)
+model Shipment {
+  id              Int            @id @default(autoincrement())
+  orderId         Int
+  type            ShipmentType   @default(OUTBOUND)
+  status          ShipmentStatus @default(READY)
+  locationId      Int // 출고 창고
+  courierId       Int
+  trackingNo      String // 송장번호 (숫자만, 택배사 자릿수 — 트리거)
+  statusChangedAt DateTime
+  shippedAt       DateTime? // 택배사 인계 시각
+  deliveredAt     DateTime? // 배송 완료 시각
+  canceledAt      DateTime?
+  createdBy       String // 처리자 (관리자 단계에서 FK, 지금은 "ADMIN:<이름>" / SYSTEM)
+  memo            String?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  order        Order                  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  location     InventoryLocation      @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  courier      Courier                @relation(fields: [courierId], references: [id], onDelete: Restrict)
+  items        ShipmentItem[]
+  reservations InventoryReservation[]
+
+  @@unique([courierId, trackingNo])
+  @@index([orderId])
+  @@index([status, shippedAt]) // 배송 완료 확인 대상
+}
+
+// 상자에 담긴 상품 (상품 줄 단위. 한 줄은 살아 있는 출고 상자 하나에만)
+model ShipmentItem {
+  id          Int @id @default(autoincrement())
+  shipmentId  Int
+  orderItemId Int
+  qty         Int // 지금은 상품 줄 수량 전체 (= OrderItem.quantity)
+
+  shipment  Shipment  @relation(fields: [shipmentId], references: [id], onDelete: Restrict)
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+
+  @@unique([shipmentId, orderItemId])
+  @@index([orderItemId])
 }
 
 // ===============================================================
@@ -1467,10 +1780,12 @@ model CashReceipt {
 // 주문 안의 상품 한 줄 (어떤 주문에, 어떤 SKU를, 몇 개)
 // 상품명·컬러·사이즈·가격은 "주문 당시 값"을 복사해 둡니다(스냅샷).
 // 나중에 상품 이름이나 가격이 바뀌어도 주문 내역은 그대로 남아야 하기 때문입니다.
+// ⑦ 주문: 상품 줄마다 상태(물건)와 금액 배분(환불 기준)을 가집니다. 만든 뒤 수량·가격·스냅샷은 바꿀 수 없음
 model OrderItem {
   id       Int @id @default(autoincrement())
   orderId  Int
-  skuId    Int // 실제로 주문한 단위 (컬러 + 사이즈)
+  lineNo   Int // ★ 주문 안 순번 1, 2, 3 … (고객센터: "주문번호 2번 상품")
+  skuId    Int // 실제로 주문한 단위 (컬러 + 사이즈). 한 주문에 같은 SKU는 한 줄만
   quantity Int
 
   // 가격 스냅샷 (1개 기준): 정가 − 할인 = 판매가
@@ -1480,6 +1795,14 @@ model OrderItem {
   promotionId    Int? // 적용된 할인 행사 (행사가 지워져도 주문은 남도록 SetNull)
   promotionName  String? // 스냅샷: 행사 이름이 나중에 바뀌어도 당시 이름 유지
 
+  // 금액 배분 (줄 합계, CHECK로 계산 일치) — 부분 취소·반품 환불의 기준
+  lineListTotal     Int // ★ 정가 × 수량
+  lineDiscountTotal Int // ★ 할인 × 수량
+  lineTotal         Int // ★ 판매가 × 수량
+  couponAllocated   Int @default(0) // ★ 이 줄이 나눠 가진 주문 쿠폰 할인 (⑬)
+  pointAllocated    Int @default(0) // ★ 이 줄이 나눠 가진 포인트 사용 (⑭)
+  payAmount         Int // ★ 이 줄의 실결제액 = lineTotal − 쿠폰 몫 − 포인트 몫 (배송비 제외)
+
   styleCode String // 스냅샷: JK26F001
   skuCode   String // 스냅샷: JK26F001-BK-100
   styleName String // 스냅샷: 울 블렌드 싱글 자켓
@@ -1487,12 +1810,32 @@ model OrderItem {
   sizeName  String // 스냅샷: 100
   imageUrl  String? // 스냅샷: 주문 당시 대표 이미지
 
-  order     Order           @relation(fields: [orderId], references: [id])
-  sku       Sku             @relation(fields: [skuId], references: [id])
-  promotion PricePromotion? @relation(fields: [promotionId], references: [id], onDelete: SetNull)
+  // 상태 (물건). 바꿀 때 statusChangedAt·statusChangedBy를 함께 바꾸면 트리거가 이력을 남김
+  status          OrderItemStatus @default(AWAITING_PAYMENT) // ★
+  statusChangedAt DateTime // ★
+  statusChangedBy OrderActor      @default(SYSTEM) // ★
+  statusMemo      String? // ★
+  paidAt          DateTime? // ★ 단계별 시각 (그 단계에 들어갔으면 필수 — CHECK)
+  preparingAt     DateTime? // ★
+  shippedAt       DateTime? // ★
+  deliveredAt     DateTime? // ★
+  confirmedAt     DateTime? // ★
+  canceledAt      DateTime? // ★
+  confirmType     ConfirmType? // ★ 구매확정 방식 (CONFIRMED일 때만)
+  autoConfirmAt   DateTime? // ★ 자동 구매확정 예정 시각 (배송 완료 + 7일. 정책이 바뀌어도 이미 정해진 날짜 유지)
+  createdAt       DateTime        @default(now())
 
-  @@index([orderId])
+  order         Order                    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  sku           Sku                      @relation(fields: [skuId], references: [id], onDelete: Restrict)
+  promotion     PricePromotion?          @relation(fields: [promotionId], references: [id], onDelete: SetNull)
+  reservations  InventoryReservation[] // 재고 예약 (갱신되면 여러 행, 살아 있는 것은 1개)
+  shipmentItems ShipmentItem[]
+  statusHistory OrderItemStatusHistory[]
+
+  @@unique([orderId, lineNo])
+  @@unique([orderId, skuId]) // ★ 같은 SKU 두 줄 금지 (예약과 1:1로 짝짓는 근거)
   @@index([skuId])
+  @@index([status, autoConfirmAt]) // 자동 구매확정 대상
 }
 
 // ---------------------------------------------------------------

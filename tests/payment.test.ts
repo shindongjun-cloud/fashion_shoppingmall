@@ -28,6 +28,7 @@ import {
   type PaymentDeps,
 } from "../src/lib/payment";
 import { createTossApi, getTossConfigProblem, maskForLog } from "../src/lib/toss";
+import { giveAddress } from "./helpers/orders";
 import { FakeToss } from "./helpers/fake-toss";
 import { toPaymentView } from "../src/lib/payment-view";
 
@@ -76,7 +77,9 @@ let dc = 0;
 
 async function newCustomer(name = "결제") {
   const user = await prisma.user.create({ data: { name } });
-  return (await ensureCustomerForUser(user.id)).id;
+  const id = (await ensureCustomerForUser(user.id)).id;
+  await giveAddress(id, { makeDefault: true }); // ⑦ 주문: 배송지가 있어야 주문 가능
+  return id;
 }
 async function available() {
   return (await getAvailability([skuId])).get(skuId) ?? 0;
@@ -122,7 +125,7 @@ after(async () => {
 
 // ---------------------------------------------------------------
 describe("카드·간편결제 승인", () => {
-  test("정상: 주문 결제 완료, 결제 DONE + 카드 상세(가린 번호), 재고 확정, API 기록(멱등키)", async () => {
+  test("정상: 주문 결제 완료, 결제 DONE + 카드 상세(가린 번호), 재고 할당, API 기록(멱등키)", async () => {
     const fake = new FakeToss();
     const { order, input } = await checkout(fake);
     const r = await confirmOrderPayment(input, makeDeps(fake));
@@ -138,7 +141,7 @@ describe("카드·간편결제 승인", () => {
     const card = await prisma.paymentCard.findUniqueOrThrow({ where: { paymentId: p.id } });
     assert.equal(card.numberMasked, "43301234****123*");
     assert.equal(card.cardType, "CREDIT");
-    assert.deepEqual((await reservationsOf(order.id)).map((x) => x.status), ["CONFIRMED"]);
+    assert.deepEqual((await reservationsOf(order.id)).map((x) => x.status), ["ALLOCATED"], "결제 = 재고 할당 (실재고는 출고 때 감소)");
     assert.deepEqual(await historyOf(p.id), ["IN_PROGRESS", "DONE"]);
     // API 기록: 승인 1건, 멱등키 헤더 = 저장된 키
     const logs = await prisma.paymentApiLog.findMany({ where: { paymentId: p.id } });
@@ -505,7 +508,7 @@ describe("가상계좌", () => {
     assert.equal(rs[1].expiresAt.getTime(), due.getTime() + VA_RESERVATION_GRACE_MS);
   });
 
-  test("입금 웹훅(DEPOSIT_CALLBACK, secret 일치) → 토스 조회로 확인 → 결제 완료 + 재고 확정", async () => {
+  test("입금 웹훅(DEPOSIT_CALLBACK, secret 일치) → 토스 조회로 확인 → 결제 완료 + 재고 할당", async () => {
     const fake = new FakeToss();
     const { order, input } = await checkout(fake, { method: "가상계좌" });
     await confirmOrderPayment(input, makeDeps(fake));
@@ -520,7 +523,7 @@ describe("가상계좌", () => {
     const [p] = await paymentsOf(order.id);
     assert.equal(p.status, "DONE");
     assert.ok((await prisma.paymentVirtualAccount.findUniqueOrThrow({ where: { paymentId: p.id } })).depositedAt);
-    assert.equal((await reservationsOf(order.id)).at(-1)!.status, "CONFIRMED");
+    assert.equal((await reservationsOf(order.id)).at(-1)!.status, "ALLOCATED");
   });
 
   test("secret이 틀린 입금 웹훅(위조) → 무시, 토스 조회도 하지 않음, 주문 그대로", async () => {
@@ -871,14 +874,19 @@ describe("결제·주문 DB 제약 (앱을 거치지 않은 직접 수정도 막
     rejects(insertPayment({ status: "ABORTED", extra: `"failedAt"=${NOW()}` }), "Payment_state_ck"));
   test("secret은 해시(64자 16진수)만", () => rejects(`UPDATE "Payment" SET "secretHash" = 'ps_plain_secret' WHERE "id" = ${paidPayment}`, "Payment_keys_ck"));
 
+  /** 결제 대기 주문을 복제하는 INSERT (필수 칸을 다 채워서, 시험하려는 규칙 하나만 어기게) */
+  const cloneOrder = (set: Record<string, string>) => {
+    const cols = ["orderNo", "paymentOrderId", "orderName", "customerId", "channel", "status", "statusChangedAt", "statusChangedBy", "fulfillmentStatus", "itemsListTotal", "itemsDiscountTotal", "itemsTotal", "couponDiscountTotal", "shippingBaseFee", "shippingExtraFee", "shippingFee", "shippingDiscount", "pointUsed", "totalPrice", "shippingPolicyId", "freeShippingThreshold", "paidAt", "createdAt", "updatedAt"];
+    return `INSERT INTO "Order" (${cols.map((c) => `"${c}"`).join(", ")}) SELECT ${cols.map((c) => set[c] ?? `"${c}"`).join(", ")} FROM "Order" WHERE "id" = ${pendingOrder}`;
+  };
   test("주문을 결제 완료로 생성 금지", () =>
-    rejects(`INSERT INTO "Order" ("paymentOrderId", "orderName", "totalPrice", "status", "paidAt", "createdAt", "customerId") VALUES ('order_direct_paid', 'x', 1000, 'PAID', ${NOW()}, ${NOW()}, (SELECT "customerId" FROM "Order" WHERE "id" = ${pendingOrder}))`, "Order_insert_pending"));
+    rejects(cloneOrder({ orderNo: "'20990101-00000001'", paymentOrderId: "'order_direct_paid'", status: "'PAID'", paidAt: NOW() }), "Order_insert_pending"));
   test("결제 없이 주문을 결제 완료로 변경 금지", () => rejects(`UPDATE "Order" SET "status" = 'PAID', "paidAt" = ${NOW()} WHERE "id" = ${pendingOrder}`, "Order_paid_guard"));
   test("결제된 주문을 결제 취소 없이 주문 취소 금지", () => rejects(`UPDATE "Order" SET "status" = 'CANCELED', "canceledAt" = ${NOW()} WHERE "id" = ${paidOrder}`, "Order_cancel_guard"));
   test("주문 금액 변경 금지", () => rejects(`UPDATE "Order" SET "totalPrice" = 1 WHERE "id" = ${pendingOrder}`, "Order_total_fixed"));
   test("주문 삭제 금지", () => rejects(`DELETE FROM "Order" WHERE "id" = ${pendingOrder}`, "Order_no_delete"));
   test("토스 주문번호 규칙 위반 금지 (특수문자)", () =>
-    rejects(`INSERT INTO "Order" ("paymentOrderId", "orderName", "totalPrice", "status", "createdAt", "customerId") VALUES ('order#bad!', 'x', 1000, 'PENDING', ${NOW()}, (SELECT "customerId" FROM "Order" WHERE "id" = ${pendingOrder}))`, "Order_payment_order_id_ck"));
+    rejects(cloneOrder({ orderNo: "'20990101-00000002'", paymentOrderId: "'order#bad!'" }), "Order_payment_order_id_ck"));
   test("결제 완료 주문에 재고 예약 추가 금지", () =>
     rejects(`INSERT INTO "InventoryReservation" ("orderId", "skuId", "locationId", "qty", "status", "expiresAt", "createdAt") VALUES (${paidOrder}, ${skuId}, ${dc}, 1, 'RESERVED', '2099-01-01T00:00:00.000+00:00', ${NOW()})`, "InventoryReservation_order_open"));
 

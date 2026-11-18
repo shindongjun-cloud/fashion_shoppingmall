@@ -3,13 +3,16 @@
 // 숫자(잔고)는 직접 고치지 않습니다. 이 파일은 "원장 행 추가"와 "예약 행 추가·상태 변경"만 하고,
 // 잔고(onHand·reserved)는 DB 트리거가 맞춥니다(prisma/db-constraints.ts).
 //
-//   판매 가능 수량 = 실재고 − 예약 − 안전재고   (온라인 판매 위치 합계)
+//   판매 가능 수량 = 실재고 − 예약(결제 대기 + 출고 대기) − 안전재고   (온라인 판매 위치 합계)
 //
-// 흐름:  주문 생성 → reserveOrder (RESERVED, 20분)
+// 흐름 (⑦ 주문: 실재고는 "출고할 때" 줄어듦):
+//        주문 생성 → reserveOrder (RESERVED, 20분)
 //        결제 승인 직전 → ensureOrderReserved (만료됐거나 곧 만료되면 다시 잡기)
-//        결제 승인 후 → confirmOrder (CONFIRMED → 트리거가 판매 원장 SALE 생성 → 실재고 감소)
+//        결제 승인 후 → allocateOrder (ALLOCATED: 만료 없음, 아직 실재고는 그대로)
+//        출고 → 출고 상자(Shipment)를 SHIPPED로 바꾸면 트리거가 CONFIRMED + 판매 원장 SALE → 실재고 감소 (lib/order.ts)
+//        출고 전 취소(환불 완료 후) → releaseAllocated (RELEASED: 원장 기록 없음 — 물건이 창고를 떠난 적 없음)
 //        결제 실패·이탈 → releaseOrder (RELEASED)
-//        시간 초과 → releaseExpired (EXPIRED)
+//        시간 초과 → releaseExpired (EXPIRED, 결제 대기 예약만)
 import type { LedgerRefType, LedgerType, Prisma, ReleaseReason } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
 
@@ -128,7 +131,8 @@ export async function releaseExpired(db: Db = prisma, now = new Date(), skuIds?:
 export async function reserveOrder(
   tx: Prisma.TransactionClient,
   orderId: number,
-  items: { skuId: number; qty: number }[],
+  /** 주문 상품 줄마다 (예약은 상품 줄과 1:1 — 반품·부분 취소 때 어느 상품의 재고인지 알기 위해) */
+  items: { orderItemId: number; skuId: number; qty: number }[],
   now = new Date(),
   /** 만료 시각 (기본: 지금 + 20분). 가상계좌는 입금 기한까지 잡아 둡니다 */
   expiresAt: Date = new Date(now.getTime() + RESERVATION_TTL_MINUTES * 60 * 1000),
@@ -148,7 +152,7 @@ export async function reserveOrder(
     if (!location) throw new InsufficientStockError(item.skuId, item.qty, totalAvailable);
     try {
       await tx.inventoryReservation.create({
-        data: { orderId, skuId: item.skuId, locationId: location.locationId, qty: item.qty, expiresAt, createdAt: now },
+        data: { orderId, orderItemId: item.orderItemId, skuId: item.skuId, locationId: location.locationId, qty: item.qty, expiresAt, createdAt: now },
       });
     } catch (e) {
       // 위에서 읽은 뒤 다른 주문이 먼저 잡은 경우: DB 트리거가 최종적으로 막아 줌
@@ -185,7 +189,7 @@ export async function ensureReservedTx(
   options: { minRemainingMs?: number; expiresAt?: Date } = {},
 ) {
   const minRemaining = options.minRemainingMs ?? 0;
-  const items = await tx.orderItem.findMany({ where: { orderId }, select: { skuId: true, quantity: true } });
+  const items = await tx.orderItem.findMany({ where: { orderId }, select: { id: true, skuId: true, quantity: true } });
   await releaseExpired(tx, now, items.map((i) => i.skuId));
   const active = await tx.inventoryReservation.findMany({ where: { orderId, status: "RESERVED" } });
 
@@ -202,7 +206,7 @@ export async function ensureReservedTx(
 
   // 하나라도 문제가 있으면 남은 예약을 모두 풀고 처음부터 다시 잡습니다 (부분 갱신보다 단순하고 안전)
   await releaseOrder(tx, orderId, "RENEWED", now);
-  await reserveOrder(tx, orderId, items.map((i) => ({ skuId: i.skuId, qty: i.quantity })), now, options.expiresAt);
+  await reserveOrder(tx, orderId, items.map((i) => ({ orderItemId: i.id, skuId: i.skuId, qty: i.quantity })), now, options.expiresAt);
 }
 
 export async function ensureOrderReserved(orderId: number, now = new Date()): Promise<{ ok: true } | { ok: false; message: string }> {
@@ -218,16 +222,31 @@ export async function ensureOrderReserved(orderId: number, now = new Date()): Pr
   }
 }
 
-/** 결제 승인 후: 주문의 예약을 모두 확정 (트리거가 판매 원장을 만들고 실재고를 줄임) */
-export async function confirmOrder(tx: Prisma.TransactionClient, orderId: number, now = new Date()) {
-  const items = await tx.orderItem.findMany({ where: { orderId }, select: { skuId: true, quantity: true } });
+/**
+ * 결제 승인 후: 주문의 예약을 모두 할당(ALLOCATED)으로. 만료되지 않고 판매 가능 수량에서 계속 빠지지만,
+ * 실재고는 출고할 때 줄어듭니다. (DB 트리거가 완료된 결제가 있는지 확인)
+ */
+export async function allocateOrder(tx: Prisma.TransactionClient, orderId: number, now = new Date()) {
+  const items = await tx.orderItem.count({ where: { orderId } });
   const result = await tx.inventoryReservation.updateMany({
     where: { orderId, status: "RESERVED" },
-    data: { status: "CONFIRMED", confirmedAt: now },
+    data: { status: "ALLOCATED", allocatedAt: now },
   });
-  if (result.count !== items.length) {
-    throw new Error(`예약 확정 개수(${result.count})가 주문 항목 수(${items.length})와 다릅니다`);
+  if (result.count !== items) {
+    throw new Error(`재고 할당 개수(${result.count})가 주문 상품 수(${items})와 다릅니다`);
   }
+}
+
+/**
+ * 출고 전 취소: 할당된 재고를 풂 (원장 기록 없음 — 물건이 창고를 떠난 적 없음).
+ * ⚠️ 환불이 끝난 뒤에만 가능 (돈이 걸린 결제가 남아 있으면 DB 트리거 InventoryReservation_release_guard가 막음)
+ */
+export async function releaseAllocated(db: Db, orderId: number, reason: ReleaseReason, now = new Date()) {
+  const result = await db.inventoryReservation.updateMany({
+    where: { orderId, status: "ALLOCATED" },
+    data: { status: "RELEASED", releasedAt: now, releaseReason: reason },
+  });
+  return result.count;
 }
 
 // ---------------------------------------------------------------

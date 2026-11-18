@@ -43,6 +43,8 @@ const CARD_COMPANIES: Record<string, string> = {
   "35": "전북", "42": "제주", "15": "카카오뱅크", "3A": "케이뱅크", "24": "토스뱅크", "21": "하나",
   "61": "현대", "11": "국민", "91": "NH농협", "34": "수협",
 };
+/** 환불 계좌 은행 선택지 (이름 순) */
+export const BANK_OPTIONS = Object.entries(BANKS).map(([code, name]) => ({ code, name })).sort((a, b) => a.name.localeCompare(b.name, "ko"));
 export const bankName = (code: string) => BANKS[code] ?? `은행 코드 ${code}`;
 export const cardCompanyName = (code: string) => (CARD_COMPANIES[code] ? `${CARD_COMPANIES[code]}카드` : `카드사 코드 ${code}`);
 
