@@ -15,6 +15,7 @@ import {
   normalizePhone,
 } from "@/lib/crypto";
 import { isConstraintError, releaseOrder, withBusyRetry } from "@/lib/inventory";
+import { issueSignupCoupons } from "@/lib/coupon";
 
 type Db = Prisma.TransactionClient | typeof prisma;
 
@@ -42,9 +43,10 @@ export async function ensureCustomerForUser(userId: string, now = new Date()) {
   if (existing) return existing;
 
   const welcome = await prisma.customerGrade.findFirstOrThrow({ where: { isActive: true }, orderBy: { minAmount: "asc" } });
+  let created = false;
   for (let attempt = 1; ; attempt++) {
     try {
-      return await withBusyRetry(() =>
+      const customer = await withBusyRetry(() =>
         prisma.$transaction(async (tx) => {
           // 같은 계정으로 동시에 두 번 로그인한 경우: 먼저 만든 쪽을 씀
           const again = await tx.customer.findUnique({ where: { userId } });
@@ -64,9 +66,13 @@ export async function ensureCustomerForUser(userId: string, now = new Date()) {
           await tx.customerGradeHistory.create({
             data: { customerId: customer.id, toGradeId: welcome.id, reason: "SIGNUP", changedBy: "SYSTEM", changedAt: now },
           });
+          created = true;
           return customer;
         }),
       );
+      // 가입 축하 쿠폰 (실패해도 가입은 계속: 쿠폰 쪽 문제로 로그인이 막히면 안 됨)
+      if (created) await issueSignupCoupons(customer.id, now).catch((e) => console.error("[쿠폰] 가입 쿠폰 발급 실패", e));
+      return customer;
     } catch (e) {
       // 고객번호가 우연히 겹치면 새 번호로 다시 (확률 매우 낮음)
       if (attempt < 5 && isConstraintError(e, "customerNo")) continue;

@@ -49,6 +49,11 @@ export default async function MyPage({ searchParams }: PageProps<"/my">) {
         <p className="mt-1 text-sm text-gray-500">
           고객번호 {customer.customerNo} · 가입 {formatDate(customer.joinedAt)} · 상태 {STATUS_LABEL[customer.status]}
         </p>
+        <p className="mt-2 flex gap-4 text-sm">
+          <Link href="/my/coupons" className="text-blue-700 underline">쿠폰함</Link>
+          <Link href="/my/notifications" className="text-blue-700 underline">알림함</Link>
+          <Link href="/orders" className="text-blue-700 underline">주문내역</Link>
+        </p>
         {typeof ok === "string" && <p className="mt-3 rounded bg-green-50 p-3 text-sm text-green-700">{ok}</p>}
         {typeof error === "string" && <p className="mt-3 rounded bg-red-50 p-3 text-sm text-red-700">{error}</p>}
         {customer.status === "WITHDRAW_PENDING" && (

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   ANONYMOUS,
   loadTossPayments,
@@ -9,6 +10,9 @@ import {
 } from "@tosspayments/tosspayments-sdk";
 import { useCart } from "@/context/CartContext";
 import { cancelPendingOrder, createGuestOrder, createOrder } from "@/app/checkout/actions";
+import { redeemCodeAtCheckout } from "@/app/coupons/actions";
+import { applyCoupon, couponBenefitText, couponChoices, COUPON_KIND_LABEL, type CouponOption } from "@/lib/coupon-rules";
+import { formatDate } from "@/lib/format";
 import type { CartSku } from "@/lib/catalog";
 import { formatPrice } from "@/lib/format";
 import { isKnownFailCode, paymentFailMessage } from "@/lib/payment-labels";
@@ -40,6 +44,10 @@ type Props = {
   shippingRule: { baseFee: number; freeShippingThreshold: number | null };
   /** 비회원 주문: 배송지를 직접 입력하므로 우편번호 → 추가 배송비 계산용 지역 범위 */
   guest?: { zones: { zipFrom: string; zipTo: string; extraFee: number; label: string }[] };
+  /** 회원: 쓸 수 있는 쿠폰 (대상 SKU는 서버가 계산). 할인 계산은 서버와 같은 lib/coupon-rules.ts */
+  coupons?: CouponOption[];
+  /** 서버 기준 지금 시각 (쿠폰 "N일 남음" 계산용. 화면 그리는 중에 Date.now()를 부르면 서버·브라우저 결과가 달라질 수 있음) */
+  nowMs?: number;
 };
 
 /** 비회원 주문서 입력값 */
@@ -53,7 +61,14 @@ export default function CheckoutView({
   addresses,
   shippingRule,
   guest,
+  coupons = [],
+  nowMs = 0,
 }: Props) {
+  const router = useRouter();
+  // 고객이 고른 쿠폰 1장 (null = 쿠폰 안 씀. 자동으로 고르지 않음: 만료일을 보고 고객이 선택)
+  const [couponId, setCouponId] = useState<number | null>(null);
+  const [code, setCode] = useState("");
+  const [codeMsg, setCodeMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [g, setG] = useState(EMPTY_GUEST);
   const setField = (key: keyof typeof EMPTY_GUEST) => (e: React.ChangeEvent<HTMLInputElement>) =>
     setG((prev) => ({ ...prev, [key]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
@@ -84,7 +99,29 @@ export default function CheckoutView({
   const freeShipping = threshold !== null && itemsTotal >= threshold;
   const baseFee = freeShipping ? 0 : shippingRule.baseFee;
   const extraFee = guest ? (guestZone?.extraFee ?? 0) : (address?.extraFee ?? 0);
-  const total = itemsTotal + baseFee + extraFee;
+
+  // 쿠폰 (주문당 1장): 화면 계산 = 서버 계산 (같은 함수)
+  // 목록은 할인 금액이 큰 순서 (같으면 만료가 빠른 순), 쓸 수 없는 쿠폰은 아래에 이유와 함께
+  const calcLines = lines.map((l) => ({ skuId: l.sku.id, lineTotal: l.sku.price * l.quantity }));
+  const choices = guest ? [] : couponChoices(calcLines, baseFee, coupons);
+  const appliedResult = guest ? null : applyCoupon(calcLines, baseFee, coupons, couponId);
+  // 고른 쿠폰을 장바구니·배송지 변경으로 더 쓸 수 없게 되면 할인 없이 계산하고 안내 (결제 금액이 화면과 달라지지 않게)
+  const applied = appliedResult && !("error" in appliedResult) ? appliedResult : null;
+  const couponProblem = appliedResult && "error" in appliedResult ? appliedResult.error : null;
+  const couponDiscount = applied?.couponDiscountTotal ?? 0;
+  const shippingDiscount = applied?.shippingDiscount ?? 0;
+  const total = itemsTotal - couponDiscount + baseFee + extraFee - shippingDiscount;
+  const daysLeft = (iso: string) => Math.ceil((new Date(iso).getTime() - nowMs) / 86400_000);
+
+  async function registerCode() {
+    if (!code.trim()) return;
+    const r = await redeemCodeAtCheckout(code);
+    setCodeMsg({ ok: r.ok, text: r.message });
+    if (r.ok) {
+      setCode("");
+      router.refresh(); // 서버에서 쿠폰 목록을 다시 받음 (고르는 것은 고객이)
+    }
+  }
 
   // 1) 토스 결제 위젯(결제수단 선택 + 약관)을 화면에 한 번만 그립니다.
   useEffect(() => {
@@ -134,7 +171,7 @@ export default function CheckoutView({
           passwordConfirm: g.passwordConfirm,
           privacyConsent: g.consent,
         })
-      : await createOrder(items, address!.id);
+      : await createOrder(items, address!.id, couponProblem ? null : couponId);
     if ("error" in order) {
       setError(order.error);
       setPaying(false);
@@ -317,7 +354,75 @@ export default function CheckoutView({
         ))}
       </ul>
 
-      {/* 금액 구성: 상품 금액 − 상품 할인 + 배송비 = 결제 금액 (쿠폰·포인트는 다음 단계) */}
+      {/* 쿠폰 (회원): 주문당 1장, 고객이 직접 선택. 할인 금액이 큰 순서 + 만료일 표시 */}
+      {!guest && (
+        <section className="mt-4 space-y-3 rounded-xl border border-gray-200 bg-white p-4 text-sm">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 className="font-bold text-gray-900">쿠폰</h2>
+            <span className="text-xs text-gray-500">주문당 1장 · 할인 금액이 큰 순서</span>
+          </div>
+          {choices.length === 0 ? (
+            <p className="text-gray-500">사용할 수 있는 쿠폰이 없어요.</p>
+          ) : (
+            <ul className="space-y-2">
+              <li>
+                <label className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 ${couponId === null ? "border-gray-900" : "border-gray-200"}`}>
+                  <input type="radio" name="coupon" checked={couponId === null} onChange={() => setCouponId(null)} disabled={paying} className="accent-gray-900" />
+                  <span className="text-gray-700">쿠폰 사용 안 함</span>
+                </label>
+              </li>
+              {choices.map(({ coupon: c, amount, lineIndex, reason }) => {
+                const usable = amount > 0;
+                const left = daysLeft(c.validTo);
+                return (
+                  <li key={c.id}>
+                    <label
+                      className={`flex items-start gap-3 rounded-lg border p-3 ${usable ? "cursor-pointer" : "cursor-not-allowed bg-gray-50 opacity-60"} ${couponId === c.id ? "border-gray-900" : "border-gray-200"}`}
+                    >
+                      <input type="radio" name="coupon" checked={couponId === c.id} onChange={() => setCouponId(c.id)} disabled={paying || !usable} className="mt-1 accent-gray-900" />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex flex-wrap items-baseline justify-between gap-x-2">
+                          <span className="font-medium text-gray-900">
+                            <span className="mr-1 text-xs font-normal text-blue-700">{COUPON_KIND_LABEL[c.kind]}</span>
+                            {c.name}
+                          </span>
+                          {usable && <span className="whitespace-nowrap font-bold text-red-600">−{formatPrice(amount)}</span>}
+                        </span>
+                        <span className="block text-xs text-gray-500">
+                          {couponBenefitText(c)} · {formatDate(new Date(new Date(c.validTo).getTime() - 1))}까지
+                          {left <= 7 && <span className="text-red-600"> ({left}일 남음)</span>}
+                        </span>
+                        {usable && c.kind === "PRODUCT" && lineIndex !== null && (
+                          <span className="block text-xs text-gray-500">적용 상품: {lines[lineIndex].sku.styleName}</span>
+                        )}
+                        {!usable && reason && <span className="block text-xs text-gray-500">{reason}</span>}
+                      </span>
+                    </label>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {couponProblem && <p className="text-xs text-amber-700">{couponProblem} — 다른 쿠폰을 고르거나 쿠폰 없이 결제해 주세요.</p>}
+          <div className="flex gap-2 pt-1">
+            <input
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              maxLength={30}
+              placeholder="쿠폰 코드"
+              autoComplete="off"
+              disabled={paying}
+              className="min-w-0 flex-1 rounded-lg border border-gray-300 px-3 py-1.5 uppercase"
+            />
+            <button type="button" onClick={registerCode} disabled={paying || !code.trim()} className="shrink-0 rounded-lg border border-gray-900 px-3 py-1.5 text-xs font-medium disabled:opacity-50">
+              등록
+            </button>
+          </div>
+          {codeMsg && <p className={`text-xs ${codeMsg.ok ? "text-blue-700" : "text-red-600"}`}>{codeMsg.text}</p>}
+        </section>
+      )}
+
+      {/* 금액 구성: 상품 금액 − 상품 할인 − 쿠폰 + 배송비 − 배송비 쿠폰 = 결제 금액 (포인트는 다음 단계) */}
       <dl className="mt-4 space-y-1 rounded-xl border border-gray-200 bg-white p-4 text-sm text-gray-700">
         <div className="flex justify-between">
           <dt>상품 금액</dt>
@@ -329,10 +434,22 @@ export default function CheckoutView({
             <dd className="whitespace-nowrap">−{formatPrice(discount)}</dd>
           </div>
         )}
+        {couponDiscount > 0 && (
+          <div className="flex justify-between text-red-600">
+            <dt>쿠폰 할인</dt>
+            <dd className="whitespace-nowrap">−{formatPrice(couponDiscount)}</dd>
+          </div>
+        )}
         <div className="flex justify-between">
           <dt>배송비</dt>
           <dd className="whitespace-nowrap">{baseFee === 0 ? "무료" : formatPrice(baseFee)}</dd>
         </div>
+        {shippingDiscount > 0 && (
+          <div className="flex justify-between text-red-600">
+            <dt>배송비 쿠폰 할인</dt>
+            <dd className="whitespace-nowrap">−{formatPrice(shippingDiscount)}</dd>
+          </div>
+        )}
         {extraFee > 0 && (
           <div className="flex justify-between">
             <dt>제주·도서산간 추가 배송비</dt>

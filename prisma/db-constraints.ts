@@ -665,7 +665,7 @@ const INV2_CHECKS: CheckConstraint[] = [
 ];
 
 export function allChecks(schemaText: string): CheckConstraint[] {
-  return [...autoChecks(schemaText), ...MANUAL_CHECKS, ...PAYMENT_CHECKS, ...ORDER_CHECKS, ...GUEST_CHECKS, ...INV2_CHECKS];
+  return [...autoChecks(schemaText), ...MANUAL_CHECKS, ...PAYMENT_CHECKS, ...ORDER_CHECKS, ...GUEST_CHECKS, ...INV2_CHECKS, ...COUPON_CHECKS];
 }
 
 // ---------------------------------------------------------------
@@ -2396,12 +2396,457 @@ END;`,
   },
 ];
 
+
+// ---------------------------------------------------------------
+// ⑬ 쿠폰 (B안: 정책 · 발급 · 사용 분리)
+//  - 앱은 쿠폰 상태를 직접 바꾸지 않음: 주문 상태 → OrderCoupon → CustomerCoupon 순서로 트리거가 바꿈
+//  - 선착순 수량·1인 한도·등급·발급 기간·사용 기간·본인 쿠폰·주문당 1장·적용 대상은 DB가 최종 판정
+// ---------------------------------------------------------------
+const COUPON_TARGET_SHAPE = [
+  `("targetType" = 'ALL'      AND "categoryId" IS NULL     AND "seasonId" IS NULL     AND "gender" IS NULL     AND "styleId" IS NULL)`,
+  `("targetType" = 'CATEGORY' AND "categoryId" IS NOT NULL AND "seasonId" IS NULL     AND "gender" IS NULL     AND "styleId" IS NULL)`,
+  `("targetType" = 'SEASON'   AND "categoryId" IS NULL     AND "seasonId" IS NOT NULL AND "gender" IS NULL     AND "styleId" IS NULL)`,
+  `("targetType" = 'GENDER'   AND "categoryId" IS NULL     AND "seasonId" IS NULL     AND "gender" IS NOT NULL AND "styleId" IS NULL)`,
+  `("targetType" = 'STYLE'    AND "categoryId" IS NULL     AND "seasonId" IS NULL     AND "gender" IS NULL     AND "styleId" IS NOT NULL)`,
+].join(" OR ");
+
+const COUPON_CHECKS: CheckConstraint[] = [
+  {
+    table: "CouponPolicy",
+    name: "CouponPolicy_values_ck",
+    expr: `${upperCode("code")} AND ${notBlank("name")} AND ${notBlank("displayName")} AND length("displayName") <= 40 AND (${memoOk("description", 500)}) AND ${notBlank("createdBy")}
+      AND (${int("discountValue", ">= 0")}) AND (${int("minOrderAmount", ">= 0")}) AND (${intOrNull("maxDiscountAmount", "> 0")})
+      AND (("discountType" = 'RATE' AND "discountValue" BETWEEN 1 AND 90) OR ("discountType" = 'AMOUNT' AND "discountValue" > 0) OR ("discountType" = 'FREE_SHIPPING' AND "discountValue" = 0 AND "kind" = 'SHIPPING'))
+      AND ("kind" <> 'SHIPPING' OR "discountType" IN ('FREE_SHIPPING', 'AMOUNT'))
+      AND ("maxDiscountAmount" IS NULL OR "discountType" = 'RATE')`,
+    why: "정률 1~90%, 정액 > 0, 무료배송은 배송비 쿠폰만, 배송비 쿠폰은 무료배송·정액만, 최대 할인은 정률에만",
+  },
+  {
+    table: "CouponPolicy",
+    name: "CouponPolicy_issue_ck",
+    expr: `("issueMethod" = 'AUTO') = ("autoTrigger" IS NOT NULL) AND "issueEndAt" > "issueStartAt"
+      AND (${intOrNull("totalQuantity", "> 0")}) AND (${int("issuedCount", ">= 0")}) AND ("totalQuantity" IS NULL OR "issuedCount" <= "totalQuantity")
+      AND (${intOrNull("perCustomerLimit", ">= 1")})
+      AND ("autoTrigger" IS NOT 'SIGNUP' OR "perCustomerLimit" = 1)
+      AND ("autoTrigger" NOT IN ('BIRTHDAY', 'GRADE_MONTHLY') OR "perCustomerLimit" IS NULL)
+      AND (("validDays" IS NOT NULL AND "useStartAt" IS NULL AND "useEndAt" IS NULL AND "validDays" BETWEEN 1 AND 365)
+        OR ("validDays" IS NULL AND "useStartAt" IS NOT NULL AND "useEndAt" > "useStartAt" AND "issueEndAt" <= "useEndAt"))
+      AND ${dates(["issueStartAt", false], ["issueEndAt", false], ["useStartAt", true], ["useEndAt", true], ["statusChangedAt", false], ["createdAt", false], ["updatedAt", false])}`,
+    why: "자동 발급은 조건 필수, 발급 수는 총수량 이하, 가입 쿠폰은 1인 1장, 생일·등급 쿠폰은 주기별 1장(평생 한도 없음), 사용 기간은 고정 또는 N일(1~365) 중 하나, 고정 기간이면 발급 종료가 사용 종료보다 늦지 않음",
+  },
+  { table: "CouponPolicyTarget", name: "CouponPolicyTarget_shape_ck", expr: COUPON_TARGET_SHAPE, why: "대상 종류에 맞는 칸 하나만 채움" },
+  { table: "CouponCode", name: "CouponCode_ck", expr: `length("code") BETWEEN 4 AND 20 AND "code" NOT GLOB '*[^A-Z0-9]*'`, why: "코드는 대문자·숫자 4~20자 (입력은 대문자로 바꿔 찾음)" },
+  { table: "CouponCodeAttempt", name: "CouponCodeAttempt_ck", expr: dates(["createdAt", false]), why: "날짜 형식" },
+  {
+    table: "CustomerCoupon",
+    name: "CustomerCoupon_values_ck",
+    expr: `length("couponNo") = 12 AND "couponNo" GLOB 'CP*' AND "couponNo" NOT GLOB '*[^A-Z0-9]*' AND "validTo" > "validFrom" AND ${notBlank("issuedBy")}
+      AND ("issueMethod" = 'CODE') = ("couponCodeId" IS NOT NULL) AND ("issueKey" IS NULL OR length("issueKey") BETWEEN 1 AND 40) AND (${memoOk("statusReason", 200)})
+      AND ${dates(["issuedAt", false], ["validFrom", false], ["validTo", false], ["statusChangedAt", false], ["expiryNotifiedAt", true], ["createdAt", false], ["updatedAt", false])}`,
+    why: "쿠폰번호 CP+10자, 사용 종료 > 시작, 코드로 받았으면 코드 필수",
+  },
+  { table: "CustomerCouponHistory", name: "CustomerCouponHistory_ck", expr: `${dates(["changedAt", false])} AND (${memoOk("reason", 200)})`, why: "날짜 형식" },
+  {
+    table: "OrderCoupon",
+    name: "OrderCoupon_values_ck",
+    expr: `(${int("discountAmount", "> 0")}) AND ${notBlank("couponName")} AND ${dates(["appliedAt", true], ["releasedAt", true], ["canceledAt", true], ["createdAt", false], ["updatedAt", false])}
+      AND (("status" = 'RESERVED' AND "appliedAt" IS NULL AND "releasedAt" IS NULL AND "canceledAt" IS NULL)
+        OR ("status" = 'APPLIED' AND "appliedAt" IS NOT NULL AND "releasedAt" IS NULL AND "canceledAt" IS NULL)
+        OR ("status" = 'RELEASED' AND "appliedAt" IS NULL AND "releasedAt" IS NOT NULL AND "canceledAt" IS NULL)
+        OR ("status" = 'CANCELED' AND "appliedAt" IS NOT NULL AND "releasedAt" IS NULL AND "canceledAt" IS NOT NULL))`,
+    why: "할인액 1원 이상, 상태별 시각 (사용=사용 시각, 해제=해제 시각, 결제 후 취소=사용·취소 시각)",
+  },
+  { table: "OrderItemCoupon", name: "OrderItemCoupon_amount_ck", expr: int("amount", ">= 0"), why: "배분액은 0 이상의 정수 (장바구니 쿠폰은 대상 줄 전부 기록: 금액이 아주 작은 줄은 0원일 수 있음. 상품 쿠폰은 주문 쿠폰 할인액 > 0으로 보장)" },
+];
+
+const POLICY_STATUS_CHANGES = ["DRAFT>ACTIVE", "DRAFT>ENDED", "ACTIVE>PAUSED", "PAUSED>ACTIVE", "ACTIVE>ENDED", "PAUSED>ENDED"];
+const COUPON_STATUS_CHANGES = ["AVAILABLE>IN_USE", "IN_USE>USED", "IN_USE>AVAILABLE", "IN_USE>EXPIRED", "USED>AVAILABLE", "USED>EXPIRED", "AVAILABLE>EXPIRED", "AVAILABLE>REVOKED"];
+const ORDER_COUPON_STATUS_CHANGES = ["RESERVED>APPLIED", "RESERVED>RELEASED", "APPLIED>CANCELED"];
+const POLICY_RULE_COLS = ["code", "kind", "discountType", "discountValue", "maxDiscountAmount", "minOrderAmount", "applyToSaleItems", "issueMethod", "autoTrigger", "issueStartAt", "perCustomerLimit", "useStartAt", "useEndAt", "validDays", "createdBy", "createdAt"];
+const policyOf = (col: string, policyRef: string) => `(SELECT p."${col}" FROM "CouponPolicy" p WHERE p."id" = ${policyRef})`;
+const LIVE_ORDER_COUPON = `('RESERVED', 'APPLIED')`;
+/** 발급일 포함 N일: 발급일(KST) + N일의 0시(KST) 직전까지 → UTC 문자열 (lib/coupon.ts couponValidTo와 같은 계산) */
+const validToDaysSql = (issuedRef: string, daysRef: string) =>
+  `strftime('%Y-%m-%dT%H:%M:%f+00:00', date(${issuedRef}, '+9 hours', '+' || ${daysRef} || ' days'), '-9 hours')`;
+/** 상품 줄(i)이 쿠폰 정책(policyRef)의 대상인지: 제외가 포함보다 우선, 카테고리는 하위 포함, 할인 행사 상품 제외 옵션 */
+const couponEligible = (policyRef: string, itemRef: string) => {
+  const style = `(SELECT st."id" FROM "Sku" k JOIN "StyleColor" sc ON sc."id" = k."styleColorId" JOIN "Style" st ON st."id" = sc."styleId" WHERE k."id" = (SELECT oi."skuId" FROM "OrderItem" oi WHERE oi."id" = ${itemRef}))`;
+  const match = `(t."targetType" = 'ALL'
+      OR (t."targetType" = 'CATEGORY' AND (SELECT c."path" FROM "Category" c WHERE c."id" = (SELECT st2."categoryId" FROM "Style" st2 WHERE st2."id" = ${style})) LIKE '%/' || t."categoryId" || '/%')
+      OR (t."targetType" = 'SEASON' AND t."seasonId" = (SELECT st2."seasonId" FROM "Style" st2 WHERE st2."id" = ${style}))
+      OR (t."targetType" = 'GENDER' AND t."gender" = (SELECT st2."gender" FROM "Style" st2 WHERE st2."id" = ${style}))
+      OR (t."targetType" = 'STYLE' AND t."styleId" = ${style}))`;
+  return `(EXISTS (SELECT 1 FROM "CouponPolicyTarget" t WHERE t."policyId" = ${policyRef} AND t."mode" = 'INCLUDE' AND ${match})
+    AND NOT EXISTS (SELECT 1 FROM "CouponPolicyTarget" t WHERE t."policyId" = ${policyRef} AND t."mode" = 'EXCLUDE' AND ${match})
+    AND (${policyOf("applyToSaleItems", policyRef)} = 1 OR (SELECT oi."discountAmount" FROM "OrderItem" oi WHERE oi."id" = ${itemRef}) = 0))`;
+};
+const draftOnly = (table: string, policyCol: string, op: "INSERT" | "DELETE"): TriggerConstraint => ({
+  table,
+  name: `${table}_draft_only_${op === "INSERT" ? "ins" : "del"}`,
+  why: "활성화한 쿠폰은 대상·등급을 바꿀 수 없음 (이미 받은 고객과 약속이 달라짐)",
+  sql: `CREATE TRIGGER "${table}_draft_only_${op === "INSERT" ? "ins" : "del"}" BEFORE ${op} ON "${table}"
+WHEN ${policyOf("status", `${op === "INSERT" ? "NEW" : "OLD"}."${policyCol}"`)} IS NOT 'DRAFT'
+BEGIN ${raise(`${table}_draft_only`, "작성 중(DRAFT)인 쿠폰만 대상·등급을 바꿀 수 있습니다")} END;`,
+});
+const noUpdate = (table: string, message: string): TriggerConstraint => ({
+  table,
+  name: `${table}_no_update`,
+  why: "만든 뒤 수정 금지",
+  sql: `CREATE TRIGGER "${table}_no_update" BEFORE UPDATE ON "${table}"
+BEGIN ${raise(`${table}_no_update`, message)} END;`,
+});
+
+const COUPON_TRIGGERS: TriggerConstraint[] = [
+  // --- 정책
+  {
+    table: "CouponPolicy",
+    name: "CouponPolicy_insert_draft",
+    why: "쿠폰은 작성 중으로 만들고 대상·등급을 채운 뒤 활성화",
+    sql: `CREATE TRIGGER "CouponPolicy_insert_draft" BEFORE INSERT ON "CouponPolicy"
+WHEN NEW."status" <> 'DRAFT' OR NEW."issuedCount" <> 0
+BEGIN ${raise("CouponPolicy_insert_draft", "쿠폰은 작성 중(DRAFT)·발급 0장으로만 만들 수 있습니다")} END;`,
+  },
+  {
+    table: "CouponPolicy",
+    name: "CouponPolicy_transition",
+    why: "정해진 길로만. 상품·장바구니 쿠폰은 포함 대상이 있어야, 코드 쿠폰은 코드가 있어야 활성화",
+    sql: `CREATE TRIGGER "CouponPolicy_transition" BEFORE UPDATE OF "status" ON "CouponPolicy"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN (${inList(POLICY_STATUS_CHANGES)})
+    THEN RAISE(ABORT, 'CouponPolicy_transition: 허용되지 않은 쿠폰 상태 변경입니다')
+  WHEN NEW."statusChangedAt" < OLD."statusChangedAt"
+    THEN RAISE(ABORT, 'CouponPolicy_transition: 상태 변경 시각이 이전보다 앞설 수 없습니다')
+  WHEN NEW."status" = 'ACTIVE' AND NEW."kind" <> 'SHIPPING' AND NOT EXISTS (SELECT 1 FROM "CouponPolicyTarget" t WHERE t."policyId" = NEW."id" AND t."mode" = 'INCLUDE')
+    THEN RAISE(ABORT, 'CouponPolicy_transition: 상품·장바구니 쿠폰은 적용 대상(포함)이 있어야 활성화할 수 있습니다')
+  WHEN NEW."status" = 'ACTIVE' AND NEW."issueMethod" = 'CODE' AND NOT EXISTS (SELECT 1 FROM "CouponCode" c WHERE c."policyId" = NEW."id" AND c."isActive" = 1)
+    THEN RAISE(ABORT, 'CouponPolicy_transition: 코드 쿠폰은 코드가 있어야 활성화할 수 있습니다')
+END;
+END;`,
+  },
+  {
+    table: "CouponPolicy",
+    name: "CouponPolicy_rules_fixed",
+    why: "활성화 후에는 할인·조건·발급 방식·사용 기간을 바꿀 수 없음 (이름·설명·상태·발급 종료·총수량만)",
+    sql: `CREATE TRIGGER "CouponPolicy_rules_fixed" BEFORE UPDATE OF ${POLICY_RULE_COLS.map(q).join(", ")} ON "CouponPolicy"
+WHEN OLD."status" <> 'DRAFT' AND (${POLICY_RULE_COLS.map((c) => `NEW."${c}" IS NOT OLD."${c}"`).join(" OR ")})
+BEGIN ${raise("CouponPolicy_rules_fixed", "활성화한 쿠폰은 할인 규칙·조건·사용 기간을 바꿀 수 없습니다 (새 쿠폰으로 만드세요)")} END;`,
+  },
+  {
+    table: "CouponPolicy",
+    name: "CouponPolicy_issued_count",
+    why: "발급 수는 실제 발급된 쿠폰 수와 같아야 함 (트리거만 바꿈)",
+    sql: `CREATE TRIGGER "CouponPolicy_issued_count" BEFORE UPDATE OF "issuedCount" ON "CouponPolicy"
+WHEN NEW."issuedCount" IS NOT (SELECT COUNT(*) FROM "CustomerCoupon" cc WHERE cc."policyId" = NEW."id")
+BEGIN ${raise("CouponPolicy_issued_count", "발급 수는 발급된 쿠폰으로만 바뀝니다")} END;`,
+  },
+  noDelete("CouponPolicy", "쿠폰 정책은 삭제할 수 없습니다 (종료로 처리)", "발급·사용 기록 보관"),
+  draftOnly("CouponPolicyTarget", "policyId", "INSERT"),
+  draftOnly("CouponPolicyTarget", "policyId", "DELETE"),
+  noUpdate("CouponPolicyTarget", "쿠폰 대상은 수정할 수 없습니다 (작성 중에 지우고 다시 추가)"),
+  draftOnly("CouponPolicyGrade", "policyId", "INSERT"),
+  draftOnly("CouponPolicyGrade", "policyId", "DELETE"),
+  noUpdate("CouponPolicyGrade", "쿠폰 등급은 수정할 수 없습니다 (작성 중에 지우고 다시 추가)"),
+  {
+    table: "CouponCode",
+    name: "CouponCode_insert_guard",
+    why: "코드는 코드 발급 쿠폰에만, 종료된 쿠폰에는 추가 불가",
+    sql: `CREATE TRIGGER "CouponCode_insert_guard" BEFORE INSERT ON "CouponCode"
+WHEN ${policyOf("issueMethod", `NEW."policyId"`)} IS NOT 'CODE' OR ${policyOf("status", `NEW."policyId"`)} = 'ENDED'
+BEGIN ${raise("CouponCode_insert_guard", "코드는 진행 중인 코드 발급 쿠폰에만 추가할 수 있습니다")} END;`,
+  },
+  fixedColumns("CouponCode", "CouponCode_fixed", ["policyId", "code", "createdAt"], "쿠폰 코드는 바꿀 수 없습니다 (사용 중지만 가능)", "코드 고정"),
+  noDelete("CouponCode", "쿠폰 코드는 삭제할 수 없습니다 (사용 중지로 처리)", "발급 기록 보관"),
+  ...appendOnly("CouponCodeAttempt"),
+
+  // --- 발급
+  {
+    table: "CustomerCoupon",
+    name: "CustomerCoupon_issue_guard",
+    why: "선착순 수량·1인 한도·발급 기간·정상 회원·대상 등급·발급 방식·코드·사용 기간을 DB가 최종 판정 (동시에 받아도 정확)",
+    sql: `CREATE TRIGGER "CustomerCoupon_issue_guard" BEFORE INSERT ON "CustomerCoupon"
+BEGIN
+SELECT CASE
+  WHEN NEW."status" <> 'AVAILABLE'
+    THEN RAISE(ABORT, 'CustomerCoupon_issue_guard: 쿠폰은 사용 가능 상태로 발급합니다')
+  WHEN ${policyOf("status", `NEW."policyId"`)} IS NOT 'ACTIVE'
+    THEN RAISE(ABORT, 'CustomerCoupon_not_active: 지금 발급할 수 없는 쿠폰입니다 (작성 중·중지·종료)')
+  WHEN NEW."issuedAt" < ${policyOf("issueStartAt", `NEW."policyId"`)} OR NEW."issuedAt" >= ${policyOf("issueEndAt", `NEW."policyId"`)}
+    THEN RAISE(ABORT, 'CustomerCoupon_issue_period: 발급 기간이 아닙니다')
+  WHEN ${policyOf("totalQuantity", `NEW."policyId"`)} IS NOT NULL AND ${policyOf("issuedCount", `NEW."policyId"`)} >= ${policyOf("totalQuantity", `NEW."policyId"`)}
+    THEN RAISE(ABORT, 'CustomerCoupon_sold_out: 선착순 수량이 모두 발급되었습니다')
+  WHEN ${policyOf("perCustomerLimit", `NEW."policyId"`)} IS NOT NULL
+      AND (SELECT COUNT(*) FROM "CustomerCoupon" cc WHERE cc."policyId" = NEW."policyId" AND cc."customerId" = NEW."customerId") >= ${policyOf("perCustomerLimit", `NEW."policyId"`)}
+    THEN RAISE(ABORT, 'CustomerCoupon_limit: 이미 받은 쿠폰입니다 (1인 발급 한도)')
+  WHEN ${customerStatusOf("customerId")} IS NOT 'ACTIVE'
+    THEN RAISE(ABORT, 'CustomerCoupon_customer: 정상 회원만 쿠폰을 받을 수 있습니다')
+  WHEN EXISTS (SELECT 1 FROM "CouponPolicyGrade" g WHERE g."policyId" = NEW."policyId")
+      AND NOT EXISTS (SELECT 1 FROM "CouponPolicyGrade" g WHERE g."policyId" = NEW."policyId" AND g."gradeId" = (SELECT c."gradeId" FROM "Customer" c WHERE c."id" = NEW."customerId"))
+    THEN RAISE(ABORT, 'CustomerCoupon_grade: 받을 수 있는 등급이 아닙니다')
+  WHEN NEW."issueMethod" <> 'ADMIN' AND NEW."issueMethod" IS NOT ${policyOf("issueMethod", `NEW."policyId"`)}
+    THEN RAISE(ABORT, 'CustomerCoupon_issue_guard: 쿠폰의 발급 방식과 다릅니다')
+  WHEN NEW."couponCodeId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "CouponCode" k WHERE k."id" = NEW."couponCodeId" AND k."policyId" = NEW."policyId" AND k."isActive" = 1)
+    THEN RAISE(ABORT, 'CustomerCoupon_issue_guard: 사용할 수 없는 쿠폰 코드입니다')
+  WHEN NEW."issueMethod" = 'AUTO' AND ${policyOf("autoTrigger", `NEW."policyId"`)} IN ('BIRTHDAY', 'GRADE_MONTHLY') AND NEW."issueKey" IS NULL
+    THEN RAISE(ABORT, 'CustomerCoupon_issue_guard: 주기 발급 쿠폰은 주기 키(issueKey)가 필요합니다')
+  WHEN ${policyOf("validDays", `NEW."policyId"`)} IS NULL
+      AND (NEW."validFrom" IS NOT ${policyOf("useStartAt", `NEW."policyId"`)} OR NEW."validTo" IS NOT ${policyOf("useEndAt", `NEW."policyId"`)})
+    THEN RAISE(ABORT, 'CustomerCoupon_validity: 사용 기간이 쿠폰 정책(고정 기간)과 다릅니다')
+  WHEN ${policyOf("validDays", `NEW."policyId"`)} IS NOT NULL
+      AND (NEW."validFrom" IS NOT NEW."issuedAt" OR NEW."validTo" IS NOT ${validToDaysSql(`NEW."issuedAt"`, policyOf("validDays", `NEW."policyId"`))})
+    THEN RAISE(ABORT, 'CustomerCoupon_validity: 사용 기간이 발급일 기준 N일과 다릅니다')
+END;
+END;`,
+  },
+  {
+    table: "CustomerCoupon",
+    name: "CustomerCoupon_after_issue",
+    why: "발급 수 +1, 이력 첫 줄",
+    sql: `CREATE TRIGGER "CustomerCoupon_after_issue" AFTER INSERT ON "CustomerCoupon"
+BEGIN
+  UPDATE "CouponPolicy" SET "issuedCount" = (SELECT COUNT(*) FROM "CustomerCoupon" cc WHERE cc."policyId" = NEW."policyId") WHERE "id" = NEW."policyId";
+  INSERT INTO "CustomerCouponHistory" ("customerCouponId", "fromStatus", "toStatus", "orderId", "reason", "changedAt")
+  VALUES (NEW."id", NULL, NEW."status", NULL, 'ISSUED:' || NEW."issueMethod", NEW."issuedAt");
+END;`,
+  },
+  fixedColumns(
+    "CustomerCoupon",
+    "CustomerCoupon_fixed",
+    ["couponNo", "policyId", "customerId", "issueMethod", "couponCodeId", "issueKey", "issuedBy", "issuedAt", "validFrom", "validTo", "createdAt"],
+    "발급된 쿠폰의 주인·사용 기간은 바꿀 수 없습니다",
+    "발급 정보 고정",
+  ),
+  {
+    table: "CustomerCoupon",
+    name: "CustomerCoupon_transition",
+    why: "정해진 길로만. 사용 중·사용됨은 주문 쿠폰 기록과 반드시 맞아야 하고(앱이 직접 못 바꿈), 만료는 기간이 지난 뒤에만, 회수는 사유 필수",
+    sql: `CREATE TRIGGER "CustomerCoupon_transition" BEFORE UPDATE OF "status" ON "CustomerCoupon"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN (${inList(COUPON_STATUS_CHANGES)})
+    THEN RAISE(ABORT, 'CustomerCoupon_transition: 허용되지 않은 쿠폰 상태 변경입니다')
+  WHEN NEW."statusChangedAt" < OLD."statusChangedAt"
+    THEN RAISE(ABORT, 'CustomerCoupon_transition: 상태 변경 시각이 이전보다 앞설 수 없습니다')
+  WHEN NEW."status" = 'IN_USE' AND NOT EXISTS (SELECT 1 FROM "OrderCoupon" oc WHERE oc."customerCouponId" = NEW."id" AND oc."status" = 'RESERVED')
+    THEN RAISE(ABORT, 'CustomerCoupon_order_sync: 사용 중 상태는 주문 쿠폰 예약으로만 바뀝니다')
+  WHEN NEW."status" = 'USED' AND NOT EXISTS (SELECT 1 FROM "OrderCoupon" oc WHERE oc."customerCouponId" = NEW."id" AND oc."status" = 'APPLIED')
+    THEN RAISE(ABORT, 'CustomerCoupon_order_sync: 사용됨 상태는 결제 완료로만 바뀝니다')
+  WHEN NEW."status" NOT IN ('IN_USE', 'USED') AND EXISTS (SELECT 1 FROM "OrderCoupon" oc WHERE oc."customerCouponId" = NEW."id" AND oc."status" IN ${LIVE_ORDER_COUPON})
+    THEN RAISE(ABORT, 'CustomerCoupon_order_sync: 주문에 쓰인 쿠폰은 주문이 끝나야 돌려받거나 만료됩니다')
+  WHEN OLD."status" = 'AVAILABLE' AND NEW."status" = 'EXPIRED' AND NEW."validTo" > NEW."statusChangedAt"
+    THEN RAISE(ABORT, 'CustomerCoupon_transition: 사용 기간이 남은 쿠폰은 만료 처리할 수 없습니다')
+  WHEN NEW."status" = 'REVOKED' AND NEW."statusReason" IS NULL
+    THEN RAISE(ABORT, 'CustomerCoupon_transition: 회수 사유가 필요합니다')
+END;
+END;`,
+  },
+  {
+    table: "CustomerCoupon",
+    name: "CustomerCoupon_history_upd",
+    why: "상태가 바뀔 때마다 이력 (주문 때문이면 주문 번호도)",
+    sql: `CREATE TRIGGER "CustomerCoupon_history_upd" AFTER UPDATE OF "status" ON "CustomerCoupon"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  INSERT INTO "CustomerCouponHistory" ("customerCouponId", "fromStatus", "toStatus", "orderId", "reason", "changedAt")
+  VALUES (NEW."id", OLD."status", NEW."status",
+    CASE WHEN NEW."status" IN ('IN_USE', 'USED') OR OLD."status" IN ('IN_USE', 'USED')
+      THEN (SELECT oc."orderId" FROM "OrderCoupon" oc WHERE oc."customerCouponId" = NEW."id" ORDER BY oc."id" DESC LIMIT 1) END,
+    NEW."statusReason", NEW."statusChangedAt");
+END;`,
+  },
+  noDelete("CustomerCoupon", "발급된 쿠폰은 삭제할 수 없습니다 (회수로 처리)", "발급·사용 기록 보관"),
+  ...appendOnly("CustomerCouponHistory"),
+  {
+    table: "Customer",
+    name: "Customer_coupon_revoke",
+    why: "탈퇴하면 남은 쿠폰 소멸 (사용한 쿠폰 기록은 그대로)",
+    sql: `CREATE TRIGGER "Customer_coupon_revoke" AFTER UPDATE OF "status" ON "Customer"
+WHEN NEW."status" = 'WITHDRAWN' AND OLD."status" IS NOT 'WITHDRAWN'
+BEGIN
+  UPDATE "CustomerCoupon" SET "status" = 'REVOKED', "statusReason" = 'WITHDRAWN', "statusChangedAt" = MAX("statusChangedAt", NEW."statusChangedAt"), "updatedAt" = ${NOW}
+  WHERE "customerId" = NEW."id" AND "status" = 'AVAILABLE';
+END;`,
+  },
+
+  // --- 주문에 사용
+  {
+    table: "OrderCoupon",
+    name: "OrderCoupon_insert_guard",
+    why: "결제 대기 회원 주문에, 본인의 사용 가능한 쿠폰만, 주문 시각이 사용 기간 안, 중지된 쿠폰 불가, 쿠폰은 종류와 관계없이 주문당 1장(중복 사용 불가), 할인액이 규칙을 넘지 않음",
+    sql: `CREATE TRIGGER "OrderCoupon_insert_guard" BEFORE INSERT ON "OrderCoupon"
+BEGIN
+SELECT CASE
+  WHEN NEW."status" <> 'RESERVED'
+    THEN RAISE(ABORT, 'OrderCoupon_insert_guard: 주문 쿠폰은 예약 상태로 만듭니다')
+  WHEN ${orderStatusOf(`NEW."orderId"`)} IS NOT 'PENDING'
+    THEN RAISE(ABORT, 'OrderCoupon_insert_guard: 결제 대기 주문에만 쿠폰을 쓸 수 있습니다')
+  WHEN (SELECT o."customerId" FROM "Order" o WHERE o."id" = NEW."orderId") IS NOT (SELECT cc."customerId" FROM "CustomerCoupon" cc WHERE cc."id" = NEW."customerCouponId")
+    THEN RAISE(ABORT, 'OrderCoupon_owner: 본인 쿠폰만 쓸 수 있습니다')
+  WHEN (SELECT cc."status" FROM "CustomerCoupon" cc WHERE cc."id" = NEW."customerCouponId") IS NOT 'AVAILABLE'
+      OR EXISTS (SELECT 1 FROM "OrderCoupon" oc WHERE oc."customerCouponId" = NEW."customerCouponId" AND oc."status" IN ${LIVE_ORDER_COUPON})
+    THEN RAISE(ABORT, 'OrderCoupon_coupon_unavailable: 사용할 수 없는 쿠폰입니다 (다른 주문에서 사용 중·사용됨·만료)')
+  WHEN (SELECT o."createdAt" FROM "Order" o WHERE o."id" = NEW."orderId") < (SELECT cc."validFrom" FROM "CustomerCoupon" cc WHERE cc."id" = NEW."customerCouponId")
+      OR (SELECT o."createdAt" FROM "Order" o WHERE o."id" = NEW."orderId") >= (SELECT cc."validTo" FROM "CustomerCoupon" cc WHERE cc."id" = NEW."customerCouponId")
+    THEN RAISE(ABORT, 'OrderCoupon_period: 쿠폰 사용 기간이 아닙니다')
+  WHEN (SELECT p."status" FROM "CouponPolicy" p JOIN "CustomerCoupon" cc ON cc."policyId" = p."id" WHERE cc."id" = NEW."customerCouponId") NOT IN ('ACTIVE', 'ENDED')
+    THEN RAISE(ABORT, 'OrderCoupon_paused: 사용이 중지된 쿠폰입니다')
+  WHEN NEW."kind" IS NOT (SELECT p."kind" FROM "CouponPolicy" p JOIN "CustomerCoupon" cc ON cc."policyId" = p."id" WHERE cc."id" = NEW."customerCouponId")
+    THEN RAISE(ABORT, 'OrderCoupon_insert_guard: 쿠폰 종류가 정책과 다릅니다')
+  WHEN EXISTS (SELECT 1 FROM "OrderCoupon" oc WHERE oc."orderId" = NEW."orderId")
+    THEN RAISE(ABORT, 'OrderCoupon_one_per_order: 쿠폰은 주문당 1장만 쓸 수 있습니다 (중복 사용 불가)')
+  WHEN (SELECT p."discountType" FROM "CouponPolicy" p JOIN "CustomerCoupon" cc ON cc."policyId" = p."id" WHERE cc."id" = NEW."customerCouponId") = 'AMOUNT'
+      AND NEW."discountAmount" > (SELECT p."discountValue" FROM "CouponPolicy" p JOIN "CustomerCoupon" cc ON cc."policyId" = p."id" WHERE cc."id" = NEW."customerCouponId")
+    THEN RAISE(ABORT, 'OrderCoupon_amount: 정액 쿠폰 금액보다 많이 할인할 수 없습니다')
+  WHEN NEW."discountAmount" > COALESCE((SELECT p."maxDiscountAmount" FROM "CouponPolicy" p JOIN "CustomerCoupon" cc ON cc."policyId" = p."id" WHERE cc."id" = NEW."customerCouponId"), NEW."discountAmount")
+    THEN RAISE(ABORT, 'OrderCoupon_amount: 최대 할인 금액을 넘었습니다')
+  WHEN NEW."kind" = 'SHIPPING' AND (
+      NEW."discountAmount" > (SELECT o."shippingBaseFee" FROM "Order" o WHERE o."id" = NEW."orderId")
+      OR ((SELECT p."discountType" FROM "CouponPolicy" p JOIN "CustomerCoupon" cc ON cc."policyId" = p."id" WHERE cc."id" = NEW."customerCouponId") = 'FREE_SHIPPING'
+        AND NEW."discountAmount" IS NOT (SELECT o."shippingBaseFee" FROM "Order" o WHERE o."id" = NEW."orderId")))
+    THEN RAISE(ABORT, 'OrderCoupon_shipping: 배송비 쿠폰은 기본 배송비만큼만 할인합니다 (제주·도서산간 추가 배송비 제외)')
+  WHEN NEW."kind" = 'SHIPPING' AND (SELECT o."itemsTotal" FROM "Order" o WHERE o."id" = NEW."orderId")
+      < (SELECT p."minOrderAmount" FROM "CouponPolicy" p JOIN "CustomerCoupon" cc ON cc."policyId" = p."id" WHERE cc."id" = NEW."customerCouponId")
+    THEN RAISE(ABORT, 'OrderCoupon_min_order: 최소 구매 금액이 모자랍니다')
+END;
+END;`,
+  },
+  {
+    table: "OrderCoupon",
+    name: "OrderCoupon_after_insert",
+    why: "예약하면 쿠폰은 '사용 중' (같은 쿠폰을 다른 주문에 못 씀)",
+    sql: `CREATE TRIGGER "OrderCoupon_after_insert" AFTER INSERT ON "OrderCoupon"
+BEGIN
+  UPDATE "CustomerCoupon" SET "status" = 'IN_USE', "statusReason" = 'ORDER_RESERVED', "statusChangedAt" = MAX("statusChangedAt", NEW."createdAt"), "updatedAt" = ${NOW}
+  WHERE "id" = NEW."customerCouponId";
+END;`,
+  },
+  {
+    table: "OrderCoupon",
+    name: "OrderCoupon_transition",
+    why: "주문 상태와 맞게만: 사용 = 결제 완료, 해제 = 결제 안 되고 끝남, 결제 후 취소 = 주문 취소 (트리거가 주문을 따라 바꿈)",
+    sql: `CREATE TRIGGER "OrderCoupon_transition" BEFORE UPDATE OF "status" ON "OrderCoupon"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN (${inList(ORDER_COUPON_STATUS_CHANGES)})
+    THEN RAISE(ABORT, 'OrderCoupon_transition: 허용되지 않은 주문 쿠폰 상태 변경입니다')
+  WHEN NEW."status" = 'APPLIED' AND ${orderStatusOf(`NEW."orderId"`)} IS NOT 'PAID'
+    THEN RAISE(ABORT, 'OrderCoupon_order_sync: 결제 완료된 주문의 쿠폰만 사용 처리됩니다')
+  WHEN NEW."status" = 'RELEASED' AND ${orderStatusOf(`NEW."orderId"`)} NOT IN ('CANCELED', 'EXPIRED')
+    THEN RAISE(ABORT, 'OrderCoupon_order_sync: 끝난 주문의 쿠폰만 돌려줍니다')
+  WHEN NEW."status" = 'CANCELED' AND ${orderStatusOf(`NEW."orderId"`)} IS NOT 'CANCELED'
+    THEN RAISE(ABORT, 'OrderCoupon_order_sync: 취소된 주문의 쿠폰만 취소 처리됩니다')
+END;
+END;`,
+  },
+  fixedColumns("OrderCoupon", "OrderCoupon_fixed", ["orderId", "customerCouponId", "kind", "couponName", "discountAmount", "createdAt"], "주문에 쓴 쿠폰 기록은 바꿀 수 없습니다", "주문 금액 근거 고정"),
+  noDelete("OrderCoupon", "주문 쿠폰 기록은 삭제할 수 없습니다", "주문 금액 근거 보관"),
+  {
+    table: "OrderCoupon",
+    name: "OrderCoupon_after_status",
+    why: "주문 쿠폰이 사용·해제·취소되면 고객 쿠폰을 따라 바꿈 (돌려줄 때 기간이 지났으면 만료)",
+    sql: `CREATE TRIGGER "OrderCoupon_after_status" AFTER UPDATE OF "status" ON "OrderCoupon"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  UPDATE "CustomerCoupon" SET "status" = 'USED', "statusReason" = 'ORDER_PAID', "statusChangedAt" = MAX("statusChangedAt", NEW."appliedAt"), "updatedAt" = ${NOW}
+  WHERE "id" = NEW."customerCouponId" AND NEW."status" = 'APPLIED';
+  UPDATE "CustomerCoupon" SET
+    "status" = CASE WHEN "validTo" > NEW."releasedAt" THEN 'AVAILABLE' ELSE 'EXPIRED' END,
+    "statusReason" = 'ORDER_NOT_PAID', "statusChangedAt" = MAX("statusChangedAt", NEW."releasedAt"), "updatedAt" = ${NOW}
+  WHERE "id" = NEW."customerCouponId" AND NEW."status" = 'RELEASED';
+  UPDATE "CustomerCoupon" SET
+    "status" = CASE WHEN "validTo" > NEW."canceledAt" THEN 'AVAILABLE' ELSE 'EXPIRED' END,
+    "statusReason" = 'ORDER_CANCELED', "statusChangedAt" = MAX("statusChangedAt", NEW."canceledAt"), "updatedAt" = ${NOW}
+  WHERE "id" = NEW."customerCouponId" AND NEW."status" = 'CANCELED';
+END;`,
+  },
+  {
+    table: "Order",
+    name: "Order_coupon_cascade",
+    why: "주문 결제 → 쿠폰 사용, 결제 없이 끝남(이탈·만료·대체) → 쿠폰 돌려줌, 결제 후 전체 취소 → 기간이 남았으면 돌려줌",
+    sql: `CREATE TRIGGER "Order_coupon_cascade" AFTER UPDATE OF "status" ON "Order"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+  UPDATE "OrderCoupon" SET "status" = 'APPLIED', "appliedAt" = NEW."statusChangedAt", "updatedAt" = ${NOW}
+  WHERE "orderId" = NEW."id" AND "status" = 'RESERVED' AND NEW."status" = 'PAID';
+  UPDATE "OrderCoupon" SET "status" = 'RELEASED', "releasedAt" = NEW."statusChangedAt", "updatedAt" = ${NOW}
+  WHERE "orderId" = NEW."id" AND "status" = 'RESERVED' AND NEW."status" IN ('CANCELED', 'EXPIRED');
+  UPDATE "OrderCoupon" SET "status" = 'CANCELED', "canceledAt" = NEW."statusChangedAt", "updatedAt" = ${NOW}
+  WHERE "orderId" = NEW."id" AND "status" = 'APPLIED' AND NEW."status" = 'CANCELED';
+END;`,
+  },
+  {
+    table: "OrderItemCoupon",
+    name: "OrderItemCoupon_insert_guard",
+    why: "같은 주문의 줄에만, 결제 대기 중에만, 배송비 쿠폰은 배분 없음, 줄 금액 이하, 상품 쿠폰은 줄 1개·줄당 1장·최소 금액, 적용 대상(제외 우선·하위 카테고리·행사 상품 제외 옵션)",
+    sql: `CREATE TRIGGER "OrderItemCoupon_insert_guard" BEFORE INSERT ON "OrderItemCoupon"
+BEGIN
+SELECT CASE
+  WHEN (SELECT oi."orderId" FROM "OrderItem" oi WHERE oi."id" = NEW."orderItemId") IS NOT (SELECT oc."orderId" FROM "OrderCoupon" oc WHERE oc."id" = NEW."orderCouponId")
+    THEN RAISE(ABORT, 'OrderItemCoupon_insert_guard: 같은 주문의 상품에만 배분할 수 있습니다')
+  WHEN (SELECT oc."status" FROM "OrderCoupon" oc WHERE oc."id" = NEW."orderCouponId") IS NOT 'RESERVED'
+      OR ${orderStatusOf(`(SELECT oc."orderId" FROM "OrderCoupon" oc WHERE oc."id" = NEW."orderCouponId")`)} IS NOT 'PENDING'
+    THEN RAISE(ABORT, 'OrderItemCoupon_insert_guard: 결제 대기 주문의 예약 쿠폰만 배분할 수 있습니다')
+  WHEN (SELECT oc."kind" FROM "OrderCoupon" oc WHERE oc."id" = NEW."orderCouponId") = 'SHIPPING'
+    THEN RAISE(ABORT, 'OrderItemCoupon_insert_guard: 배송비 쿠폰은 상품에 배분하지 않습니다')
+  WHEN NEW."amount" > (SELECT oi."lineTotal" FROM "OrderItem" oi WHERE oi."id" = NEW."orderItemId")
+    THEN RAISE(ABORT, 'OrderItemCoupon_insert_guard: 상품 금액보다 많이 할인할 수 없습니다')
+  WHEN (SELECT oc."kind" FROM "OrderCoupon" oc WHERE oc."id" = NEW."orderCouponId") = 'PRODUCT' AND (
+      EXISTS (SELECT 1 FROM "OrderItemCoupon" x WHERE x."orderCouponId" = NEW."orderCouponId")
+      OR EXISTS (SELECT 1 FROM "OrderItemCoupon" x JOIN "OrderCoupon" oc ON oc."id" = x."orderCouponId" WHERE x."orderItemId" = NEW."orderItemId" AND oc."kind" = 'PRODUCT' AND oc."status" IN ${LIVE_ORDER_COUPON}))
+    THEN RAISE(ABORT, 'OrderItemCoupon_product_one: 상품 쿠폰은 상품 1개에 1장만 씁니다')
+  WHEN (SELECT oc."kind" FROM "OrderCoupon" oc WHERE oc."id" = NEW."orderCouponId") = 'PRODUCT'
+      AND (SELECT oi."lineTotal" FROM "OrderItem" oi WHERE oi."id" = NEW."orderItemId") < ${policyOf("minOrderAmount", `(SELECT cc."policyId" FROM "CustomerCoupon" cc JOIN "OrderCoupon" oc ON oc."customerCouponId" = cc."id" WHERE oc."id" = NEW."orderCouponId")`)}
+    THEN RAISE(ABORT, 'OrderCoupon_min_order: 상품 금액이 쿠폰의 최소 구매 금액보다 적습니다')
+  WHEN NOT ${couponEligible(`(SELECT cc."policyId" FROM "CustomerCoupon" cc JOIN "OrderCoupon" oc ON oc."customerCouponId" = cc."id" WHERE oc."id" = NEW."orderCouponId")`, `NEW."orderItemId"`)}
+    THEN RAISE(ABORT, 'OrderItemCoupon_target: 쿠폰 적용 대상이 아닌 상품입니다')
+END;
+END;`,
+  },
+  noUpdate("OrderItemCoupon", "쿠폰 배분은 바꿀 수 없습니다"),
+  noDelete("OrderItemCoupon", "쿠폰 배분은 삭제할 수 없습니다", "환불 기준 보관"),
+  {
+    table: "Payment",
+    name: "Payment_coupon_ready",
+    why: "결제 시작 전 마지막 검사: 쿠폰 할인 합계 = 주문 금액 구성, 줄 배분 합계 = 줄의 쿠폰 할인, 상품 쿠폰은 줄 1개, 장바구니 쿠폰은 최소 금액·정률 한도",
+    sql: `CREATE TRIGGER "Payment_coupon_ready" BEFORE INSERT ON "Payment"
+WHEN NEW."status" = 'IN_PROGRESS'
+BEGIN
+SELECT CASE
+  WHEN (SELECT o."couponDiscountTotal" FROM "Order" o WHERE o."id" = NEW."orderId")
+      IS NOT (SELECT COALESCE(SUM(oc."discountAmount"), 0) FROM "OrderCoupon" oc WHERE oc."orderId" = NEW."orderId" AND oc."kind" <> 'SHIPPING' AND oc."status" IN ${LIVE_ORDER_COUPON})
+    OR (SELECT o."shippingDiscount" FROM "Order" o WHERE o."id" = NEW."orderId")
+      IS NOT (SELECT COALESCE(SUM(oc."discountAmount"), 0) FROM "OrderCoupon" oc WHERE oc."orderId" = NEW."orderId" AND oc."kind" = 'SHIPPING' AND oc."status" IN ${LIVE_ORDER_COUPON})
+    THEN RAISE(ABORT, 'Payment_coupon_ready: 쿠폰 할인 합계가 주문 금액과 다릅니다')
+  WHEN EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = NEW."orderId"
+      AND i."couponAllocated" IS NOT (SELECT COALESCE(SUM(x."amount"), 0) FROM "OrderItemCoupon" x JOIN "OrderCoupon" oc ON oc."id" = x."orderCouponId" WHERE x."orderItemId" = i."id" AND oc."status" IN ${LIVE_ORDER_COUPON}))
+    THEN RAISE(ABORT, 'Payment_coupon_ready: 상품별 쿠폰 배분 합계가 상품의 쿠폰 할인과 다릅니다')
+  WHEN EXISTS (SELECT 1 FROM "OrderCoupon" oc WHERE oc."orderId" = NEW."orderId" AND oc."kind" <> 'SHIPPING' AND oc."status" IN ${LIVE_ORDER_COUPON}
+      AND (oc."discountAmount" IS NOT (SELECT SUM(x."amount") FROM "OrderItemCoupon" x WHERE x."orderCouponId" = oc."id")
+        OR (oc."kind" = 'PRODUCT' AND (SELECT COUNT(*) FROM "OrderItemCoupon" x WHERE x."orderCouponId" = oc."id") <> 1)))
+    THEN RAISE(ABORT, 'Payment_coupon_ready: 쿠폰 할인액과 상품 배분이 맞지 않습니다 (상품 쿠폰은 상품 1개)')
+  WHEN EXISTS (SELECT 1 FROM "OrderCoupon" oc JOIN "CustomerCoupon" cc ON cc."id" = oc."customerCouponId" JOIN "CouponPolicy" p ON p."id" = cc."policyId"
+      WHERE oc."orderId" = NEW."orderId" AND oc."status" IN ${LIVE_ORDER_COUPON} AND oc."kind" IN ('PRODUCT', 'ORDER') AND (
+        (SELECT SUM(i."lineTotal" - CASE WHEN oc."kind" = 'ORDER' THEN COALESCE((SELECT SUM(y."amount") FROM "OrderItemCoupon" y JOIN "OrderCoupon" pc ON pc."id" = y."orderCouponId" WHERE y."orderItemId" = i."id" AND pc."kind" = 'PRODUCT' AND pc."status" IN ${LIVE_ORDER_COUPON}), 0) ELSE 0 END)
+           FROM "OrderItem" i WHERE i."id" IN (SELECT x."orderItemId" FROM "OrderItemCoupon" x WHERE x."orderCouponId" = oc."id")) < p."minOrderAmount"
+        OR (p."discountType" = 'RATE' AND oc."discountAmount" * 100 >
+          (SELECT SUM(i."lineTotal" - CASE WHEN oc."kind" = 'ORDER' THEN COALESCE((SELECT SUM(y."amount") FROM "OrderItemCoupon" y JOIN "OrderCoupon" pc ON pc."id" = y."orderCouponId" WHERE y."orderItemId" = i."id" AND pc."kind" = 'PRODUCT' AND pc."status" IN ${LIVE_ORDER_COUPON}), 0) ELSE 0 END)
+             FROM "OrderItem" i WHERE i."id" IN (SELECT x."orderItemId" FROM "OrderItemCoupon" x WHERE x."orderCouponId" = oc."id")) * p."discountValue")))
+    THEN RAISE(ABORT, 'Payment_coupon_ready: 쿠폰 최소 구매 금액이 모자라거나 정률 할인이 한도를 넘었습니다')
+END;
+END;`,
+  },
+];
+
 export const TRIGGERS: TriggerConstraint[] = [
   ...INVENTORY_TRIGGERS,
   ...CUSTOMER_TRIGGERS,
   ...PAYMENT_TRIGGERS,
   ...ORDER_TRIGGERS,
   ...INV2_TRIGGERS,
+  ...COUPON_TRIGGERS,
   // ----- 판매 시작 검사 (⭐1)
   {
     table: "Style",

@@ -10,6 +10,7 @@ import { loginPath } from "@/lib/safe-redirect";
 import { prisma } from "@/lib/prisma";
 import { currentShippingPolicy, findZone } from "@/lib/order-rules";
 import { REGION_LABEL } from "@/lib/order-labels";
+import { couponOptionsFor } from "@/lib/coupon";
 
 export const dynamic = "force-dynamic";
 
@@ -54,6 +55,8 @@ export default async function CheckoutPage({ searchParams }: PageProps<"/checkou
 
   const now = new Date();
   const [skus, addresses, policy] = await Promise.all([getCartSkus(), listAddresses(customer.id), currentShippingPolicy(prisma, now).catch(() => null)]);
+  // 쓸 수 있는 쿠폰 + 각 쿠폰의 대상 SKU (장바구니는 브라우저에만 있으므로 판매 중인 SKU 전체 기준으로 계산)
+  const coupons = await couponOptionsFor(customer.id, skus.map((s) => ({ id: s.id, discountAmount: s.discountAmount })), now);
   if (!policy) {
     console.error("[주문 설정 오류] 지금 적용 중인 배송비 규칙(ShippingPolicy)이 없습니다");
     return (
@@ -88,6 +91,8 @@ export default async function CheckoutPage({ searchParams }: PageProps<"/checkou
       customerEmail={session.user.email ?? undefined}
       addresses={addressOptions}
       shippingRule={{ baseFee: policy.baseFee, freeShippingThreshold: policy.freeShippingThreshold }}
+      coupons={coupons}
+      nowMs={now.getTime()}
     />
   );
 }

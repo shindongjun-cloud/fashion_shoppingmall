@@ -261,6 +261,36 @@ const RULES: [string, string, "error" | "warn"][] = [
      WHERE rr."status" = 'COMPLETED' AND rr."refundAmount" > 0 AND (c."id" IS NULL OR c."status" <> 'DONE' OR c."cancelAmount" <> rr."refundAmount")`, "error"],
   ["반품: 검수 끝나고 환불이 1시간 넘게 끝나지 않은 반품 없음 → npm run inventory:jobs -- return-refunds",
     `SELECT "returnNo" FROM "ReturnRequest" WHERE "status" = 'INSPECTED' AND julianday(${NOW}) - julianday("inspectedAt") > 1.0 / 24`, "warn"],
+  // ----- ⑬ 쿠폰
+  ["쿠폰: 정책의 발급 수 = 실제 발급된 쿠폰 수",
+    `SELECT p."code", p."issuedCount", (SELECT COUNT(*) FROM "CustomerCoupon" c WHERE c."policyId" = p."id") AS actual FROM "CouponPolicy" p
+     WHERE p."issuedCount" <> (SELECT COUNT(*) FROM "CustomerCoupon" c WHERE c."policyId" = p."id")`, "error"],
+  ["쿠폰: 고객 쿠폰 상태 = 주문 쿠폰 기록 (사용 중 ⇔ 예약 1건, 사용됨 ⇔ 사용 1건, 나머지는 살아 있는 기록 없음)",
+    `SELECT c."couponNo", c."status",
+       (SELECT COUNT(*) FROM "OrderCoupon" oc WHERE oc."customerCouponId" = c."id" AND oc."status" = 'RESERVED') AS reserved,
+       (SELECT COUNT(*) FROM "OrderCoupon" oc WHERE oc."customerCouponId" = c."id" AND oc."status" = 'APPLIED') AS applied
+     FROM "CustomerCoupon" c
+     WHERE (c."status" = 'IN_USE') <> ((SELECT COUNT(*) FROM "OrderCoupon" oc WHERE oc."customerCouponId" = c."id" AND oc."status" = 'RESERVED') = 1)
+        OR (c."status" = 'USED') <> ((SELECT COUNT(*) FROM "OrderCoupon" oc WHERE oc."customerCouponId" = c."id" AND oc."status" = 'APPLIED') = 1)
+        OR (SELECT COUNT(*) FROM "OrderCoupon" oc WHERE oc."customerCouponId" = c."id" AND oc."status" IN ('RESERVED', 'APPLIED')) > 1`, "error"],
+  ["쿠폰: 주문 쿠폰 상태 = 주문 상태 (예약 = 결제 전, 사용 = 결제됨, 해제 = 결제 없이 끝남, 취소 = 결제 후 취소)",
+    `SELECT o."orderNo", o."status" AS orderStatus, oc."status" AS couponStatus FROM "OrderCoupon" oc JOIN "Order" o ON o."id" = oc."orderId"
+     WHERE NOT ((oc."status" = 'RESERVED' AND o."status" IN ('PENDING', 'WAITING_DEPOSIT', 'CANCEL_FAILED'))
+             OR (oc."status" = 'APPLIED' AND o."status" IN ('PAID', 'CANCEL_FAILED'))
+             OR (oc."status" = 'RELEASED' AND o."status" IN ('CANCELED', 'EXPIRED') AND o."paidAt" IS NULL)
+             OR (oc."status" = 'CANCELED' AND o."status" = 'CANCELED'))`, "error"],
+  ["쿠폰: 주문당 쿠폰은 1장 이하 (중복 사용 없음)",
+    `SELECT o."orderNo", COUNT(*) AS n FROM "OrderCoupon" oc JOIN "Order" o ON o."id" = oc."orderId" GROUP BY oc."orderId" HAVING COUNT(*) > 1`, "error"],
+  ["쿠폰: 주문의 쿠폰 할인 = 주문 쿠폰 합계 (상품·장바구니 = 쿠폰 할인, 배송비 = 배송비 할인)",
+    `SELECT o."orderNo", o."couponDiscountTotal", o."shippingDiscount" FROM "Order" o
+     WHERE o."couponDiscountTotal" <> (SELECT COALESCE(SUM(oc."discountAmount"), 0) FROM "OrderCoupon" oc WHERE oc."orderId" = o."id" AND oc."kind" <> 'SHIPPING')
+        OR o."shippingDiscount" <> (SELECT COALESCE(SUM(oc."discountAmount"), 0) FROM "OrderCoupon" oc WHERE oc."orderId" = o."id" AND oc."kind" = 'SHIPPING')`, "error"],
+  ["쿠폰: 상품 줄의 쿠폰 할인 = 줄별 배분 합계, 주문 쿠폰 할인액 = 그 쿠폰의 배분 합계",
+    `SELECT 'item' AS kind, i."id" FROM "OrderItem" i WHERE i."couponAllocated" <> (SELECT COALESCE(SUM(x."amount"), 0) FROM "OrderItemCoupon" x WHERE x."orderItemId" = i."id")
+     UNION ALL
+     SELECT 'coupon', oc."id" FROM "OrderCoupon" oc WHERE oc."kind" <> 'SHIPPING' AND oc."discountAmount" <> (SELECT COALESCE(SUM(x."amount"), 0) FROM "OrderItemCoupon" x WHERE x."orderCouponId" = oc."id")`, "error"],
+  ["쿠폰: 사용 기간이 지났는데 아직 '사용 가능'으로 표시된 쿠폰 없음 → npm run coupons:jobs -- expire",
+    `SELECT "couponNo" FROM "CustomerCoupon" WHERE "status" = 'AVAILABLE' AND "validTo" <= ${NOW}`, "warn"],
   ["반품: 승인 후 3일 넘게 회수가 시작되지 않은 반품 없음 / 도착 후 2일 넘게 검수하지 않은 반품 없음",
     `SELECT "returnNo", "status" FROM "ReturnRequest" WHERE ("status" = 'APPROVED' AND julianday(${NOW}) - julianday("approvedAt") > 3) OR ("status" = 'RECEIVED' AND julianday(${NOW}) - julianday("receivedAt") > 2)`, "warn"],
   ["재입고 알림: 재고가 있는데 아직 대기 중인 신청 없음 → npm run inventory:jobs -- restock",

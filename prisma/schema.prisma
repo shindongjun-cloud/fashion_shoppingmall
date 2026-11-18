@@ -184,6 +184,7 @@ model Season {
 
   styles           Style[]
   promotionTargets PricePromotionTarget[]
+  couponTargets    CouponPolicyTarget[]
 }
 
 // 표준 카테고리 트리: 아우터 > 자켓
@@ -208,6 +209,7 @@ model Category {
   children         Category[]             @relation("CategoryTree")
   styles           Style[]
   promotionTargets PricePromotionTarget[]
+  couponTargets    CouponPolicyTarget[]
 
   @@index([parentId])
   @@index([path])
@@ -352,6 +354,7 @@ model Style {
   detailBlocks     StyleDetailBlock[]
   prices           StylePrice[]
   promotionTargets PricePromotionTarget[]
+  couponTargets    CouponPolicyTarget[]
 
   @@index([categoryId])
   @@index([status, isDisplayed])
@@ -965,6 +968,8 @@ model Customer {
   restockSubscriptions RestockSubscription[] // 재입고 알림 신청
   notifications        Notification[] // 받은 알림 (알림함)
   guestAttempts        GuestLookupAttempt[] // 비회원 주문 가져오기 시도
+  coupons              CustomerCoupon[] // 받은 쿠폰 (쿠폰함)
+  couponCodeAttempts   CouponCodeAttempt[] // 쿠폰 코드 입력 시도
 
   @@index([status])
   @@index([gradeId])
@@ -1079,6 +1084,7 @@ model CustomerGrade {
   customers   Customer[]
   historyFrom CustomerGradeHistory[] @relation("GradeFrom")
   historyTo   CustomerGradeHistory[] @relation("GradeTo")
+  couponPolicies CouponPolicyGrade[] // 이 등급이 받을 수 있는 쿠폰
 }
 
 // 등급 변경 이력 (추가만 가능)
@@ -1301,6 +1307,7 @@ model Order {
   apiLogs         PaymentApiLog[]
   shipments       Shipment[]
   statusHistory   OrderStatusHistory[]
+  coupons         OrderCoupon[] // 이 주문에 쓴 쿠폰
 
   @@index([customerId, createdAt])
   @@index([status, createdAt])
@@ -1953,6 +1960,7 @@ model OrderItem {
   shipmentItems ShipmentItem[]
   statusHistory OrderItemStatusHistory[]
   returnItems   ReturnItem[]
+  coupons       OrderItemCoupon[] // 이 줄이 나눠 가진 쿠폰 할인
 
   @@unique([orderId, lineNo])
   @@unique([orderId, skuId]) // ★ 같은 SKU 두 줄 금지 (예약과 1:1로 짝짓는 근거)
@@ -2074,6 +2082,8 @@ enum NotificationType {
   RESTOCK_ARRIVED // 재입고됨
   RETURN_UPDATE // 반품 진행 (승인·회수·검수·환불·거절)
   REORDER_NEEDED // (관리자) 재주문 필요
+  COUPON_ISSUED // 쿠폰 발급 (가입·생일·등급·관리자 지급)
+  COUPON_EXPIRING // 쿠폰 만료 임박 (7일 전)
 }
 
 enum NotificationChannel {
@@ -2349,5 +2359,249 @@ model ReturnItem {
   ledgers       InventoryLedger[]
 
   @@unique([returnRequestId, orderItemId])
+  @@index([orderItemId])
+}
+
+// =====================================================================
+// ⑬ 쿠폰 (B안: 정책 · 발급 · 사용 분리)
+//
+//   CouponPolicy ── 어떤 쿠폰인가 (종류·할인·조건·발급 방식·사용 기간)
+//    ├─ CouponPolicyTarget  적용 대상 (할인 행사와 같은 방식: 전체/카테고리/시즌/성별/상품, 포함·제외)
+//    ├─ CouponPolicyGrade   받을 수 있는 등급 (없으면 전원)
+//    ├─ CouponCode          입력 코드 ("WELCOME2026")
+//    └─ CustomerCoupon      고객이 가진 1장 (쿠폰번호, 사용 기간은 발급 때 복사)
+//         ├─ CustomerCouponHistory  상태 이력 (트리거가 기록)
+//         └─ OrderCoupon            주문에 쓴 기록: 예약(RESERVED) → 사용(APPLIED) / 해제(RELEASED) / 결제 후 취소(CANCELED)
+//              └─ OrderItemCoupon   상품 줄별 할인 배분 (합계 = OrderItem.couponAllocated)
+//
+// ★ 쿠폰도 재고처럼: 주문을 만들 때 "예약", 결제되면 "사용", 결제 안 되면 바로 "복원".
+//   앱은 쿠폰 상태를 직접 바꾸지 않습니다. 주문 상태가 바뀌면 트리거가 OrderCoupon → CustomerCoupon 순서로 바꿈.
+// =====================================================================
+
+enum CouponKind {
+  PRODUCT // 상품 쿠폰: 상품 줄 1개에 1장
+  ORDER // 장바구니 쿠폰: 주문당 1장, 대상 상품 금액 전체에
+  SHIPPING // 배송비 쿠폰: 주문당 1장, 기본 배송비만 (제주·도서산간 추가 배송비는 할인 안 함)
+}
+
+enum CouponDiscountType {
+  RATE // 정률 N% (10원 미만 버림)
+  AMOUNT // 정액 N원
+  FREE_SHIPPING // 기본 배송비 전액 (배송비 쿠폰만)
+}
+
+enum CouponIssueMethod {
+  DOWNLOAD // 고객이 [쿠폰 받기]
+  AUTO // 조건이 되면 자동 (가입·생일·등급)
+  CODE // 코드 입력
+  ADMIN // 관리자 지급만 (CS 보상 등)
+}
+
+enum CouponAutoTrigger {
+  SIGNUP // 가입 축하
+  BIRTHDAY // 생일 월 (해마다 1장)
+  GRADE_MONTHLY // 등급 혜택 (매월 1장)
+}
+
+// 정책 상태. 활성화 후에는 할인 규칙을 바꿀 수 없음 (이미 받은 고객과 약속이 달라지므로)
+enum CouponPolicyStatus {
+  DRAFT // 작성 중 (대상·등급 편집 가능)
+  ACTIVE // 발급·사용 가능
+  PAUSED // 긴급 중지: 발급·사용 모두 멈춤 (잘못 만든 쿠폰 등)
+  ENDED // 발급 종료 (이미 받은 쿠폰은 사용 기간까지 사용 가능)
+}
+
+enum CustomerCouponStatus {
+  AVAILABLE // 사용 가능
+  IN_USE // 결제 대기 주문에 예약됨
+  USED // 결제 완료 주문에 사용됨
+  EXPIRED // 기간 만료 (또는 취소로 돌아왔는데 기간이 지남)
+  REVOKED // 회수 (탈퇴·관리자)
+}
+
+enum OrderCouponStatus {
+  RESERVED // 결제 대기 주문에 예약
+  APPLIED // 결제 완료 → 사용
+  RELEASED // 결제 안 됨(이탈·만료·대체) → 쿠폰 돌려줌
+  CANCELED // 결제 후 전체 취소 → 기간이 남았으면 돌려줌, 지났으면 소멸
+}
+
+model CouponPolicy {
+  id          Int     @id @default(autoincrement())
+  code        String  @unique // WELCOME_10 (내부 관리 코드)
+  name        String // 관리자용 이름
+  displayName String // 고객에게 보이는 이름 "신규가입 10% 할인"
+  description String? // 유의 사항 (고객 표시)
+
+  kind              CouponKind
+  discountType      CouponDiscountType
+  discountValue     Int // RATE: 10(%) / AMOUNT: 5000(원) / FREE_SHIPPING: 0
+  maxDiscountAmount Int? // 정률 최대 할인 (원)
+  minOrderAmount    Int     @default(0) // 최소 구매 금액: 상품 쿠폰 = 그 상품 줄, 장바구니 = 대상 상품 합계, 배송비 = 상품 합계 (모두 판매가 기준)
+  applyToSaleItems  Boolean @default(true) // 할인 행사 중인 상품에도 적용 (false면 행사 상품 제외)
+
+  issueMethod      CouponIssueMethod
+  autoTrigger      CouponAutoTrigger? // AUTO일 때만
+  issueStartAt     DateTime // 발급 기간 (이 시각부터)
+  issueEndAt       DateTime // 이 시각 직전까지
+  totalQuantity    Int? // 선착순 총 수량 (null = 무제한)
+  issuedCount      Int     @default(0) // 발급된 수 (트리거가 관리)
+  perCustomerLimit Int? // 1인당 평생 발급 한도 (생일·등급처럼 주기적인 쿠폰은 null + 주기별 1장)
+
+  // 사용 기간: 고정(useStartAt~useEndAt) 또는 발급일부터 N일 (발급일 포함 N일째 23:59:59 KST까지)
+  useStartAt DateTime?
+  useEndAt   DateTime?
+  validDays  Int?
+
+  status          CouponPolicyStatus @default(DRAFT)
+  statusChangedAt DateTime
+  createdBy       String
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  targets CouponPolicyTarget[]
+  grades  CouponPolicyGrade[]
+  codes   CouponCode[]
+  issued  CustomerCoupon[]
+
+  @@index([status, issueMethod])
+}
+
+// 적용 대상 (상품·장바구니 쿠폰). 할인 행사의 대상(PricePromotionTarget)과 같은 규칙: 제외가 포함보다 우선, 카테고리는 하위 포함
+model CouponPolicyTarget {
+  id         Int                 @id @default(autoincrement())
+  policyId   Int
+  targetType PromotionTargetType
+  mode       TargetMode          @default(INCLUDE)
+  categoryId Int?
+  seasonId   Int?
+  gender     Gender?
+  styleId    Int?
+  createdAt  DateTime            @default(now())
+
+  policy   CouponPolicy @relation(fields: [policyId], references: [id], onDelete: Restrict)
+  category Category?    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  season   Season?      @relation(fields: [seasonId], references: [id], onDelete: Restrict)
+  style    Style?       @relation(fields: [styleId], references: [id], onDelete: Restrict)
+
+  @@index([policyId])
+}
+
+// 받을 수 있는 등급 (행이 없으면 전원)
+model CouponPolicyGrade {
+  policyId Int
+  gradeId  Int
+
+  policy CouponPolicy  @relation(fields: [policyId], references: [id], onDelete: Restrict)
+  grade  CustomerGrade @relation(fields: [gradeId], references: [id], onDelete: Restrict)
+
+  @@id([policyId, gradeId])
+}
+
+// 입력 코드 (공용 코드: 여러 고객이 같은 코드, 1인 한도는 정책의 perCustomerLimit)
+model CouponCode {
+  id        Int      @id @default(autoincrement())
+  policyId  Int
+  code      String   @unique // 대문자·숫자 4~20자 (입력은 대소문자 구분 없이 대문자로 바꿔 찾음)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  policy CouponPolicy     @relation(fields: [policyId], references: [id], onDelete: Restrict)
+  issued CustomerCoupon[]
+}
+
+// 쿠폰 코드 입력 시도 (무차별 대입 방지: 1시간에 10번 틀리면 막음). 추가만
+model CouponCodeAttempt {
+  id         Int      @id @default(autoincrement())
+  customerId Int
+  success    Boolean
+  createdAt  DateTime @default(now())
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  @@index([customerId, createdAt])
+}
+
+// 고객이 가진 쿠폰 1장. 사용 기간은 발급 때 정해져 바뀌지 않음
+model CustomerCoupon {
+  id           Int               @id @default(autoincrement())
+  couponNo     String            @unique // CP + 대문자·숫자 10자 (고객·CS 안내용)
+  policyId     Int
+  customerId   Int
+  issueMethod  CouponIssueMethod // 이 장을 받은 방법 (정책 방식 또는 ADMIN)
+  couponCodeId Int? // 코드로 받았으면
+  issueKey     String? // 주기 발급 중복 방지 (BIRTHDAY:2026, GRADE:202611, SIGNUP)
+  issuedBy     String // CUSTOMER / SYSTEM / ADMIN:아이디
+  issuedAt     DateTime
+  validFrom    DateTime
+  validTo      DateTime // 이 시각 직전까지 사용 가능
+
+  status           CustomerCouponStatus @default(AVAILABLE)
+  statusChangedAt  DateTime
+  statusReason     String? // 회수·만료 사유
+  expiryNotifiedAt DateTime? // 만료 임박 안내 보낸 시각
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  policy   CouponPolicy            @relation(fields: [policyId], references: [id], onDelete: Restrict)
+  customer Customer                @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  code     CouponCode?             @relation(fields: [couponCodeId], references: [id], onDelete: Restrict)
+  history  CustomerCouponHistory[]
+  uses     OrderCoupon[]
+
+  @@unique([policyId, customerId, issueKey])
+  @@index([customerId, status, validTo])
+  @@index([status, validTo])
+}
+
+// 쿠폰 상태 이력 (트리거가 기록, 추가만)
+model CustomerCouponHistory {
+  id               Int                   @id @default(autoincrement())
+  customerCouponId Int
+  fromStatus       CustomerCouponStatus?
+  toStatus         CustomerCouponStatus
+  orderId          Int? // 주문 때문에 바뀌었으면
+  reason           String?
+  changedAt        DateTime
+
+  customerCoupon CustomerCoupon @relation(fields: [customerCouponId], references: [id], onDelete: Restrict)
+
+  @@index([customerCouponId])
+}
+
+// 주문에 쓴 쿠폰 (쿠폰 1장이 여러 주문에 걸칠 수 있음: 이탈로 돌려받은 뒤 다시 쓰면. 살아 있는 것은 1개)
+model OrderCoupon {
+  id               Int               @id @default(autoincrement())
+  orderId          Int
+  customerCouponId Int
+  kind             CouponKind // 정책 종류 복사 (주문당 장바구니·배송비 1장 검사용)
+  couponName       String // 표시 이름 스냅샷
+  discountAmount   Int // 이 쿠폰의 할인액 (상품·장바구니 = 줄 배분 합계, 배송비 = 배송비 할인)
+  status           OrderCouponStatus @default(RESERVED)
+  appliedAt        DateTime?
+  releasedAt       DateTime?
+  canceledAt       DateTime?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  order          Order             @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  customerCoupon CustomerCoupon    @relation(fields: [customerCouponId], references: [id], onDelete: Restrict)
+  items          OrderItemCoupon[]
+
+  @@index([orderId])
+  @@index([customerCouponId])
+}
+
+// 상품 줄별 쿠폰 할인 배분 (반품 환불 기준). 상품 쿠폰은 줄 1개, 장바구니 쿠폰은 대상 줄 전부에 금액 비율로
+model OrderItemCoupon {
+  id            Int @id @default(autoincrement())
+  orderCouponId Int
+  orderItemId   Int
+  amount        Int
+
+  orderCoupon OrderCoupon @relation(fields: [orderCouponId], references: [id], onDelete: Restrict)
+  orderItem   OrderItem   @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+
+  @@unique([orderCouponId, orderItemId])
   @@index([orderItemId])
 }

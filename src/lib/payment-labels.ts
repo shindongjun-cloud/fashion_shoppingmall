@@ -62,6 +62,7 @@ const FAIL_MESSAGES: Record<string, string> = {
   NOT_FOUND_PAYMENT_SESSION: "결제 시간(10분)이 지났어요. 다시 결제해 주세요. 결제된 금액은 없어요.",
   PROVIDER_ERROR: "결제사에 일시적인 문제가 있어요. 잠시 후 다시 시도해 주세요.",
   OUT_OF_STOCK: "결제를 기다리는 동안 재고가 소진되었어요. 결제는 진행되지 않았어요.",
+  COUPON_UNAVAILABLE: "주문에 쓴 쿠폰이 사용 중지되어 결제를 진행하지 않았어요. 쿠폰은 돌려드렸어요. 다시 주문해 주세요.",
   AMOUNT_MISMATCH: "결제 금액이 주문 금액과 달라 결제를 중단했어요. 결제된 금액은 없어요.",
   ORDER_NOT_FOUND: "주문을 찾을 수 없어요.",
   GUEST_SESSION_EXPIRED: "비회원 주문 확인 시간(1시간)이 지났거나 주문한 브라우저가 아니어서 결제를 마치지 않았어요. 돈은 빠져나가지 않았어요. 다시 주문해 주세요.",

@@ -20,6 +20,10 @@ import { getPrices } from "@/lib/pricing";
 import { getAvailability } from "@/lib/inventory";
 import { restockDates } from "@/lib/restock";
 import { getCurrentCustomer } from "@/lib/current-customer";
+import { downloadableCouponsFor } from "@/lib/coupon";
+import { COUPON_KIND_LABEL, COUPON_NOTICE, isCouponNoticeCode } from "@/lib/coupon-rules";
+import { downloadCouponAction } from "@/app/coupons/actions";
+import { loginPath } from "@/lib/safe-redirect";
 
 export const dynamic = "force-dynamic";
 
@@ -47,7 +51,7 @@ export default async function ProductPage({
   searchParams,
 }: PageProps<"/products/[code]">) {
   const { code } = await params;
-  const { color: colorParam, restock: restockParam } = await searchParams;
+  const { color: colorParam, restock: restockParam, coupon: couponParam } = await searchParams;
 
   const style = await prisma.style.findFirst({
     where: { styleCode: code, ...sellableStyleWhere() },
@@ -95,10 +99,12 @@ export default async function ProductPage({
   // 품절 사이즈의 재입고 예정일 + 내 재입고 알림 신청 여부
   const selectedSkuIds = selected.skus.map((k) => k.id);
   const customer = await getCurrentCustomer();
-  const [restock, mySubs] = await Promise.all([
+  const [restock, mySubs, coupons] = await Promise.all([
     restockDates(selectedSkuIds),
     customer ? prisma.restockSubscription.findMany({ where: { customerId: customer.id, skuId: { in: selectedSkuIds }, status: { in: ["WAITING", "SCHEDULED"] } }, select: { skuId: true } }) : [],
+    downloadableCouponsFor(style.id, customer?.id ?? null, price.discountAmount > 0),
   ]);
+  const couponNotice = isCouponNoticeCode(couponParam) ? COUPON_NOTICE[couponParam] : null;
   const subscribedIds = new Set(mySubs.map((x) => x.skuId));
   const back = `/products/${style.styleCode}?color=${selected.color.code}`;
   const restockNotice = restockParam === "ok" ? "재입고 알림을 신청했어요. 일정이 정해지거나 입고되면 알림함으로 알려 드려요." : restockParam === "instock" ? "지금 구매할 수 있는 상품이에요. 사이즈를 다시 골라 주세요." : undefined;
@@ -187,6 +193,38 @@ export default async function ProductPage({
                 </span>
               )}
             </p>
+          )}
+
+          {/* 이 상품에 쓸 수 있는 쿠폰 받기 (상품·장바구니 다운로드 쿠폰) */}
+          {coupons.length > 0 && (
+            <div className="mt-3 rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm">
+              {couponNotice && <p className="mb-2 text-xs font-medium text-blue-800">{couponNotice}</p>}
+              <ul className="space-y-2">
+                {coupons.map((c) => (
+                  <li key={c.policyId} className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-gray-800">
+                      <span className="mr-1 text-xs text-blue-700">{COUPON_KIND_LABEL[c.kind]}</span>
+                      {c.name} <span className="text-xs text-gray-500">· {c.benefit}{c.remaining !== null ? ` · 남은 수량 ${c.remaining}장` : ""}</span>
+                    </span>
+                    {c.received ? (
+                      <span className="text-xs text-gray-500">받음 ✓</span>
+                    ) : c.soldOut ? (
+                      <span className="text-xs text-gray-400">소진</span>
+                    ) : customer ? (
+                      <form action={downloadCouponAction}>
+                        <input type="hidden" name="policyId" value={c.policyId} />
+                        <input type="hidden" name="back" value={back} />
+                        <button className="rounded-lg border border-blue-600 px-3 py-1 text-xs font-medium text-blue-700 hover:bg-blue-100">쿠폰 받기</button>
+                      </form>
+                    ) : (
+                      <Link href={loginPath(back)} className="text-xs text-blue-700 underline">
+                        로그인하고 받기
+                      </Link>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
 
           {(style.preorderShipDate || style.maxQtyPerOrder) && (

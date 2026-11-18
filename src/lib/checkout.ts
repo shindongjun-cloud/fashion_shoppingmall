@@ -11,6 +11,8 @@ import { blindIndex, decrypt, encrypt, encryptOrNull, normalizeEmail, normalizeP
 import { InsufficientStockError, isBusyError, isConstraintError, releaseOrder, reserveOrder, withBusyRetry } from "@/lib/inventory";
 import { computeShipping, currentShippingPolicy, findZone, generateOrderNo, OrderError, orderStatusData, type ShippingQuote } from "@/lib/order-rules";
 import { createGuestSession, GUEST_PRIVACY_VERSION, guestPasswordProblem, hashGuestPassword } from "@/lib/guest";
+import { couponOptionsFor, reserveOrderCoupons } from "@/lib/coupon";
+import { applyCoupon, type CouponApplied, type CouponOption } from "@/lib/coupon-rules";
 
 export type PlaceOrderResult =
   | { paymentOrderId: string; orderNo: string; orderName: string; amount: number }
@@ -29,6 +31,8 @@ export type PlaceOrderOptions = {
   /** 배송지(주소록 id). 없으면 기본 배송지 */
   addressId?: number;
   channel?: OrderChannel;
+  /** 결제 화면에서 고른 쿠폰 1장 (CustomerCoupon id, 없으면 쿠폰 없이). 금액은 서버가 다시 계산 */
+  couponId?: number | null;
 };
 
 // ---------------------------------------------------------------
@@ -44,6 +48,8 @@ type Prepared = {
   shipping: ShippingQuote;
   amount: number;
   orderName: string;
+  /** 쿠폰 (회원만) */
+  coupons: { applied: CouponApplied; options: CouponOption[] } | null;
 };
 
 async function prepare(items: CartLine[], zipCode: string, now: Date): Promise<Prepared | { error: string }> {
@@ -96,7 +102,28 @@ async function prepare(items: CartLine[], zipCode: string, now: Date): Promise<P
     shipping,
     amount: itemsTotal + shipping.fee,
     orderName: lines.length > 1 ? `${firstName} 외 ${lines.length - 1}건` : firstName,
+    coupons: null,
   };
+}
+
+/** 고른 쿠폰을 서버에서 다시 계산해 금액에 반영 (내 쿠폰인지·대상인지·조건은 DB에서 다시 읽어 판단) */
+async function withCoupons(p: Prepared, customerId: number, couponId: number | null | undefined, now: Date): Promise<Prepared | { error: string }> {
+  if (couponId === undefined || couponId === null) return p;
+  // 쿠폰은 주문당 1장 (브라우저에서 온 값이므로 형식부터 검사)
+  if (!Number.isInteger(couponId) || couponId < 1) return { error: "쿠폰 선택 정보가 올바르지 않아요. 새로고침해 주세요." };
+  const options = await couponOptionsFor(customerId, p.skus.map((s) => ({ id: s.id, discountAmount: s.discountAmount })), now);
+  // 내 "지금 쓸 수 있는 쿠폰"에 없음 = 만료·사용됨·다른 결제에서 사용 중·남의 쿠폰 (조건 미달과 구분해서 안내)
+  if (!options.some((o) => o.id === couponId)) return { error: "선택한 쿠폰을 지금 쓸 수 없어요. 만료됐거나 다른 주문에서 쓰였을 수 있어요. 새로고침해 주세요." };
+  const applied = applyCoupon(
+    p.lines.map(({ sku }, i) => ({ skuId: sku.id, lineTotal: p.lineAmounts[i].lineTotal })),
+    p.shipping.baseFee,
+    options,
+    couponId,
+  );
+  if ("error" in applied) return { error: `${applied.error} 다른 쿠폰을 고르거나 쿠폰 없이 결제해 주세요.` };
+  const amount = p.itemsTotal - applied.couponDiscountTotal + p.shipping.fee - applied.shippingDiscount;
+  if (amount < 1) return { error: "쿠폰 할인 후 결제 금액이 0원이 되어 주문할 수 없어요." };
+  return { ...p, amount, coupons: { applied, options } };
 }
 
 type AddressSnapshot = {
@@ -130,6 +157,8 @@ async function insertOrder(
       itemsListTotal: p.itemsListTotal,
       itemsDiscountTotal: p.itemsDiscountTotal,
       itemsTotal: p.itemsTotal,
+      couponDiscountTotal: p.coupons?.applied.couponDiscountTotal ?? 0,
+      shippingDiscount: p.coupons?.applied.shippingDiscount ?? 0,
       shippingBaseFee: p.shipping.baseFee,
       shippingExtraFee: p.shipping.extraFee,
       shippingFee: p.shipping.fee,
@@ -149,7 +178,8 @@ async function insertOrder(
           promotionId: sku.promotionId,
           promotionName: sku.promotionName,
           ...p.lineAmounts[i],
-          payAmount: p.lineAmounts[i].lineTotal,
+          couponAllocated: p.coupons?.applied.lineCouponAllocated[i] ?? 0,
+          payAmount: p.lineAmounts[i].lineTotal - (p.coupons?.applied.lineCouponAllocated[i] ?? 0),
           styleCode: sku.styleCode,
           skuCode: sku.skuCode,
           styleName: sku.styleName,
@@ -162,8 +192,10 @@ async function insertOrder(
         })),
       },
     },
-    include: { items: { select: { id: true, skuId: true, quantity: true } } },
+    include: { items: { select: { id: true, skuId: true, quantity: true }, orderBy: { lineNo: "asc" } } },
   });
+  // 쿠폰 예약 (주문 쿠폰 + 줄별 배분). 같은 쿠폰이 다른 주문에서 쓰이는 중이면 DB가 거부 → 트랜잭션 전체 취소
+  if (p.coupons) await reserveOrderCoupons(tx, order.id, order.items, p.coupons.applied, p.coupons.options, now);
   await tx.orderShippingAddress.create({ data: { orderId: order.id, ...o.address, region: o.region, createdAt: now } });
   // 재고 예약: 하나라도 부족하면 예외 → 트랜잭션 전체 취소 (주문도 안 만들어짐)
   await reserveOrder(tx, order.id, order.items.map((i) => ({ orderItemId: i.id, skuId: i.skuId, qty: i.quantity })), now);
@@ -186,6 +218,8 @@ async function withNewOrderNo<T>(now: Date, fn: (orderNo: string) => Promise<T>)
 function friendlyOrderError(e: unknown, skus: CartSku[]): { error: string } {
   if (isConstraintError(e, "Order_customer_active")) return { error: "주문할 수 없는 회원 상태예요. (탈퇴 신청·정지·휴면 회원)" };
   if (isConstraintError(e, "Order_shipping_rule")) return { error: "배송비 규칙이 바뀌었어요. 새로고침해서 금액을 다시 확인해 주세요." };
+  if (isConstraintError(e, "OrderCoupon_coupon_unavailable")) return { error: "선택한 쿠폰을 지금 쓸 수 없어요. 다른 결제(탭)에서 사용 중이거나 이미 사용·만료됐어요. 새로고침해 주세요." };
+  if (isConstraintError(e, "OrderCoupon_") || isConstraintError(e, "OrderItemCoupon_")) return { error: "쿠폰 사용 조건이 바뀌었어요. 새로고침해서 쿠폰을 다시 골라 주세요." };
   if (isBusyError(e)) return { error: "주문이 몰려 처리하지 못했어요. 잠시 후 다시 시도해 주세요." };
   if (e instanceof InsufficientStockError) {
     const sku = skus.find((s) => s.id === e.skuId)!;
@@ -208,7 +242,9 @@ export async function placeOrder(customerId: number, items: CartLine[], now = ne
   if (!address) {
     return { error: options.addressId !== undefined ? "선택한 배송지를 찾을 수 없어요. 다시 선택해 주세요." : "배송지를 먼저 등록해 주세요. (내 정보 > 배송지)" };
   }
-  const p = await prepare(items, address.zipCode, now);
+  const prepared = await prepare(items, address.zipCode, now);
+  if ("error" in prepared) return prepared;
+  const p = await withCoupons(prepared, customerId, options.couponId, now);
   if ("error" in p) return p;
   const paymentOrderId = `order_${randomUUID()}`;
 

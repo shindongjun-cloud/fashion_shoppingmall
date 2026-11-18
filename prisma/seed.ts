@@ -812,11 +812,35 @@ async function openSales() {
   if (opened.count > 0) console.log(`스타일 ${opened.count}개 판매를 시작했습니다.`);
 }
 
+// ⑬ 쿠폰 샘플 (지금 시각 기준). 쿠폰 정책이 하나라도 있으면 건너뜀
+async function seedCoupons() {
+  if ((await prisma.couponPolicy.count()) > 0) {
+    console.log("쿠폰 정책이 이미 있어 쿠폰 시드는 건너뜁니다.");
+    return;
+  }
+  const { createCouponPolicy } = await import("../src/lib/coupon");
+  const now = new Date();
+  const day = 24 * 60 * 60 * 1000;
+  const from = new Date(now.getTime() - day);
+  const yearLater = new Date(now.getTime() + 365 * day);
+  const knit = await prisma.category.findUniqueOrThrow({ where: { code: "TOP_KNIT" } });
+  const base = { issueStartAt: from, issueEndAt: yearLater, by: "SEED", activate: true };
+  await createCouponPolicy({ ...base, code: "WELCOME_10", name: "가입 축하 10%", displayName: "신규가입 10% 할인", description: "3만원 이상 구매 시, 최대 1만원", kind: "ORDER", discountType: "RATE", discountValue: 10, maxDiscountAmount: 10000, minOrderAmount: 30000, issueMethod: "AUTO", autoTrigger: "SIGNUP", perCustomerLimit: 1, validDays: 30, targets: [{ targetType: "ALL" }] }, now);
+  await createCouponPolicy({ ...base, code: "KNIT_15", name: "니트 상품 쿠폰", displayName: "니트 15% 쿠폰", description: "니트 카테고리 상품 1개에 사용, 최대 2만원", kind: "PRODUCT", discountType: "RATE", discountValue: 15, maxDiscountAmount: 20000, issueMethod: "DOWNLOAD", totalQuantity: 100, perCustomerLimit: 1, validDays: 14, targets: [{ targetType: "CATEGORY", categoryId: knit.id }] }, now);
+  await createCouponPolicy({ ...base, code: "CART_5000", name: "5만원 이상 5천원", displayName: "5만원 이상 5,000원 할인", description: "5만원 이상 구매 시 (할인 행사 상품 포함)", kind: "ORDER", discountType: "AMOUNT", discountValue: 5000, minOrderAmount: 50000, issueMethod: "DOWNLOAD", perCustomerLimit: 1, validDays: 7, targets: [{ targetType: "ALL" }] }, now);
+  await createCouponPolicy({ ...base, code: "FREE_SHIP", name: "무료배송 쿠폰", displayName: "무료배송", description: "기본 배송비 무료 (제주·도서산간 추가 배송비 제외)", kind: "SHIPPING", discountType: "FREE_SHIPPING", discountValue: 0, issueMethod: "DOWNLOAD", perCustomerLimit: 1, validDays: 30 }, now);
+  await createCouponPolicy({ ...base, code: "BIRTHDAY_15", name: "생일 쿠폰", displayName: "생일 축하 15% 할인", description: "5만원 이상 구매 시, 최대 2만원", kind: "ORDER", discountType: "RATE", discountValue: 15, maxDiscountAmount: 20000, minOrderAmount: 50000, issueMethod: "AUTO", autoTrigger: "BIRTHDAY", perCustomerLimit: null, validDays: 30, targets: [{ targetType: "ALL" }] }, now);
+  await createCouponPolicy({ ...base, code: "GOLD_MONTHLY", name: "GOLD·VIP 월간 쿠폰", displayName: "GOLD 이상 월간 1만원", description: "10만원 이상 구매 시", kind: "ORDER", discountType: "AMOUNT", discountValue: 10000, minOrderAmount: 100000, issueMethod: "AUTO", autoTrigger: "GRADE_MONTHLY", perCustomerLimit: null, validDays: 30, targets: [{ targetType: "ALL" }], gradeCodes: ["GOLD", "VIP"] }, now);
+  await createCouponPolicy({ ...base, code: "CODE_WELCOME", name: "코드 쿠폰 (오픈 기념)", displayName: "오픈 기념 3,000원", description: "3만원 이상 구매 시 (코드 WELCOME2026)", kind: "ORDER", discountType: "AMOUNT", discountValue: 3000, minOrderAmount: 30000, issueMethod: "CODE", perCustomerLimit: 1, issueEndAt: new Date(now.getTime() + 30 * day), useStartAt: from, useEndAt: new Date(now.getTime() + 60 * day), targets: [{ targetType: "ALL" }], codes: ["WELCOME2026"] }, now);
+  console.log("쿠폰 정책 7개를 추가했습니다.");
+}
+
 async function main() {
   await seedProducts();
   await seedPricing(); // 정가가 있어야 판매를 시작할 수 있으므로 가격이 먼저
   await seedInventory();
   await openSales();
+  await seedCoupons();
 }
 
 main()

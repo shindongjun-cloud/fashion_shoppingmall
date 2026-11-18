@@ -14,6 +14,7 @@ import { createHash, randomUUID } from "crypto";
 import type { Order, Payment, PaymentActor, PaymentCancelReason, PaymentMethod, PaymentStatusSource, Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
 import { blindIndex, decrypt, encrypt, maskAccountNumber, maskName } from "@/lib/crypto";
+import { pausedCouponsOf } from "@/lib/coupon";
 import { allocateOrder, ensureOrderReserved, ensureReservedTx, InsufficientStockError, isConstraintError, releaseAllocated, releaseOrder, withBusyRetry } from "@/lib/inventory";
 import { orderStatusData, ownerRef, ownsOrder, toOwner, type OwnerArg } from "@/lib/order-rules";
 import { markRestockPurchased } from "@/lib/restock";
@@ -542,6 +543,13 @@ export async function confirmOrderPayment(input: ConfirmInput, deps: PaymentDeps
     await markAborted(payment.id, "OUT_OF_STOCK", reserved.message, "CONFIRM", now);
     await closeOrderIfNoLivePayment(order.id, "CANCELED", "PAYMENT_FAILED", now);
     return { kind: "FAILED", code: "OUT_OF_STOCK", orderId: order.id };
+  }
+  // ④-2 쿠폰 확인: 주문 뒤에 쿠폰이 긴급 중지(잘못 만든 쿠폰 등)됐으면 토스를 부르지 않음 → 주문 취소로 쿠폰은 자동 복원
+  const paused = await pausedCouponsOf(order.id);
+  if (paused.length > 0) {
+    await markAborted(payment.id, "COUPON_UNAVAILABLE", `사용 중지된 쿠폰: ${paused.map((c) => c.couponName).join(", ")}`, "CONFIRM", now);
+    await closeOrderIfNoLivePayment(order.id, "CANCELED", "PAYMENT_FAILED", now);
+    return { kind: "FAILED", code: "COUPON_UNAVAILABLE", orderId: order.id };
   }
 
   // ⑤ 토스 승인 → ⑥⑦

@@ -16,14 +16,15 @@ async function channel() {
   return /Mobi|Android|iPhone|iPad/i.test(ua) ? ("MOBILE_WEB" as const) : ("WEB" as const);
 }
 
-// 회원 주문 생성 + 배송지 스냅샷 + 재고 예약
+// 회원 주문 생성 + 배송지 스냅샷 + 쿠폰 예약 + 재고 예약
 // addressId: 주문서에서 고른 배송지 (내 주소록인지는 placeOrder가 확인. 없으면 기본 배송지)
-export async function createOrder(items: CartItem[], addressId?: number): Promise<PlaceOrderResult> {
+// couponId: 고른 쿠폰 1장 (주문당 1장. 내 쿠폰인지·대상·조건·금액은 placeOrder가 DB로 다시 계산)
+export async function createOrder(items: CartItem[], addressId?: number, couponId?: number | null): Promise<PlaceOrderResult> {
   const customer = await getCurrentCustomer();
   if (!customer) {
     return { error: "로그인이 필요해요." };
   }
-  return placeOrder(customer.id, items, new Date(), { addressId: typeof addressId === "number" ? addressId : undefined, channel: await channel() });
+  return placeOrder(customer.id, items, new Date(), { addressId: typeof addressId === "number" ? addressId : undefined, channel: await channel(), couponId: typeof couponId === "number" ? couponId : null });
 }
 
 // 비회원 주문 생성: 주문자·배송지 직접 입력 + 주문 비밀번호 + 개인정보 동의 → 출입증 쿠키(결제창에서 돌아올 때 주인 확인)

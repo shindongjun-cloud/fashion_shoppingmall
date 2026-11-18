@@ -43,6 +43,7 @@ export default async function OrderDetailView({
       shippingPolicy: true,
       statusHistory: { orderBy: { id: "asc" } },
       returns: { orderBy: { id: "desc" }, include: { items: { include: { orderItem: true } }, pickupCourier: true } },
+      coupons: { orderBy: { id: "asc" } },
     },
   });
   if (!order || !ownsOrder(owner, order)) notFound();
@@ -156,7 +157,7 @@ export default async function OrderDetailView({
       {/* 금액 구성 (주문 당시 값) */}
       <section className={box}>
         <h2 className="mb-2 font-bold text-gray-900">결제 금액</h2>
-        <OrderAmounts order={order} totalLabel={order.status === "WAITING_DEPOSIT" ? "입금할 금액" : "결제 금액"} />
+        <OrderAmounts order={order} coupons={order.coupons} totalLabel={order.status === "WAITING_DEPOSIT" ? "입금할 금액" : "결제 금액"} />
         {payment && (
           <div className="mt-3 border-t border-gray-100 pt-3">
             <PaymentSummary view={toPaymentView(payment)} orderStatus={order.status} />

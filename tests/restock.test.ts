@@ -60,7 +60,9 @@ async function setAvailable(code: string, n: number) {
     recordMovement(tx, { skuId: id(code), locationId: dc, type: diff > 0 ? "INBOUND" : "ADJUST_OUT", qty: diff, refType: diff > 0 ? "INBOUND_ORDER" : "STOCK_COUNT", refId: "TEST", reason: "테스트 준비" }),
   );
 }
-const notificationsOf = (customerId: number) => prisma.notification.findMany({ where: { customerId }, orderBy: { id: "asc" } });
+// 재입고 알림만 (새 회원은 가입 축하 쿠폰 알림도 받으므로 종류로 거름)
+const notificationsOf = (customerId: number) =>
+  prisma.notification.findMany({ where: { customerId, type: { in: ["RESTOCK_SCHEDULED", "RESTOCK_RESCHEDULED", "RESTOCK_CANCELED", "RESTOCK_ARRIVED"] } }, orderBy: { id: "asc" } });
 const subOf = (customerId: number, code: string) => prisma.restockSubscription.findFirstOrThrow({ where: { customerId, skuId: id(code) }, orderBy: { id: "desc" } });
 const day = (offset: number) => new Date(Date.now() + offset * DAY).toISOString().slice(0, 10);
 

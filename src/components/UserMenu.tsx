@@ -30,10 +30,14 @@ export default async function UserMenu() {
   const unread = customer ? await unreadCount(customer.id) : 0;
 
   return (
-    <div className="flex items-center gap-3">
+    <div className="flex items-center gap-4">
       <Link href="/my/notifications" className="relative text-gray-700 hover:text-gray-900">
         알림
         {unread > 0 && <span className="absolute -right-3 -top-2 rounded-full bg-red-500 px-1.5 text-xs text-white">{unread > 99 ? "99+" : unread}</span>}
+      </Link>
+      {/* 휴대폰에서는 자리가 좁아 숨김 (내 정보 화면에서 쿠폰함으로 이동) */}
+      <Link href="/my/coupons" className="hidden text-gray-700 hover:text-gray-900 sm:inline">
+        쿠폰
       </Link>
       <Link href="/orders" className="text-gray-700 hover:text-gray-900">
         주문내역
