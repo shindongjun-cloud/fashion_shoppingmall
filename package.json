@@ -18,7 +18,9 @@
     "customer:jobs": "tsx scripts/customer-jobs.ts",
     "payments:jobs": "tsx scripts/payment-jobs.ts",
     "orders:ship": "tsx scripts/orders-ship.ts",
-    "orders:jobs": "tsx scripts/order-jobs.ts"
+    "orders:jobs": "tsx scripts/order-jobs.ts",
+    "inventory:ops": "tsx scripts/inventory-ops.ts",
+    "inventory:jobs": "tsx scripts/inventory-jobs.ts"
   },
   "dependencies": {
     "@auth/prisma-adapter": "^2.11.3",

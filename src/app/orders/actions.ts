@@ -13,6 +13,7 @@ import { getGuestOrderId } from "@/lib/current-owner";
 import { loginPath } from "@/lib/safe-redirect";
 import { cancelPaidOrder, changeOrderAddress, changeOrderAddressDirect, confirmPurchase, OrderError } from "@/lib/order";
 import { ORDER_NO_PATTERN, type OrderOwner } from "@/lib/order-rules";
+import { cancelReturn, requestReturn, ReturnError, type ReturnRequestInput } from "@/lib/returns";
 
 const text = (form: FormData, key: string) => {
   const v = form.get(key);
@@ -72,7 +73,7 @@ async function run(form: FormData, okNotice: string, work: (owner: OrderOwner, o
   try {
     await work(owner, orderNo);
   } catch (e) {
-    if (!(e instanceof OrderError)) throw e;
+    if (!(e instanceof OrderError) && !(e instanceof ReturnError)) throw e;
     target = await flashError(back, e.message);
   }
   revalidatePath("/orders");
@@ -103,3 +104,24 @@ export async function confirmPurchaseAction(form: FormData) {
   await run(form, "CONFIRMED", (owner, orderNo) => confirmPurchase(owner, orderNo, Number(text(form, "orderItemId"))));
 }
 
+
+/** 반품 신청 (배송 완료 상품, 사유별 기간·배송비는 lib/returns.ts) */
+export async function requestReturnAction(form: FormData) {
+  await run(form, "RETURN_REQUESTED", (owner, orderNo) => {
+    const bankCode = text(form, "bankCode");
+    const accountNumber = text(form, "accountNumber").replace(/[\s-]/g, "");
+    const holderName = text(form, "holderName");
+    if (bankCode && (!/^\d{6,20}$/.test(accountNumber) || !holderName || holderName.length > 30)) throw new ReturnError("환불 계좌(은행·숫자 계좌번호·예금주)를 정확히 입력해 주세요.");
+    return requestReturn(owner, orderNo, {
+      orderItemIds: form.getAll("orderItemId").map(Number).filter((n) => Number.isInteger(n) && n > 0),
+      reason: text(form, "reason") as ReturnRequestInput["reason"],
+      reasonText: text(form, "reasonText"),
+      refundAccount: bankCode ? { bankCode, accountNumber, holderName } : undefined,
+    });
+  });
+}
+
+/** 반품 철회 (회수 전) */
+export async function cancelReturnAction(form: FormData) {
+  await run(form, "RETURN_CANCELED", (owner) => cancelReturn(owner, text(form, "returnNo")));
+}

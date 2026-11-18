@@ -132,10 +132,10 @@ const RULES: [string, string, "error" | "warn"][] = [
      FROM "Order" o JOIN "OrderItem" i ON i."orderId" = o."id"
      LEFT JOIN "InventoryReservation" r ON r."orderItemId" = i."id" AND r."status" IN ('ALLOCATED', 'CONFIRMED')
      WHERE o."status" = 'PAID' AND i."status" <> 'CANCELED' GROUP BY i."id" HAVING COALESCE(SUM(r."qty"), 0) <> i."quantity"`, "error"],
-  ["재고: 출고된 상품만 재고가 확정(차감)됨, 출고 전 상품은 할당 상태",
+  ["재고: 출고된 상품만 재고가 확정(차감)됨 (반품 상품도 출고됐던 것), 출고 전 상품은 할당 상태",
     `SELECT o."orderNo", i."lineNo", i."status", r."status" AS reservation FROM "OrderItem" i JOIN "Order" o ON o."id" = i."orderId"
      JOIN "InventoryReservation" r ON r."orderItemId" = i."id" AND r."status" IN ('ALLOCATED', 'CONFIRMED')
-     WHERE (r."status" = 'CONFIRMED') <> (i."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED'))`, "error"],
+     WHERE (r."status" = 'CONFIRMED') <> (i."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED', 'RETURN_REQUESTED', 'RETURN_COLLECTING', 'RETURNED'))`, "error"],
   ["재고: 만료 시각이 지난 RESERVED 예약 없음 (만료 정리 필요: npm run inventory:release-expired)",
     `SELECT r."id" AS reservationId, r."expiresAt" AS expiresAt FROM "InventoryReservation" r WHERE r."status" = 'RESERVED' AND r."expiresAt" <= ${NOW}`, "warn"],
   ["재고: 판매 중인 SKU는 온라인 판매 위치에 잔고 행이 있음",
@@ -209,7 +209,7 @@ const RULES: [string, string, "error" | "warn"][] = [
   ["주문: 상품 상태가 주문(돈) 상태와 맞음 (결제 전 = 결제 대기, 취소·만료 = 취소, 결제 완료 = 결제 대기 없음)",
     `SELECT o."orderNo", o."status", i."lineNo", i."status" AS item FROM "Order" o JOIN "OrderItem" i ON i."orderId" = o."id"
      WHERE (o."status" IN ('PENDING', 'WAITING_DEPOSIT') AND i."status" <> 'AWAITING_PAYMENT')
-        OR (o."status" IN ('CANCELED', 'EXPIRED') AND i."status" <> 'CANCELED')
+        OR (o."status" IN ('CANCELED', 'EXPIRED') AND i."status" NOT IN ('CANCELED', 'RETURNED'))
         OR (o."status" = 'PAID' AND i."status" = 'AWAITING_PAYMENT')`, "error"],
   ["주문: 현재 상태 = 상태 이력의 마지막 상태 (주문·상품)",
     `SELECT 'order' AS kind, o."orderNo" AS ref, o."status" FROM "Order" o
@@ -239,6 +239,38 @@ const RULES: [string, string, "error" | "warn"][] = [
     `SELECT (SELECT count(*) FROM "GuestOrderSession" WHERE julianday(${NOW}) - julianday("expiresAt") > 1) AS sessions,
             (SELECT count(*) FROM "GuestLookupAttempt" WHERE julianday(${NOW}) - julianday("attemptedAt") > 91) AS attempts
      WHERE sessions > 0 OR attempts > 0`, "warn"],
+  // ----- 재고 보강: 발주·입고·재입고·반품
+  ["발주: 줄의 입고 수량 = 입고 전표 합계 (정상 + 불량)",
+    `SELECT l."id", l."qtyReceived", (SELECT COALESCE(SUM(r."qtyGood" + r."qtyDefect"), 0) FROM "InboundReceiptLine" r WHERE r."purchaseOrderLineId" = l."id") AS receipts
+     FROM "PurchaseOrderLine" l WHERE l."qtyReceived" <> (SELECT COALESCE(SUM(r."qtyGood" + r."qtyDefect"), 0) FROM "InboundReceiptLine" r WHERE r."purchaseOrderLineId" = l."id")`, "error"],
+  ["입고: 전표 줄의 정상·불량 수량 = 원장에 들어간 수량",
+    `SELECT r."id", r."qtyGood" + r."qtyDefect" AS qty, (SELECT COALESCE(SUM(l."qty"), 0) FROM "InventoryLedger" l WHERE l."inboundLineId" = r."id") AS ledger
+     FROM "InboundReceiptLine" r WHERE r."qtyGood" + r."qtyDefect" <> (SELECT COALESCE(SUM(l."qty"), 0) FROM "InventoryLedger" l WHERE l."inboundLineId" = r."id")`, "error"],
+  ["발주: 입고 완료 발주는 모든 줄이 다 들어왔거나 잔량 마감, 일부 입고는 받은 줄이 있음",
+    `SELECT p."poNo", p."status" FROM "PurchaseOrder" p WHERE p."status" = 'PARTIALLY_RECEIVED' AND NOT EXISTS (SELECT 1 FROM "PurchaseOrderLine" l WHERE l."purchaseOrderId" = p."id" AND l."qtyReceived" > 0)`, "error"],
+  ["반품: 반품센터 실재고 = 도착했지만 아직 검수하지 않은 반품 수량 (SKU별)",
+    `SELECT b."skuId", b."onHand", COALESCE(x.q, 0) AS pending FROM "InventoryBalance" b JOIN "InventoryLocation" loc ON loc."id" = b."locationId" AND loc."type" = 'RETURN_CENTER'
+     LEFT JOIN (SELECT i."skuId", SUM(ri."qty") AS q FROM "ReturnItem" ri JOIN "OrderItem" i ON i."id" = ri."orderItemId" JOIN "ReturnRequest" rr ON rr."id" = ri."returnRequestId"
+                WHERE rr."status" = 'RECEIVED' AND ri."inspection" IS NULL GROUP BY i."skuId") x ON x."skuId" = b."skuId"
+     WHERE b."onHand" <> COALESCE(x.q, 0)`, "error"],
+  ["반품: 검수 통과 상품은 반품 완료, 반품 불가는 다시 배송 완료(또는 구매확정)",
+    `SELECT ri."id", ri."inspection", i."status" FROM "ReturnItem" ri JOIN "OrderItem" i ON i."id" = ri."orderItemId"
+     WHERE (ri."inspection" IN ('RESELLABLE', 'DEFECTIVE') AND i."status" <> 'RETURNED') OR (ri."inspection" = 'NOT_RETURNABLE' AND i."status" NOT IN ('DELIVERED', 'CONFIRMED'))`, "error"],
+  ["반품: 완료된 반품의 환불액 = 연결된 결제 취소 금액",
+    `SELECT rr."returnNo", rr."refundAmount", c."cancelAmount" FROM "ReturnRequest" rr LEFT JOIN "PaymentCancel" c ON c."id" = rr."paymentCancelId"
+     WHERE rr."status" = 'COMPLETED' AND rr."refundAmount" > 0 AND (c."id" IS NULL OR c."status" <> 'DONE' OR c."cancelAmount" <> rr."refundAmount")`, "error"],
+  ["반품: 검수 끝나고 환불이 1시간 넘게 끝나지 않은 반품 없음 → npm run inventory:jobs -- return-refunds",
+    `SELECT "returnNo" FROM "ReturnRequest" WHERE "status" = 'INSPECTED' AND julianday(${NOW}) - julianday("inspectedAt") > 1.0 / 24`, "warn"],
+  ["반품: 승인 후 3일 넘게 회수가 시작되지 않은 반품 없음 / 도착 후 2일 넘게 검수하지 않은 반품 없음",
+    `SELECT "returnNo", "status" FROM "ReturnRequest" WHERE ("status" = 'APPROVED' AND julianday(${NOW}) - julianday("approvedAt") > 3) OR ("status" = 'RECEIVED' AND julianday(${NOW}) - julianday("receivedAt") > 2)`, "warn"],
+  ["재입고 알림: 재고가 있는데 아직 대기 중인 신청 없음 → npm run inventory:jobs -- restock",
+    `SELECT s."id", s."skuId" FROM "RestockSubscription" s JOIN "InventoryBalance" b ON b."skuId" = s."skuId" JOIN "InventoryLocation" loc ON loc."id" = b."locationId" AND loc."isOnlineSellable" = 1
+     WHERE s."status" IN ('WAITING', 'SCHEDULED') AND b."onHand" - b."reserved" - b."safetyStock" > 0`, "warn"],
+  ["발주: 입고 예정일이 지났는데 다 들어오지 않은 발주 없음 (입고 지연 → 예정일 변경으로 고객 안내)",
+    `SELECT p."poNo", l."lineNo", l."expectedAt" FROM "PurchaseOrderLine" l JOIN "PurchaseOrder" p ON p."id" = l."purchaseOrderId"
+     WHERE p."status" IN ('CONFIRMED', 'PARTIALLY_RECEIVED') AND l."qtyReceived" < l."qtyOrdered" AND l."expectedAt" < ${NOW}`, "warn"],
+  ["재주문: 재주문 필요 알림이 열려 있음 (발주가 필요한 SKU) → npm run inventory:ops -- alerts",
+    `SELECT a."skuId", a."availableAtOpen", a."reorderPoint" FROM "StockAlert" a WHERE a."status" = 'OPEN'`, "warn"],
   ["배송비 규칙: 지금 적용 중인 규칙이 정확히 1개 (없으면 주문 불가)",
     `SELECT count(*) AS n FROM "ShippingPolicy" WHERE "validFrom" <= ${NOW} AND ("validTo" IS NULL OR "validTo" > ${NOW}) HAVING count(*) <> 1`, "error"],
   ["주문: 출고 후 결제가 전액 취소된 주문 없음 (토스 상점관리자에서 취소?) → 상품 회수·반품 확인 필요",

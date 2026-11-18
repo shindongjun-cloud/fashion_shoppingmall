@@ -4,6 +4,9 @@ import type { CartSku } from "@/lib/catalog";
 
 // 1회 주문 수량 제한 검사: 같은 스타일의 SKU(컬러·사이즈 상관없이)를 합쳐서 셉니다.
 // 예: 스니커즈 최대 2켤레 → 화이트 260 1개 + 블랙 270 1개 = 2개까지 OK
+/** 상품 화면 "품절 임박 n개" 표시 기준 (판매 가능 수량이 이 값 이하) */
+export const LOW_STOCK_DISPLAY = 3;
+
 export function findQtyLimitViolation(lines: { sku: CartSku; quantity: number }[]) {
   const totals = new Map<string, { sku: CartSku; total: number }>();
   for (const { sku, quantity } of lines) {

@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { getGuestOrderId } from "@/lib/current-owner";
 import OrderDetailView from "@/components/OrderDetailView";
-import { cancelOrderAction, changeAddressAction, changeAddressDirectAction, confirmPurchaseAction } from "@/app/orders/actions";
+import { cancelOrderAction, changeAddressAction, changeAddressDirectAction, confirmPurchaseAction, requestReturnAction, cancelReturnAction } from "@/app/orders/actions";
 
 export const dynamic = "force-dynamic";
 
@@ -20,7 +20,7 @@ export default async function GuestOrderDetailPage({ params, searchParams }: Pag
       orderNo={orderNo}
       notice={notice}
       flashId={e}
-      actions={{ cancel: cancelOrderAction, confirm: confirmPurchaseAction, changeAddress: changeAddressAction, changeAddressDirect: changeAddressDirectAction }}
+      actions={{ cancel: cancelOrderAction, confirm: confirmPurchaseAction, changeAddress: changeAddressAction, changeAddressDirect: changeAddressDirectAction, requestReturn: requestReturnAction, cancelReturn: cancelReturnAction }}
     />
   );
 }

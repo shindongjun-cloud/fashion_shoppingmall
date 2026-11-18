@@ -151,14 +151,23 @@ const MANUAL_CHECKS: CheckConstraint[] = [
 
   { table: "InventoryBalance", name: "InventoryBalance_qty_ck", expr: `${int("onHand", ">= 0")} AND ${int("reserved", ">= 0")} AND ${int("safetyStock", ">= 0")}`, why: "실재고·예약·안전재고는 0 이상의 정수" },
   { table: "InventoryBalance", name: "InventoryBalance_reserved_ck", expr: `"reserved" <= "onHand"`, why: "예약은 실재고를 넘을 수 없음 (초과 판매 방지의 마지막 방어선)" },
+  { table: "InventoryBalance", name: "InventoryBalance_reorder_ck", expr: `${int("reorderPoint", ">= 0")} AND ${int("reorderQty", ">= 0")}`, why: "재주문점·권장 수량은 0 이상 (0 = 알림 안 함)" },
   { table: "InventoryBalance", name: "InventoryBalance_dates_ck", expr: `(${isoDate("updatedAt")}) AND (${isoDateOrNull("lastCountedAt")})`, why: "날짜 형식" },
 
   { table: "InventoryLedger", name: "InventoryLedger_qty_ck", expr: int("qty", "<> 0"), why: "변동 수량은 0이 아닌 정수" },
   {
     table: "InventoryLedger",
     name: "InventoryLedger_sign_ck",
-    expr: `("type" IN ('INITIAL', 'INBOUND', 'RETURN_IN', 'ADJUST_IN', 'TRANSFER_IN') AND "qty" > 0) OR ("type" IN ('SALE', 'ADJUST_OUT', 'DEFECT_OUT', 'TRANSFER_OUT') AND "qty" < 0)`,
-    why: "유형별 부호: 입고·반품·조정입고·이동입고는 +, 판매·조정출고·불량·이동출고는 −",
+    expr: `("type" IN ('INITIAL', 'INBOUND', 'RETURN_IN', 'ADJUST_IN', 'TRANSFER_IN') AND "qty" > 0) OR ("type" IN ('SALE', 'ADJUST_OUT', 'DEFECT_OUT', 'TRANSFER_OUT', 'RETURN_REJECT_OUT') AND "qty" < 0)`,
+    why: "유형별 부호: 입고·반품·조정입고·이동입고는 +, 판매·조정출고·불량·이동출고·반품 반송은 −",
+  },
+  {
+    table: "InventoryLedger",
+    name: "InventoryLedger_doc_ck",
+    expr: `("type" NOT IN ('RETURN_IN', 'RETURN_REJECT_OUT') OR ("returnItemId" IS NOT NULL AND "refType" = 'RETURN'))
+      AND ("returnItemId" IS NULL OR ("refType" = 'RETURN' AND "type" IN ('RETURN_IN', 'RETURN_REJECT_OUT', 'TRANSFER_IN', 'TRANSFER_OUT')))
+      AND ("inboundLineId" IS NULL OR ("type" = 'INBOUND' AND "refType" = 'INBOUND_ORDER'))`,
+    why: "반품 도착·반송은 반품 상품을 가리켜야 하고, 입고 전표 줄은 입고(INBOUND)에만 연결",
   },
   { table: "InventoryLedger", name: "InventoryLedger_balance_after_ck", expr: int("balanceAfter", ">= 0"), why: "반영 후 실재고 >= 0" },
   { table: "InventoryLedger", name: "InventoryLedger_sale_ck", expr: `("type" = 'SALE') = ("reservationId" IS NOT NULL) AND ("type" <> 'SALE' OR "refType" = 'ORDER')`, why: "판매(SALE)는 반드시 예약 확정에서만 생기고 주문을 참조. 다른 유형은 예약을 참조하지 않음" },
@@ -461,6 +470,7 @@ const ORDER_CHECKS: CheckConstraint[] = [
     expr: `(${encOrNull("ordererNameEnc")}) AND (${encOrNull("ordererPhoneEnc")}) AND (${encOrNull("ordererEmailEnc")}) AND (${hashOrNull("ordererPhoneHash")}) AND ("piiPurgedAt" IS NULL OR (${ORDERER_COLS.map((c) => `"${c}" IS NULL`).join(" AND ")}))`,
     why: "주문자 정보는 암호문·해시로만 저장, 파기하면 전부 비움",
   },
+  { table: "Order", name: "Order_returned_date_ck", expr: isoDateOrNull("returnedAt"), why: "날짜 형식" },
   { table: "Order", name: "Order_confirmed_ck", expr: `("fulfillmentStatus" = 'CONFIRMED') = ("confirmedAt" IS NOT NULL)`, why: "전체 구매확정 시각은 모두 확정됐을 때만" },
 
   // ----- 주문 상품 (줄 금액·상태별 시각)
@@ -488,10 +498,12 @@ const ORDER_CHECKS: CheckConstraint[] = [
       `("status" = 'DELIVERED' AND "paidAt" IS NOT NULL AND "preparingAt" IS NOT NULL AND "shippedAt" IS NOT NULL AND "deliveredAt" IS NOT NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)`,
       `("status" = 'CONFIRMED' AND "paidAt" IS NOT NULL AND "preparingAt" IS NOT NULL AND "shippedAt" IS NOT NULL AND "confirmedAt" IS NOT NULL AND "canceledAt" IS NULL)`,
       `("status" = 'CANCELED' AND "shippedAt" IS NULL AND "deliveredAt" IS NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NOT NULL)`,
-    ].join(" OR ") + `) AND (("status" = 'CONFIRMED') = ("confirmType" IS NOT NULL)) AND ("autoConfirmAt" IS NULL OR "status" IN ('DELIVERED', 'CONFIRMED')) AND ("status" <> 'DELIVERED' OR "autoConfirmAt" IS NOT NULL)`,
+      `("status" IN ('RETURN_REQUESTED', 'RETURN_COLLECTING') AND "paidAt" IS NOT NULL AND "shippedAt" IS NOT NULL AND "deliveredAt" IS NOT NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)`,
+      `("status" = 'RETURNED' AND "deliveredAt" IS NOT NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)`,
+    ].join(" OR ") + `) AND (("status" = 'CONFIRMED') = ("confirmType" IS NOT NULL)) AND ("autoConfirmAt" IS NULL OR "status" IN ('DELIVERED', 'CONFIRMED', 'RETURN_REQUESTED', 'RETURN_COLLECTING', 'RETURNED')) AND ("status" <> 'DELIVERED' OR "autoConfirmAt" IS NOT NULL) AND (("status" = 'RETURNED') = ("returnedAt" IS NOT NULL))`,
     why: "단계별 시각: 그 단계까지 거친 시각은 필수, 아직 안 간 단계는 비어 있음. 구매확정이면 확정 방식, 배송 완료면 자동확정 예정일 필수",
   },
-  { table: "OrderItem", name: "OrderItem_dates_ck", expr: `(${memoOk("statusMemo")}) AND ${dates(["statusChangedAt", false], ["paidAt", true], ["preparingAt", true], ["shippedAt", true], ["deliveredAt", true], ["confirmedAt", true], ["canceledAt", true], ["autoConfirmAt", true], ["createdAt", false])}`, why: "날짜 형식, 상태 사유 200자 이내" },
+  { table: "OrderItem", name: "OrderItem_dates_ck", expr: `(${memoOk("statusMemo")}) AND ${dates(["statusChangedAt", false], ["paidAt", true], ["preparingAt", true], ["shippedAt", true], ["deliveredAt", true], ["confirmedAt", true], ["canceledAt", true], ["autoConfirmAt", true], ["returnedAt", true], ["createdAt", false])}`, why: "날짜 형식, 상태 사유 200자 이내" },
 
   // ----- 주문 배송지 (암호문, 파기)
   {
@@ -578,8 +590,82 @@ const GUEST_CHECKS: CheckConstraint[] = [
   },
 ];
 
+// ----- 재고 보강 (발주·입고·재입고 알림·알림·재주문·반품)
+const INV2_CHECKS: CheckConstraint[] = [
+  { table: "PurchaseOrder", name: "PurchaseOrder_values_ck", expr: `"poNo" GLOB 'PO-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9]*' AND ${notBlank("createdBy")} AND (${memoOk("memo", 500)}) AND ${dates(["orderedAt", true], ["confirmedAt", true], ["canceledAt", true], ["statusChangedAt", false], ["createdAt", false], ["updatedAt", false])}`, why: "발주번호 형식 PO-날짜-순번, 처리자 필수" },
+  {
+    table: "PurchaseOrder",
+    name: "PurchaseOrder_state_ck",
+    expr: `("status" = 'DRAFT' AND "orderedAt" IS NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)
+      OR ("status" = 'ORDERED' AND "orderedAt" IS NOT NULL AND "confirmedAt" IS NULL AND "canceledAt" IS NULL)
+      OR ("status" IN ('CONFIRMED', 'PARTIALLY_RECEIVED', 'RECEIVED') AND "orderedAt" IS NOT NULL AND "canceledAt" IS NULL)
+      OR ("status" = 'CANCELED' AND "canceledAt" IS NOT NULL)`,
+    why: "상태별 시각: 발주 이후는 발주 시각, 취소는 취소 시각",
+  },
+  { table: "PurchaseOrderLine", name: "PurchaseOrderLine_qty_ck", expr: `(${int("lineNo", ">= 1")}) AND (${int("qtyOrdered", ">= 1")}) AND (${int("qtyReceived", ">= 0")}) AND "qtyReceived" <= "qtyOrdered" AND (${intOrNull("unitCost", ">= 0")}) AND ${dates(["expectedAt", true], ["createdAt", false], ["updatedAt", false])}`, why: "발주 수량 1 이상, 입고 수량은 발주 수량 이하" },
+  { table: "PurchaseOrderEvent", name: "PurchaseOrderEvent_ck", expr: `${notBlank("createdBy")} AND (${memoOk("memo", 500)}) AND ${dates(["fromDate", true], ["toDate", true], ["createdAt", false])} AND ("type" <> 'DATE_CHANGED' OR ("lineId" IS NOT NULL AND "toDate" IS NOT NULL))`, why: "예정일 변경 이력은 줄·새 날짜 필수" },
+  { table: "InboundReceipt", name: "InboundReceipt_values_ck", expr: `"receiptNo" GLOB 'IN-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9]*' AND ${notBlank("createdBy")} AND (${memoOk("memo", 500)}) AND ${dates(["receivedAt", false], ["createdAt", false])}`, why: "입고번호 형식, 처리자 필수" },
+  { table: "InboundReceiptLine", name: "InboundReceiptLine_qty_ck", expr: `(${int("qtyGood", ">= 0")}) AND (${int("qtyDefect", ">= 0")}) AND "qtyGood" + "qtyDefect" >= 1`, why: "정상·불량 0 이상, 합계 1 이상" },
+  {
+    table: "RestockSubscription",
+    name: "RestockSubscription_state_ck",
+    expr: `"expiresAt" > "createdAt" AND ${dates(["notifiedExpectedAt", true], ["scheduledAt", true], ["arrivedAt", true], ["closedAt", true], ["expiresAt", false], ["createdAt", false], ["updatedAt", false])}
+      AND (("status" IN ('WAITING', 'SCHEDULED')) = ("closedAt" IS NULL))
+      AND ("status" <> 'SCHEDULED' OR ("notifiedExpectedAt" IS NOT NULL AND "scheduledAt" IS NOT NULL))
+      AND ("status" NOT IN ('ARRIVED', 'PURCHASED') OR "arrivedAt" IS NOT NULL)`,
+    why: "진행 중(대기·예정 안내)이면 끝난 시각 없음, 예정 안내면 안내한 날짜 필수, 재입고 안내·구매는 안내 시각 필수",
+  },
+  {
+    table: "Notification",
+    name: "Notification_values_ck",
+    expr: `"audience" IN ('CUSTOMER', 'ADMIN') AND ("audience" = 'CUSTOMER') = ("customerId" IS NOT NULL) AND ${notBlank("title")} AND length("title") <= 100 AND ${notBlank("body")} AND length("body") <= 1000
+      AND ("linkUrl" IS NULL OR ("linkUrl" GLOB '/*' AND "linkUrl" NOT GLOB '//*')) AND length("dedupKey") BETWEEN 3 AND 200 AND (${int("attempts", ">= 0")})
+      AND ("status" <> 'SENT' OR "sentAt" IS NOT NULL) AND ("channel" <> 'IN_APP' OR "status" = 'SENT') AND ${dates(["sentAt", true], ["readAt", true], ["createdAt", false])}`,
+    why: "회원 알림은 회원 필수(관리자 알림은 없음), 링크는 사이트 안 경로만, 알림함은 만들자마자 보냄",
+  },
+  {
+    table: "StockAlert",
+    name: "StockAlert_state_ck",
+    expr: `(${int("availableAtOpen", ">= 0")}) AND (${int("reorderPoint", ">= 1")}) AND ${dates(["openedAt", false], ["resolvedAt", true])}
+      AND (("status" = 'OPEN') = ("resolvedAt" IS NULL)) AND (("status" = 'OPEN') = ("resolution" IS NULL))`,
+    why: "해소되면 해소 시각·사유 필수",
+  },
+  {
+    table: "ReturnRequest",
+    name: "ReturnRequest_values_ck",
+    expr: `"returnNo" GLOB 'R[0-9]*-[0-9]*-[0-9]*' AND "requestedBy" IN ('CUSTOMER', 'ADMIN') AND (${memoOk("reasonText", 500)}) AND (${memoOk("memo", 500)})
+      AND (${int("returnShippingFee", ">= 0")}) AND (${intOrNull("refundAmount", ">= 0")})
+      AND ("fault" = CASE WHEN "reason" IN ('CHANGE_OF_MIND', 'SIZE') THEN 'CUSTOMER' ELSE 'SELLER' END)
+      AND ("fault" = 'CUSTOMER' OR "returnShippingFee" = 0)
+      AND ("pickupTrackingNo" IS NULL OR (length("pickupTrackingNo") BETWEEN 6 AND 30 AND "pickupTrackingNo" NOT GLOB '*[^0-9]*'))
+      AND ("pickupCourierId" IS NULL) = ("pickupTrackingNo" IS NULL)`,
+    why: "반품번호 형식, 사유에 따른 귀책(단순 변심·사이즈 = 고객), 판매자 사유면 반품 배송비 0, 회수 송장은 택배사와 함께",
+  },
+  {
+    table: "ReturnRequest",
+    name: "ReturnRequest_state_ck",
+    expr: `${dates(["statusChangedAt", false], ["requestedAt", false], ["approvedAt", true], ["collectingAt", true], ["receivedAt", true], ["inspectedAt", true], ["completedAt", true], ["closedAt", true], ["createdAt", false], ["updatedAt", false])}
+      AND ("status" NOT IN ('APPROVED', 'COLLECTING', 'RECEIVED', 'INSPECTED', 'COMPLETED') OR "approvedAt" IS NOT NULL)
+      AND ("status" NOT IN ('COLLECTING', 'RECEIVED', 'INSPECTED', 'COMPLETED') OR ("collectingAt" IS NOT NULL AND "pickupTrackingNo" IS NOT NULL))
+      AND ("status" NOT IN ('RECEIVED', 'INSPECTED', 'COMPLETED') OR "receivedAt" IS NOT NULL)
+      AND ("status" NOT IN ('INSPECTED', 'COMPLETED') OR ("inspectedAt" IS NOT NULL AND "refundAmount" IS NOT NULL))
+      AND (("status" = 'COMPLETED') = ("completedAt" IS NOT NULL))
+      AND (("status" IN ('REJECTED', 'CANCELED')) = ("closedAt" IS NOT NULL))
+      AND ("status" <> 'COMPLETED' OR "refundAmount" = 0 OR "paymentCancelId" IS NOT NULL)`,
+    why: "단계별 시각 필수, 검수 끝나면 환불액 확정, 환불할 금액이 있으면 완료 전에 결제 취소가 있어야 함",
+  },
+  {
+    table: "ReturnItem",
+    name: "ReturnItem_values_ck",
+    expr: `(${int("qty", ">= 1")}) AND (${intOrNull("refundAmount", ">= 0")}) AND (${memoOk("inspectionMemo", 500)}) AND ${dates(["inspectedAt", true])}
+      AND ("inspection" IS NULL) = ("inspectedAt" IS NULL) AND ("inspection" IS NULL) = ("refundAmount" IS NULL)
+      AND ("inspection" IS NOT 'NOT_RETURNABLE' OR "refundAmount" = 0)`,
+    why: "검수하면 검수 시각·환불액 필수, 반품 불가는 환불 0",
+  },
+];
+
 export function allChecks(schemaText: string): CheckConstraint[] {
-  return [...autoChecks(schemaText), ...MANUAL_CHECKS, ...PAYMENT_CHECKS, ...ORDER_CHECKS, ...GUEST_CHECKS];
+  return [...autoChecks(schemaText), ...MANUAL_CHECKS, ...PAYMENT_CHECKS, ...ORDER_CHECKS, ...GUEST_CHECKS, ...INV2_CHECKS];
 }
 
 // ---------------------------------------------------------------
@@ -1208,7 +1294,7 @@ SELECT CASE
     THEN RAISE(ABORT, 'Order_paid_guard: 재고가 할당되지 않은 상품이 있어 결제 완료로 바꿀 수 없습니다')
   WHEN NEW."status" IN ('CANCELED', 'EXPIRED') AND EXISTS (SELECT 1 FROM "InventoryReservation" r WHERE r."orderId" = NEW."id" AND r."status" IN ('RESERVED', 'ALLOCATED'))
     THEN RAISE(ABORT, 'Order_cancel_guard: 남은 재고 예약·할당을 먼저 풀어야 주문을 닫을 수 있습니다')
-  WHEN NEW."status" = 'CANCELED' AND EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = NEW."id" AND i."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED'))
+  WHEN NEW."status" = 'CANCELED' AND EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = NEW."id" AND i."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED', 'RETURN_REQUESTED', 'RETURN_COLLECTING'))
     THEN RAISE(ABORT, 'Order_shipped_guard: 출고된 상품이 있어 주문 전체를 취소할 수 없습니다 (반품으로 처리)')
   WHEN NEW."status" = 'WAITING_DEPOSIT' AND NOT EXISTS (SELECT 1 FROM "Payment" p WHERE p."orderId" = NEW."id" AND p."status" = 'WAITING_FOR_DEPOSIT')
     THEN RAISE(ABORT, 'Order_status_transition: 입금 대기 결제(가상계좌)가 없습니다')
@@ -1408,6 +1494,11 @@ const ITEM_STATUS_CHANGES = [
   "PREPARING>SHIPPED", "PREPARING>CANCELED",
   "SHIPPED>DELIVERED", "SHIPPED>CONFIRMED",
   "DELIVERED>CONFIRMED",
+  "DELIVERED>RETURN_REQUESTED", // 반품 신청
+  "RETURN_REQUESTED>RETURN_COLLECTING", // 회수 송장 등록
+  "RETURN_REQUESTED>DELIVERED", // 반품 거절·철회 (회수 전)
+  "RETURN_COLLECTING>RETURNED", // 검수 통과 (정상·불량)
+  "RETURN_COLLECTING>DELIVERED", // 검수 결과 반품 불가 → 고객에게 반송
 ];
 const SHIPMENT_STATUS_CHANGES = ["READY>SHIPPED", "READY>CANCELED", "SHIPPED>DELIVERED"];
 /** 개인정보 보관 기간 (전자상거래법: 계약·대금결제 기록 5년) */
@@ -1416,13 +1507,14 @@ const orderStatusOf = (orderRef: string) => `(SELECT o."status" FROM "Order" o W
 /** 주문의 상품 상태들 → 진행 요약 (취소된 상품은 빼고 판단) */
 export const FULFILLMENT_OF = (orderRef: string) => {
   const has = (cond: string) => `EXISTS (SELECT 1 FROM "OrderItem" fi WHERE fi."orderId" = ${orderRef} AND ${cond})`;
+  // 취소·반품 완료된 상품은 빼고 판단. 반품 진행 중(요청·회수)은 "배송 완료" 단계로 봄
   return `(CASE
-    WHEN NOT ${has(`fi."status" <> 'CANCELED'`)} THEN 'CANCELED'
+    WHEN NOT ${has(`fi."status" NOT IN ('CANCELED', 'RETURNED')`)} THEN (CASE WHEN ${has(`fi."status" = 'RETURNED'`)} THEN 'RETURNED' ELSE 'CANCELED' END)
     WHEN ${has(`fi."status" = 'AWAITING_PAYMENT'`)} THEN 'UNPAID'
-    WHEN NOT ${has(`fi."status" NOT IN ('CONFIRMED', 'CANCELED')`)} THEN 'CONFIRMED'
-    WHEN NOT ${has(`fi."status" NOT IN ('DELIVERED', 'CONFIRMED', 'CANCELED')`)} THEN 'DELIVERED'
+    WHEN NOT ${has(`fi."status" NOT IN ('CONFIRMED', 'CANCELED', 'RETURNED')`)} THEN 'CONFIRMED'
+    WHEN NOT ${has(`fi."status" NOT IN ('DELIVERED', 'CONFIRMED', 'CANCELED', 'RETURNED', 'RETURN_REQUESTED', 'RETURN_COLLECTING')`)} THEN 'DELIVERED'
     WHEN NOT ${has(`fi."status" IN ('PAID', 'PREPARING')`)} THEN 'SHIPPED'
-    WHEN ${has(`fi."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED')`)} THEN 'PARTIALLY_SHIPPED'
+    WHEN ${has(`fi."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED', 'RETURN_REQUESTED', 'RETURN_COLLECTING', 'RETURNED')`)} THEN 'PARTIALLY_SHIPPED'
     WHEN ${has(`fi."status" = 'PREPARING'`)} THEN 'PREPARING'
     ELSE 'PAID' END)`;
 };
@@ -1555,6 +1647,15 @@ SELECT CASE
     THEN RAISE(ABORT, 'OrderItem_shipment_only: 배송 완료는 출고 상자를 배송 완료 처리해서만 바뀝니다')
   WHEN NEW."status" = 'CANCELED' AND ${orderStatusOf(`NEW."orderId"`)} NOT IN ('CANCELED', 'EXPIRED')
     THEN RAISE(ABORT, 'OrderItem_cancel_guard: 상품 단위 취소는 ⑩ 클레임에서 합니다 (지금은 주문 전체 취소로만)')
+  WHEN NEW."status" = 'RETURN_REQUESTED' AND NOT EXISTS (SELECT 1 FROM "ReturnItem" ri JOIN "ReturnRequest" rr ON rr."id" = ri."returnRequestId" WHERE ri."orderItemId" = NEW."id" AND rr."status" IN ('REQUESTED', 'APPROVED'))
+    THEN RAISE(ABORT, 'OrderItem_return_guard: 반품 요청(ReturnRequest)이 있어야 반품 요청 상태로 바꿀 수 있습니다')
+  WHEN NEW."status" = 'RETURN_COLLECTING' AND NOT EXISTS (SELECT 1 FROM "ReturnItem" ri JOIN "ReturnRequest" rr ON rr."id" = ri."returnRequestId" WHERE ri."orderItemId" = NEW."id" AND rr."status" = 'COLLECTING')
+    THEN RAISE(ABORT, 'OrderItem_return_guard: 회수 중인 반품이 있어야 합니다')
+  WHEN NEW."status" = 'RETURNED' AND NOT EXISTS (SELECT 1 FROM "ReturnItem" ri WHERE ri."orderItemId" = NEW."id" AND ri."inspection" IN ('RESELLABLE', 'DEFECTIVE'))
+    THEN RAISE(ABORT, 'OrderItem_return_guard: 검수를 통과(정상·불량)한 반품 상품만 반품 완료로 바꿀 수 있습니다')
+  WHEN OLD."status" IN ('RETURN_REQUESTED', 'RETURN_COLLECTING') AND NEW."status" = 'DELIVERED'
+      AND NOT EXISTS (SELECT 1 FROM "ReturnItem" ri JOIN "ReturnRequest" rr ON rr."id" = ri."returnRequestId" WHERE ri."orderItemId" = NEW."id" AND (rr."status" IN ('REJECTED', 'CANCELED') OR ri."inspection" = 'NOT_RETURNABLE'))
+    THEN RAISE(ABORT, 'OrderItem_return_guard: 반품이 거절·철회되었거나 반품 불가 판정일 때만 배송 완료로 되돌립니다')
 END;
 END;`,
   },
@@ -1723,7 +1824,7 @@ BEGIN
 SELECT CASE
   WHEN NEW."requestedBy" = 'CUSTOMER' AND EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = (SELECT p."orderId" FROM "Payment" p WHERE p."id" = NEW."paymentId") AND i."status" IN ('PREPARING', 'SHIPPED', 'DELIVERED', 'CONFIRMED'))
     THEN RAISE(ABORT, 'PaymentCancel_customer_preparing: 상품 준비가 시작되어 직접 취소할 수 없습니다')
-  WHEN EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = (SELECT p."orderId" FROM "Payment" p WHERE p."id" = NEW."paymentId") AND i."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED'))
+  WHEN EXISTS (SELECT 1 FROM "OrderItem" i WHERE i."orderId" = (SELECT p."orderId" FROM "Payment" p WHERE p."id" = NEW."paymentId") AND i."status" IN ('SHIPPED', 'DELIVERED', 'CONFIRMED', 'RETURN_REQUESTED', 'RETURN_COLLECTING'))
       AND NEW."cancelAmount" >= (SELECT p."balanceAmount" FROM "Payment" p WHERE p."id" = NEW."paymentId")
     THEN RAISE(ABORT, 'PaymentCancel_shipped: 출고된 상품이 있어 전액 취소할 수 없습니다 (반품으로 처리)')
 END;
@@ -1950,11 +2051,357 @@ BEGIN ${raise("ShipmentItem_no_update", "상자에 담은 상품은 바꿀 수 �
   noDelete("ShipmentItem", "출고 상자 내용은 삭제할 수 없습니다", "출고 기록 보관"),
 ];
 
+
+// ----- 재고 보강 트리거
+const PO_STATUS_CHANGES = [
+  "DRAFT>ORDERED", "DRAFT>CANCELED",
+  "ORDERED>CONFIRMED", "ORDERED>CANCELED", "ORDERED>PARTIALLY_RECEIVED", "ORDERED>RECEIVED",
+  "CONFIRMED>PARTIALLY_RECEIVED", "CONFIRMED>RECEIVED", "CONFIRMED>CANCELED",
+  "PARTIALLY_RECEIVED>RECEIVED", // 잔량 마감
+];
+const RESTOCK_STATUS_CHANGES = [
+  "WAITING>SCHEDULED", "WAITING>ARRIVED", "WAITING>CANCELED", "WAITING>EXPIRED",
+  "SCHEDULED>WAITING", "SCHEDULED>ARRIVED", "SCHEDULED>CANCELED", "SCHEDULED>EXPIRED",
+  "ARRIVED>PURCHASED",
+];
+const RETURN_STATUS_CHANGES = [
+  "REQUESTED>APPROVED", "REQUESTED>REJECTED", "REQUESTED>CANCELED",
+  "APPROVED>COLLECTING", "APPROVED>REJECTED", "APPROVED>CANCELED",
+  "COLLECTING>RECEIVED", "RECEIVED>INSPECTED",
+  "INSPECTED>COMPLETED", "INSPECTED>REJECTED", // 전부 반품 불가면 거절로 끝
+];
+/** 반품 기간: 단순 변심·사이즈 7일, 불량·오배송·파손 30일 (배송 완료일 기준) */
+const RETURN_WINDOW_DAYS = { CUSTOMER: 7, SELLER: 30 };
+const PO_OPEN = "('ORDERED', 'CONFIRMED', 'PARTIALLY_RECEIVED')";
+
+const INV2_TRIGGERS: TriggerConstraint[] = [
+  // --- 발주
+  {
+    table: "PurchaseOrder",
+    name: "PurchaseOrder_insert_draft",
+    why: "발주는 작성 중(DRAFT)으로 만들고 줄을 채운 뒤 발주",
+    sql: `CREATE TRIGGER "PurchaseOrder_insert_draft" BEFORE INSERT ON "PurchaseOrder"
+WHEN NEW."status" <> 'DRAFT'
+BEGIN ${raise("PurchaseOrder_insert_draft", "발주는 작성 중(DRAFT)으로만 만들 수 있습니다")} END;`,
+  },
+  {
+    table: "PurchaseOrder",
+    name: "PurchaseOrder_transition",
+    why: "정해진 길로만, 발주하려면 줄이 있어야 하고, 날짜 확정은 모든 줄에 예정일, 입고가 있으면 취소 불가",
+    sql: `CREATE TRIGGER "PurchaseOrder_transition" BEFORE UPDATE OF "status" ON "PurchaseOrder"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN (${inList(PO_STATUS_CHANGES)})
+    THEN RAISE(ABORT, 'PurchaseOrder_transition: 허용되지 않은 발주 상태 변경입니다')
+  WHEN NEW."statusChangedAt" < OLD."statusChangedAt"
+    THEN RAISE(ABORT, 'PurchaseOrder_transition: 상태 변경 시각이 이전보다 앞설 수 없습니다')
+  WHEN NEW."status" = 'ORDERED' AND NOT EXISTS (SELECT 1 FROM "PurchaseOrderLine" l WHERE l."purchaseOrderId" = NEW."id")
+    THEN RAISE(ABORT, 'PurchaseOrder_transition: 줄이 없는 발주는 보낼 수 없습니다')
+  WHEN NEW."status" = 'CONFIRMED' AND EXISTS (SELECT 1 FROM "PurchaseOrderLine" l WHERE l."purchaseOrderId" = NEW."id" AND l."expectedAt" IS NULL)
+    THEN RAISE(ABORT, 'PurchaseOrder_confirm_guard: 모든 줄에 입고 예정일이 있어야 확정할 수 있습니다')
+  WHEN NEW."status" = 'CANCELED' AND EXISTS (SELECT 1 FROM "PurchaseOrderLine" l WHERE l."purchaseOrderId" = NEW."id" AND l."qtyReceived" > 0)
+    THEN RAISE(ABORT, 'PurchaseOrder_transition: 입고가 시작된 발주는 취소할 수 없습니다 (잔량 마감으로 처리)')
+  WHEN NEW."status" IN ('PARTIALLY_RECEIVED', 'RECEIVED') AND NOT EXISTS (SELECT 1 FROM "PurchaseOrderLine" l WHERE l."purchaseOrderId" = NEW."id" AND l."qtyReceived" > 0)
+    THEN RAISE(ABORT, 'PurchaseOrder_transition: 입고된 수량이 없습니다')
+END;
+END;`,
+  },
+  fixedColumns("PurchaseOrder", "PurchaseOrder_fixed", ["poNo", "supplierId", "createdBy", "createdAt"], "발주번호·거래처·처리자는 바꿀 수 없습니다", "발주 기본 정보 고정"),
+  noDelete("PurchaseOrder", "발주는 삭제할 수 없습니다 (취소로 처리)", "발주 기록 보관"),
+  {
+    table: "PurchaseOrderLine",
+    name: "PurchaseOrderLine_insert_guard",
+    why: "작성 중인 발주에만 줄 추가, 순번은 차례로, 입고 수량 0으로 시작",
+    sql: `CREATE TRIGGER "PurchaseOrderLine_insert_guard" BEFORE INSERT ON "PurchaseOrderLine"
+BEGIN
+SELECT CASE
+  WHEN (SELECT p."status" FROM "PurchaseOrder" p WHERE p."id" = NEW."purchaseOrderId") IS NOT 'DRAFT'
+    THEN RAISE(ABORT, 'PurchaseOrderLine_insert_guard: 작성 중인 발주에만 줄을 추가할 수 있습니다')
+  WHEN NEW."qtyReceived" <> 0
+    THEN RAISE(ABORT, 'PurchaseOrderLine_insert_guard: 입고 수량은 0으로 시작합니다')
+  WHEN NEW."lineNo" IS NOT (SELECT COALESCE(MAX(l."lineNo"), 0) + 1 FROM "PurchaseOrderLine" l WHERE l."purchaseOrderId" = NEW."purchaseOrderId")
+    THEN RAISE(ABORT, 'PurchaseOrderLine_insert_guard: 순번은 1부터 차례로 붙입니다')
+END;
+END;`,
+  },
+  {
+    table: "PurchaseOrderLine",
+    name: "PurchaseOrderLine_update_guard",
+    why: "발주·SKU·순번 고정, 수량은 작성 중에만, 입고 수량은 입고 전표 합계와 같아야 함(트리거만), 예정일은 진행 중인 발주에서만 바꾸고 확정 뒤에는 비울 수 없음",
+    sql: `CREATE TRIGGER "PurchaseOrderLine_update_guard" BEFORE UPDATE ON "PurchaseOrderLine"
+BEGIN
+SELECT CASE
+  WHEN NEW."purchaseOrderId" IS NOT OLD."purchaseOrderId" OR NEW."lineNo" IS NOT OLD."lineNo" OR NEW."skuId" IS NOT OLD."skuId" OR NEW."createdAt" IS NOT OLD."createdAt"
+    THEN RAISE(ABORT, 'PurchaseOrderLine_fixed: 발주 줄의 발주·SKU·순번은 바꿀 수 없습니다')
+  WHEN (NEW."qtyOrdered" IS NOT OLD."qtyOrdered" OR NEW."unitCost" IS NOT OLD."unitCost") AND (SELECT p."status" FROM "PurchaseOrder" p WHERE p."id" = NEW."purchaseOrderId") <> 'DRAFT'
+    THEN RAISE(ABORT, 'PurchaseOrderLine_fixed: 발주를 보낸 뒤에는 수량·단가를 바꿀 수 없습니다')
+  WHEN NEW."qtyReceived" IS NOT (SELECT COALESCE(SUM(r."qtyGood" + r."qtyDefect"), 0) FROM "InboundReceiptLine" r WHERE r."purchaseOrderLineId" = NEW."id")
+    THEN RAISE(ABORT, 'PurchaseOrderLine_received_guard: 입고 수량은 입고 전표로만 바뀝니다')
+  WHEN NEW."expectedAt" IS NOT OLD."expectedAt" AND (SELECT p."status" FROM "PurchaseOrder" p WHERE p."id" = NEW."purchaseOrderId") NOT IN ('DRAFT', ${PO_OPEN.slice(1, -1)})
+    THEN RAISE(ABORT, 'PurchaseOrderLine_fixed: 끝난 발주의 예정일은 바꿀 수 없습니다')
+  WHEN NEW."expectedAt" IS NULL AND OLD."expectedAt" IS NOT NULL AND (SELECT p."status" FROM "PurchaseOrder" p WHERE p."id" = NEW."purchaseOrderId") <> 'DRAFT'
+    THEN RAISE(ABORT, 'PurchaseOrderLine_fixed: 보낸 발주의 예정일은 비울 수 없습니다 (날짜를 바꾸세요)')
+END;
+END;`,
+  },
+  {
+    table: "PurchaseOrderLine",
+    name: "PurchaseOrderLine_delete_guard",
+    why: "작성 중인 발주의 줄만 삭제 가능",
+    sql: `CREATE TRIGGER "PurchaseOrderLine_delete_guard" BEFORE DELETE ON "PurchaseOrderLine"
+WHEN (SELECT p."status" FROM "PurchaseOrder" p WHERE p."id" = OLD."purchaseOrderId") IS NOT 'DRAFT'
+BEGIN ${raise("PurchaseOrderLine_delete_guard", "보낸 발주의 줄은 지울 수 없습니다")} END;`,
+  },
+  ...appendOnly("PurchaseOrderEvent"),
+
+  // --- 입고 전표
+  {
+    table: "InboundReceipt",
+    name: "InboundReceipt_insert_guard",
+    why: "입고는 사용 중인 위치로, 발주가 있으면 진행 중인 발주만",
+    sql: `CREATE TRIGGER "InboundReceipt_insert_guard" BEFORE INSERT ON "InboundReceipt"
+WHEN NOT EXISTS (SELECT 1 FROM "InventoryLocation" loc WHERE loc."id" = NEW."locationId" AND loc."isActive" = 1 AND loc."type" IN ('WAREHOUSE', 'STORE'))
+  OR (NEW."purchaseOrderId" IS NOT NULL AND (SELECT p."status" FROM "PurchaseOrder" p WHERE p."id" = NEW."purchaseOrderId") NOT IN ${PO_OPEN})
+BEGIN ${raise("InboundReceipt_insert_guard", "입고할 수 없는 위치이거나 진행 중인 발주가 아닙니다")} END;`,
+  },
+  {
+    table: "InboundReceipt",
+    name: "InboundReceipt_no_update",
+    why: "입고 전표는 수정 금지 (잘못 입고했으면 조정 원장)",
+    sql: `CREATE TRIGGER "InboundReceipt_no_update" BEFORE UPDATE ON "InboundReceipt"
+BEGIN ${raise("InboundReceipt_append_only", "입고 전표는 수정할 수 없습니다")} END;`,
+  },
+  noDelete("InboundReceipt", "입고 전표는 삭제할 수 없습니다", "입고 기록 보관"),
+  {
+    table: "InboundReceiptLine",
+    name: "InboundReceiptLine_insert_guard",
+    why: "발주 줄과 같은 발주·SKU, 발주 수량을 넘는 입고 금지, 발주 없는 입고는 발주 줄 없이",
+    sql: `CREATE TRIGGER "InboundReceiptLine_insert_guard" BEFORE INSERT ON "InboundReceiptLine"
+BEGIN
+SELECT CASE
+  WHEN NEW."purchaseOrderLineId" IS NULL AND (SELECT r."purchaseOrderId" FROM "InboundReceipt" r WHERE r."id" = NEW."receiptId") IS NOT NULL
+    THEN RAISE(ABORT, 'InboundReceiptLine_insert_guard: 발주 입고는 발주 줄을 지정해야 합니다')
+  WHEN NEW."purchaseOrderLineId" IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM "PurchaseOrderLine" l JOIN "InboundReceipt" r ON r."purchaseOrderId" = l."purchaseOrderId"
+      WHERE l."id" = NEW."purchaseOrderLineId" AND r."id" = NEW."receiptId" AND l."skuId" = NEW."skuId")
+    THEN RAISE(ABORT, 'InboundReceiptLine_insert_guard: 발주 줄의 발주·SKU와 다릅니다')
+  WHEN NEW."purchaseOrderLineId" IS NOT NULL
+      AND (SELECT l."qtyReceived" + NEW."qtyGood" + NEW."qtyDefect" > l."qtyOrdered" FROM "PurchaseOrderLine" l WHERE l."id" = NEW."purchaseOrderLineId")
+    THEN RAISE(ABORT, 'InboundReceiptLine_over: 발주 수량보다 많이 입고할 수 없습니다')
+END;
+END;`,
+  },
+  {
+    table: "InboundReceiptLine",
+    name: "InboundReceiptLine_apply",
+    why: "입고 전표 줄을 넣으면 발주 줄의 입고 수량을 자동 반영",
+    sql: `CREATE TRIGGER "InboundReceiptLine_apply" AFTER INSERT ON "InboundReceiptLine"
+WHEN NEW."purchaseOrderLineId" IS NOT NULL
+BEGIN
+  UPDATE "PurchaseOrderLine" SET "qtyReceived" = (SELECT COALESCE(SUM(r."qtyGood" + r."qtyDefect"), 0) FROM "InboundReceiptLine" r WHERE r."purchaseOrderLineId" = NEW."purchaseOrderLineId"), "updatedAt" = ${NOW}
+  WHERE "id" = NEW."purchaseOrderLineId";
+END;`,
+  },
+  {
+    table: "InboundReceiptLine",
+    name: "InboundReceiptLine_no_update",
+    why: "입고 전표 줄은 수정 금지",
+    sql: `CREATE TRIGGER "InboundReceiptLine_no_update" BEFORE UPDATE ON "InboundReceiptLine"
+BEGIN ${raise("InboundReceiptLine_append_only", "입고 전표 줄은 수정할 수 없습니다")} END;`,
+  },
+  noDelete("InboundReceiptLine", "입고 전표 줄은 삭제할 수 없습니다", "입고 기록 보관"),
+
+  // --- 재입고 알림 신청
+  {
+    table: "RestockSubscription",
+    name: "RestockSubscription_insert_guard",
+    why: "대기 상태로, 정상 회원만, 같은 SKU에 진행 중인 신청은 1개",
+    sql: `CREATE TRIGGER "RestockSubscription_insert_guard" BEFORE INSERT ON "RestockSubscription"
+BEGIN
+SELECT CASE
+  WHEN NEW."status" <> 'WAITING' OR NEW."closedAt" IS NOT NULL
+    THEN RAISE(ABORT, 'RestockSubscription_insert_guard: 신청은 대기(WAITING)로 만듭니다')
+  WHEN ${customerStatusOf("customerId")} IS NOT 'ACTIVE'
+    THEN RAISE(ABORT, 'RestockSubscription_insert_guard: 정상(ACTIVE) 회원만 신청할 수 있습니다')
+  WHEN EXISTS (SELECT 1 FROM "RestockSubscription" x WHERE x."customerId" = NEW."customerId" AND x."skuId" = NEW."skuId" AND x."status" IN ('WAITING', 'SCHEDULED'))
+    THEN RAISE(ABORT, 'RestockSubscription_duplicate: 이미 재입고 알림을 신청한 상품입니다')
+END;
+END;`,
+  },
+  {
+    table: "RestockSubscription",
+    name: "RestockSubscription_update_guard",
+    why: "회원·SKU·신청 시각·만료 시각 고정, 상태는 정해진 길로만",
+    sql: `CREATE TRIGGER "RestockSubscription_update_guard" BEFORE UPDATE ON "RestockSubscription"
+BEGIN
+SELECT CASE
+  WHEN NEW."customerId" IS NOT OLD."customerId" OR NEW."skuId" IS NOT OLD."skuId" OR NEW."createdAt" IS NOT OLD."createdAt" OR NEW."expiresAt" IS NOT OLD."expiresAt"
+    THEN RAISE(ABORT, 'RestockSubscription_fixed: 신청 내용은 바꿀 수 없습니다')
+  WHEN NEW."status" IS NOT OLD."status" AND (OLD."status" || '>' || NEW."status") NOT IN (${inList(RESTOCK_STATUS_CHANGES)})
+    THEN RAISE(ABORT, 'RestockSubscription_transition: 허용되지 않은 재입고 알림 상태 변경입니다')
+END;
+END;`,
+  },
+  noDelete("RestockSubscription", "재입고 알림 신청 기록은 삭제할 수 없습니다 (취소로 처리)", "알림 근거 보관"),
+
+  // --- 알림
+  {
+    table: "Notification",
+    name: "Notification_update_guard",
+    why: "알림 내용은 고정. 발송 상태·횟수·읽은 시각만 바뀌고, 읽은 시각은 한 번만",
+    sql: `CREATE TRIGGER "Notification_update_guard" BEFORE UPDATE ON "Notification"
+WHEN NEW."customerId" IS NOT OLD."customerId" OR NEW."audience" IS NOT OLD."audience" OR NEW."type" IS NOT OLD."type" OR NEW."channel" IS NOT OLD."channel"
+  OR NEW."title" IS NOT OLD."title" OR NEW."body" IS NOT OLD."body" OR NEW."linkUrl" IS NOT OLD."linkUrl" OR NEW."dedupKey" IS NOT OLD."dedupKey" OR NEW."createdAt" IS NOT OLD."createdAt"
+  OR (OLD."readAt" IS NOT NULL AND NEW."readAt" IS NOT OLD."readAt")
+BEGIN ${raise("Notification_update_guard", "알림 내용은 바꿀 수 없습니다 (읽음 표시·발송 상태만)")} END;`,
+  },
+  noDelete("Notification", "알림은 삭제할 수 없습니다", "발송 근거 보관"),
+
+  // --- 재주문 필요
+  {
+    table: "StockAlert",
+    name: "StockAlert_insert_guard",
+    why: "새 알림은 진행 중(OPEN)으로, SKU·위치마다 진행 중인 알림은 1개",
+    sql: `CREATE TRIGGER "StockAlert_insert_guard" BEFORE INSERT ON "StockAlert"
+WHEN NEW."status" <> 'OPEN' OR EXISTS (SELECT 1 FROM "StockAlert" a WHERE a."skuId" = NEW."skuId" AND a."locationId" = NEW."locationId" AND a."status" = 'OPEN')
+BEGIN ${raise("StockAlert_insert_guard", "이미 진행 중인 재주문 알림이 있습니다")} END;`,
+  },
+  {
+    table: "StockAlert",
+    name: "StockAlert_update_guard",
+    why: "진행 중 → 해소 한 번만, 발생 정보 고정",
+    sql: `CREATE TRIGGER "StockAlert_update_guard" BEFORE UPDATE ON "StockAlert"
+WHEN OLD."status" <> 'OPEN' OR NEW."skuId" IS NOT OLD."skuId" OR NEW."locationId" IS NOT OLD."locationId" OR NEW."openedAt" IS NOT OLD."openedAt"
+  OR NEW."availableAtOpen" IS NOT OLD."availableAtOpen" OR NEW."reorderPoint" IS NOT OLD."reorderPoint"
+BEGIN ${raise("StockAlert_update_guard", "해소된 재주문 알림·발생 정보는 바꿀 수 없습니다")} END;`,
+  },
+  noDelete("StockAlert", "재주문 알림 기록은 삭제할 수 없습니다", "운영 기록 보관"),
+
+  // --- 반품
+  {
+    table: "ReturnRequest",
+    name: "ReturnRequest_insert_guard",
+    why: "반품은 신청(REQUESTED)으로, 결제 완료 주문에만",
+    sql: `CREATE TRIGGER "ReturnRequest_insert_guard" BEFORE INSERT ON "ReturnRequest"
+WHEN NEW."status" <> 'REQUESTED' OR NEW."approvedAt" IS NOT NULL OR NEW."refundAmount" IS NOT NULL OR NEW."paymentCancelId" IS NOT NULL
+  OR ${orderStatusOf(`NEW."orderId"`)} IS NOT 'PAID'
+BEGIN ${raise("ReturnRequest_insert_guard", "결제 완료 주문에 신청 상태로만 반품을 만들 수 있습니다")} END;`,
+  },
+  {
+    table: "ReturnRequest",
+    name: "ReturnRequest_transition",
+    why: "정해진 길로만. 검수 끝은 모든 상품 검수 후, 완료는 환불(결제 취소 완료) 후, 전부 반품 불가일 때만 검수 뒤 거절",
+    sql: `CREATE TRIGGER "ReturnRequest_transition" BEFORE UPDATE OF "status" ON "ReturnRequest"
+WHEN NEW."status" IS NOT OLD."status"
+BEGIN
+SELECT CASE
+  WHEN (OLD."status" || '>' || NEW."status") NOT IN (${inList(RETURN_STATUS_CHANGES)})
+    THEN RAISE(ABORT, 'ReturnRequest_transition: 허용되지 않은 반품 상태 변경입니다')
+  WHEN NEW."statusChangedAt" < OLD."statusChangedAt"
+    THEN RAISE(ABORT, 'ReturnRequest_transition: 상태 변경 시각이 이전보다 앞설 수 없습니다')
+  WHEN NEW."status" = 'INSPECTED' AND EXISTS (SELECT 1 FROM "ReturnItem" ri WHERE ri."returnRequestId" = NEW."id" AND ri."inspection" IS NULL)
+    THEN RAISE(ABORT, 'ReturnRequest_transition: 모든 반품 상품을 검수해야 합니다')
+  WHEN NEW."status" = 'COMPLETED' AND NEW."refundAmount" > 0
+      AND (SELECT c."status" FROM "PaymentCancel" c WHERE c."id" = NEW."paymentCancelId") IS NOT 'DONE'
+    THEN RAISE(ABORT, 'ReturnRequest_refund_guard: 환불(결제 취소)이 완료되어야 반품을 끝낼 수 있습니다')
+  WHEN OLD."status" = 'INSPECTED' AND NEW."status" = 'REJECTED'
+      AND EXISTS (SELECT 1 FROM "ReturnItem" ri WHERE ri."returnRequestId" = NEW."id" AND ri."inspection" <> 'NOT_RETURNABLE')
+    THEN RAISE(ABORT, 'ReturnRequest_transition: 검수를 통과한 상품이 있으면 거절할 수 없습니다 (환불로 완료)')
+END;
+END;`,
+  },
+  {
+    table: "ReturnRequest",
+    name: "ReturnRequest_fixed",
+    why: "반품번호·주문·사유·귀책·신청자·신청 시각 고정, 환불액·반품 배송비는 검수 끝날 때 한 번만 확정",
+    sql: `CREATE TRIGGER "ReturnRequest_fixed" BEFORE UPDATE ON "ReturnRequest"
+WHEN NEW."returnNo" IS NOT OLD."returnNo" OR NEW."orderId" IS NOT OLD."orderId" OR NEW."reason" IS NOT OLD."reason" OR NEW."fault" IS NOT OLD."fault"
+  OR NEW."requestedBy" IS NOT OLD."requestedBy" OR NEW."requestedAt" IS NOT OLD."requestedAt" OR NEW."createdAt" IS NOT OLD."createdAt"
+  OR (OLD."refundAmount" IS NOT NULL AND (NEW."refundAmount" IS NOT OLD."refundAmount" OR NEW."returnShippingFee" IS NOT OLD."returnShippingFee"))
+  OR (OLD."paymentCancelId" IS NOT NULL AND NEW."paymentCancelId" IS NOT OLD."paymentCancelId")
+BEGIN ${raise("ReturnRequest_fixed", "반품 기본 정보·확정된 환불액은 바꿀 수 없습니다")} END;`,
+  },
+  noDelete("ReturnRequest", "반품 기록은 삭제할 수 없습니다", "반품 기록 보관"),
+  {
+    table: "ReturnItem",
+    name: "ReturnItem_insert_guard",
+    why: "신청 중인 반품에, 같은 주문의 배송 완료 상품을, 반품 기간 안(고객 사유 7일·판매자 사유 30일), 줄 수량 전체로, 진행 중인 다른 반품이 없을 때",
+    sql: `CREATE TRIGGER "ReturnItem_insert_guard" BEFORE INSERT ON "ReturnItem"
+BEGIN
+SELECT CASE
+  WHEN (SELECT rr."status" FROM "ReturnRequest" rr WHERE rr."id" = NEW."returnRequestId") IS NOT 'REQUESTED'
+    THEN RAISE(ABORT, 'ReturnItem_insert_guard: 신청 중인 반품에만 상품을 담을 수 있습니다')
+  WHEN NOT EXISTS (SELECT 1 FROM "OrderItem" i JOIN "ReturnRequest" rr ON rr."orderId" = i."orderId" WHERE i."id" = NEW."orderItemId" AND rr."id" = NEW."returnRequestId")
+    THEN RAISE(ABORT, 'ReturnItem_insert_guard: 다른 주문의 상품입니다')
+  WHEN (SELECT i."status" FROM "OrderItem" i WHERE i."id" = NEW."orderItemId") IS NOT 'DELIVERED'
+    THEN RAISE(ABORT, 'ReturnItem_status_guard: 배송 완료된(구매확정 전) 상품만 반품할 수 있습니다')
+  WHEN NEW."qty" IS NOT (SELECT i."quantity" FROM "OrderItem" i WHERE i."id" = NEW."orderItemId")
+    THEN RAISE(ABORT, 'ReturnItem_insert_guard: 지금은 상품 줄 수량 전체만 반품할 수 있습니다')
+  WHEN (SELECT julianday(rr."requestedAt") - julianday(i."deliveredAt") FROM "ReturnRequest" rr, "OrderItem" i WHERE rr."id" = NEW."returnRequestId" AND i."id" = NEW."orderItemId")
+      > (SELECT CASE rr."fault" WHEN 'CUSTOMER' THEN ${RETURN_WINDOW_DAYS.CUSTOMER} ELSE ${RETURN_WINDOW_DAYS.SELLER} END FROM "ReturnRequest" rr WHERE rr."id" = NEW."returnRequestId")
+    THEN RAISE(ABORT, 'ReturnItem_window: 반품 신청 기간이 지났습니다 (단순 변심·사이즈 7일, 불량·오배송·파손 30일)')
+  WHEN EXISTS (SELECT 1 FROM "ReturnItem" x JOIN "ReturnRequest" rr ON rr."id" = x."returnRequestId" WHERE x."orderItemId" = NEW."orderItemId" AND rr."status" NOT IN ('REJECTED', 'CANCELED'))
+    THEN RAISE(ABORT, 'ReturnItem_duplicate: 이미 반품이 진행 중이거나 끝난 상품입니다')
+END;
+END;`,
+  },
+  {
+    table: "ReturnItem",
+    name: "ReturnItem_update_guard",
+    why: "반품 상품·수량 고정, 검수는 반품센터 도착 뒤 한 번만",
+    sql: `CREATE TRIGGER "ReturnItem_update_guard" BEFORE UPDATE ON "ReturnItem"
+BEGIN
+SELECT CASE
+  WHEN NEW."returnRequestId" IS NOT OLD."returnRequestId" OR NEW."orderItemId" IS NOT OLD."orderItemId" OR NEW."qty" IS NOT OLD."qty"
+    THEN RAISE(ABORT, 'ReturnItem_fixed: 반품 상품·수량은 바꿀 수 없습니다')
+  WHEN OLD."inspection" IS NOT NULL AND (NEW."inspection" IS NOT OLD."inspection" OR NEW."refundAmount" IS NOT OLD."refundAmount" OR NEW."inspectedAt" IS NOT OLD."inspectedAt")
+    THEN RAISE(ABORT, 'ReturnItem_fixed: 검수 결과는 바꿀 수 없습니다')
+  WHEN NEW."inspection" IS NOT NULL AND OLD."inspection" IS NULL AND (SELECT rr."status" FROM "ReturnRequest" rr WHERE rr."id" = NEW."returnRequestId") IS NOT 'RECEIVED'
+    THEN RAISE(ABORT, 'ReturnItem_inspect_guard: 반품센터에 도착한 반품만 검수할 수 있습니다')
+  WHEN NEW."inspection" IN ('RESELLABLE', 'DEFECTIVE') AND NEW."refundAmount" IS NOT (SELECT i."payAmount" FROM "OrderItem" i WHERE i."id" = NEW."orderItemId")
+    THEN RAISE(ABORT, 'ReturnItem_refund: 검수를 통과한 상품의 환불액은 그 상품의 실결제액입니다')
+END;
+END;`,
+  },
+  noDelete("ReturnItem", "반품 상품 기록은 삭제할 수 없습니다", "반품 기록 보관"),
+  {
+    table: "InventoryLedger",
+    name: "InventoryLedger_return_guard",
+    why: "반품 재고 이동은 실제 단계대로: 도착(반품센터 +)은 도착한 반품에 한 번, 검수 이동·반송은 검수 결과에 맞게, 수량은 반품 수량",
+    sql: `CREATE TRIGGER "InventoryLedger_return_guard" BEFORE INSERT ON "InventoryLedger"
+WHEN NEW."returnItemId" IS NOT NULL
+BEGIN
+SELECT CASE
+  WHEN abs(NEW."qty") IS NOT (SELECT ri."qty" FROM "ReturnItem" ri WHERE ri."id" = NEW."returnItemId")
+    THEN RAISE(ABORT, 'InventoryLedger_return_guard: 반품 수량과 다릅니다')
+  WHEN NEW."skuId" IS NOT (SELECT i."skuId" FROM "ReturnItem" ri JOIN "OrderItem" i ON i."id" = ri."orderItemId" WHERE ri."id" = NEW."returnItemId")
+    THEN RAISE(ABORT, 'InventoryLedger_return_guard: 반품 상품의 SKU와 다릅니다')
+  WHEN NEW."type" = 'RETURN_IN' AND (
+      (SELECT rr."status" FROM "ReturnItem" ri JOIN "ReturnRequest" rr ON rr."id" = ri."returnRequestId" WHERE ri."id" = NEW."returnItemId") IS NOT 'RECEIVED'
+      OR (SELECT loc."type" FROM "InventoryLocation" loc WHERE loc."id" = NEW."locationId") IS NOT 'RETURN_CENTER'
+      OR EXISTS (SELECT 1 FROM "InventoryLedger" l WHERE l."returnItemId" = NEW."returnItemId" AND l."type" = 'RETURN_IN'))
+    THEN RAISE(ABORT, 'InventoryLedger_return_guard: 반품 도착은 반품센터에, 도착한 반품마다 한 번만 기록합니다')
+  WHEN NEW."type" IN ('TRANSFER_OUT', 'TRANSFER_IN') AND COALESCE((SELECT ri."inspection" FROM "ReturnItem" ri WHERE ri."id" = NEW."returnItemId"), '') NOT IN ('RESELLABLE', 'DEFECTIVE')
+    THEN RAISE(ABORT, 'InventoryLedger_return_guard: 검수를 통과한(정상·불량) 반품만 이동합니다')
+  WHEN NEW."type" = 'TRANSFER_IN' AND (SELECT loc."type" FROM "InventoryLocation" loc WHERE loc."id" = NEW."locationId")
+      IS NOT (CASE (SELECT ri."inspection" FROM "ReturnItem" ri WHERE ri."id" = NEW."returnItemId") WHEN 'RESELLABLE' THEN 'WAREHOUSE' ELSE 'DEFECT' END)
+    THEN RAISE(ABORT, 'InventoryLedger_return_guard: 정상은 물류센터, 불량은 불량 창고로만 옮깁니다')
+  WHEN NEW."type" = 'RETURN_REJECT_OUT' AND (SELECT ri."inspection" FROM "ReturnItem" ri WHERE ri."id" = NEW."returnItemId") IS NOT 'NOT_RETURNABLE'
+    THEN RAISE(ABORT, 'InventoryLedger_return_guard: 반품 불가 판정 상품만 고객에게 반송합니다')
+  WHEN NEW."type" IN ('TRANSFER_OUT', 'RETURN_REJECT_OUT') AND (SELECT loc."type" FROM "InventoryLocation" loc WHERE loc."id" = NEW."locationId") IS NOT 'RETURN_CENTER'
+    THEN RAISE(ABORT, 'InventoryLedger_return_guard: 검수 뒤 이동·반송은 반품센터에서 나갑니다')
+END;
+END;`,
+  },
+];
+
 export const TRIGGERS: TriggerConstraint[] = [
   ...INVENTORY_TRIGGERS,
   ...CUSTOMER_TRIGGERS,
   ...PAYMENT_TRIGGERS,
   ...ORDER_TRIGGERS,
+  ...INV2_TRIGGERS,
   // ----- 판매 시작 검사 (⭐1)
   {
     table: "Style",

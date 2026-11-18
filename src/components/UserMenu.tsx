@@ -2,6 +2,8 @@ import Image from "next/image";
 import Link from "next/link";
 import { cookies } from "next/headers";
 import { auth, signOut } from "@/auth";
+import { getCurrentCustomer } from "@/lib/current-customer";
+import { unreadCount } from "@/lib/notification";
 import { BROWSER_COOKIE } from "@/lib/auth-session";
 
 // 헤더 오른쪽: 로그인했으면 프로필 + 로그아웃, 아니면 로그인 버튼
@@ -23,8 +25,16 @@ export default async function UserMenu() {
     );
   }
 
+  // 안 읽은 알림 수 (재입고·반품 진행)
+  const customer = await getCurrentCustomer();
+  const unread = customer ? await unreadCount(customer.id) : 0;
+
   return (
     <div className="flex items-center gap-3">
+      <Link href="/my/notifications" className="relative text-gray-700 hover:text-gray-900">
+        알림
+        {unread > 0 && <span className="absolute -right-3 -top-2 rounded-full bg-red-500 px-1.5 text-xs text-white">{unread > 99 ? "99+" : unread}</span>}
+      </Link>
       <Link href="/orders" className="text-gray-700 hover:text-gray-900">
         주문내역
       </Link>

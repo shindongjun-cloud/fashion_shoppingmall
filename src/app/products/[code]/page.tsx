@@ -18,6 +18,8 @@ import {
 import SizeSelector from "@/components/SizeSelector";
 import { getPrices } from "@/lib/pricing";
 import { getAvailability } from "@/lib/inventory";
+import { restockDates } from "@/lib/restock";
+import { getCurrentCustomer } from "@/lib/current-customer";
 
 export const dynamic = "force-dynamic";
 
@@ -45,7 +47,7 @@ export default async function ProductPage({
   searchParams,
 }: PageProps<"/products/[code]">) {
   const { code } = await params;
-  const { color: colorParam } = await searchParams;
+  const { color: colorParam, restock: restockParam } = await searchParams;
 
   const style = await prisma.style.findFirst({
     where: { styleCode: code, ...sellableStyleWhere() },
@@ -90,6 +92,16 @@ export default async function ProductPage({
   // 주소의 ?color=BE 와 맞는 컬러를 고르고, 없으면 대표 컬러(0번)
   const selected =
     style.colors.find((c) => c.color.code === colorParam) ?? style.colors[0];
+  // 품절 사이즈의 재입고 예정일 + 내 재입고 알림 신청 여부
+  const selectedSkuIds = selected.skus.map((k) => k.id);
+  const customer = await getCurrentCustomer();
+  const [restock, mySubs] = await Promise.all([
+    restockDates(selectedSkuIds),
+    customer ? prisma.restockSubscription.findMany({ where: { customerId: customer.id, skuId: { in: selectedSkuIds }, status: { in: ["WAITING", "SCHEDULED"] } }, select: { skuId: true } }) : [],
+  ]);
+  const subscribedIds = new Set(mySubs.map((x) => x.skuId));
+  const back = `/products/${style.styleCode}?color=${selected.color.code}`;
+  const restockNotice = restockParam === "ok" ? "재입고 알림을 신청했어요. 일정이 정해지거나 입고되면 알림함으로 알려 드려요." : restockParam === "instock" ? "지금 구매할 수 있는 상품이에요. 사이즈를 다시 골라 주세요." : undefined;
   const rate = price.discountRate;
 
   // 실측표: 데이터가 있는 항목만 열로, 사이즈는 정렬 순서대로 행으로
@@ -232,7 +244,12 @@ export default async function ProductPage({
               sizeLabel: sku.size.label,
               stock: available(sku.id),
               onSale: sku.status === "ON_SALE",
+              restockDate: restock.get(sku.id) ? formatDate(restock.get(sku.id)!) : null,
+              subscribed: subscribedIds.has(sku.id),
             }))}
+            back={back}
+            loggedIn={Boolean(customer)}
+            restockNotice={restockNotice}
           />
 
           {style.summary && <p className="mt-8 font-medium text-gray-900">{style.summary}</p>}

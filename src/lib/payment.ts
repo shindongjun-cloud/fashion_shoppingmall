@@ -16,6 +16,7 @@ import { prisma } from "@/lib/prisma";
 import { blindIndex, decrypt, encrypt, maskAccountNumber, maskName } from "@/lib/crypto";
 import { allocateOrder, ensureOrderReserved, ensureReservedTx, InsufficientStockError, isConstraintError, releaseAllocated, releaseOrder, withBusyRetry } from "@/lib/inventory";
 import { orderStatusData, ownerRef, ownsOrder, toOwner, type OwnerArg } from "@/lib/order-rules";
+import { markRestockPurchased } from "@/lib/restock";
 import { maskForLog, tossApi, type TossApi, type TossPayment, type TossResult } from "@/lib/toss";
 
 type Tx = Prisma.TransactionClient;
@@ -49,7 +50,12 @@ async function defaultFinalizeOrder(tx: Tx, order: Order, payment: Payment, now:
   await allocateOrder(tx, order.id, now); // 예약 → 할당 (출고 대기. 실재고는 출고할 때 감소)
   // 주문 결제 완료 → 트리거가 상품들도 결제 완료로 바꾸고 이력을 남김
   await tx.order.update({ where: { id: order.id }, data: { ...orderStatusData("PAID", now, "SYSTEM"), paidAt: payment.approvedAt ?? now } });
-  if (order.customerId !== null) await tx.customer.update({ where: { id: order.customerId }, data: { lastOrderAt: now } }); // 휴면·등급 산정 참고 (회원만)
+  if (order.customerId !== null) {
+    await tx.customer.update({ where: { id: order.customerId }, data: { lastOrderAt: now } }); // 휴면·등급 산정 참고 (회원만)
+    // 재입고 안내를 받고 산 경우 "구매함"으로 (알림 효과 확인)
+    const skuIds = (await tx.orderItem.findMany({ where: { orderId: order.id }, select: { skuId: true } })).map((i) => i.skuId);
+    await markRestockPurchased(tx, order.customerId, skuIds, now);
+  }
 }
 
 export const defaultPaymentDeps: PaymentDeps = {
@@ -260,7 +266,7 @@ export async function applyTossPayment(tx: Tx, paymentId: number, tp: TossPaymen
   return tx.payment.findUniqueOrThrow({ where: { id: p.id } });
 }
 
-function refundAccountData(paymentId: number, a: { bankCode: string; accountNumber: string; holderName: string }) {
+export function refundAccountData(paymentId: number, a: { bankCode: string; accountNumber: string; holderName: string }) {
   return {
     paymentId,
     bankCode: a.bankCode,

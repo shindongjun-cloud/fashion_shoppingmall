@@ -273,6 +273,10 @@ export async function recordMovement(
     memo?: string;
     createdBy?: string;
     occurredAt?: Date;
+    /** 입고 전표 줄 (입고면) */
+    inboundLineId?: number;
+    /** 반품 상품 (반품 도착·검수 이동·반송이면) */
+    returnItemId?: number;
   },
 ) {
   const balance = await ensureBalance(tx, input.skuId, input.locationId);
@@ -289,6 +293,8 @@ export async function recordMovement(
       memo: input.memo,
       createdBy: input.createdBy ?? "SYSTEM",
       occurredAt: input.occurredAt ?? new Date(),
+      inboundLineId: input.inboundLineId ?? null,
+      returnItemId: input.returnItemId ?? null,
     },
   });
 }

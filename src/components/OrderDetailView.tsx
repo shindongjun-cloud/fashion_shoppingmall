@@ -6,7 +6,7 @@ import { decryptOrNull, maskName, maskPhone } from "@/lib/crypto";
 import { listAddresses } from "@/lib/customer";
 import { formatDate, formatDateTime, formatPrice } from "@/lib/format";
 import { findZone, ORDER_NO_PATTERN, ownsOrder, type OrderOwner } from "@/lib/order-rules";
-import { CUSTOMER_CANCEL_NOTICE, formatTrackingNo, FULFILLMENT_LABEL, ITEM_STATUS_LABEL, REGION_LABEL, trackingUrl } from "@/lib/order-labels";
+import { CUSTOMER_CANCEL_NOTICE, formatTrackingNo, FULFILLMENT_LABEL, ITEM_STATUS_LABEL, REGION_LABEL, RETURN_INSPECTION_LABEL, RETURN_REASON_LABEL, RETURN_STATUS_LABEL, trackingUrl } from "@/lib/order-labels";
 import { BANK_OPTIONS, ORDER_STATUS_LABEL } from "@/lib/payment-labels";
 import { mainPayment, paymentInclude, toPaymentView } from "@/lib/payment-view";
 import { loginPath } from "@/lib/safe-redirect";
@@ -14,7 +14,7 @@ import OrderAmounts from "@/components/OrderAmounts";
 import PaymentSummary from "@/components/PaymentSummary";
 
 type FormAction = (form: FormData) => Promise<void>;
-export type OrderDetailActions = { cancel: FormAction; confirm: FormAction; changeAddress: FormAction; changeAddressDirect: FormAction };
+export type OrderDetailActions = { cancel: FormAction; confirm: FormAction; changeAddress: FormAction; changeAddressDirect: FormAction; requestReturn: FormAction; cancelReturn: FormAction };
 
 // 주문 상세 (회원 /orders/[주문번호], 비회원 /guest/orders/[주문번호] 공통)
 // 상품별 상태·배송조회·구매확정, 금액 구성, 결제 정보, 배송지(준비 전까지 변경), 취소(준비 전까지)
@@ -40,7 +40,9 @@ export default async function OrderDetailView({
       items: { orderBy: { lineNo: "asc" }, include: { shipmentItems: { include: { shipment: { include: { courier: true } } } } } },
       payments: { include: paymentInclude },
       shippingAddress: true,
+      shippingPolicy: true,
       statusHistory: { orderBy: { id: "asc" } },
+      returns: { orderBy: { id: "desc" }, include: { items: { include: { orderItem: true } }, pickupCourier: true } },
     },
   });
   if (!order || !ownsOrder(owner, order)) notFound();
@@ -62,8 +64,12 @@ export default async function OrderDetailView({
           })),
         )
       : [];
+  // 반품할 수 있는 상품 (배송 완료, 구매확정 전, 기간은 서버가 사유별로 다시 확인)
+  const returnable = order.status === "PAID" ? order.items.filter((i) => i.status === "DELIVERED") : [];
   const statusText =
-    order.status === "PAID" ? FULFILLMENT_LABEL[order.fulfillmentStatus] : order.status === "PENDING" ? "결제 확인 중" : (ORDER_STATUS_LABEL[order.status] ?? order.status);
+    order.fulfillmentStatus === "RETURNED"
+      ? FULFILLMENT_LABEL.RETURNED
+      : order.status === "PAID" ? FULFILLMENT_LABEL[order.fulfillmentStatus] : order.status === "PENDING" ? "결제 확인 중" : (ORDER_STATUS_LABEL[order.status] ?? order.status);
   const noticeText = typeof notice === "string" ? CUSTOMER_CANCEL_NOTICE[notice] : undefined;
   // 서버 액션이 남긴 오류 문구 (주소가 아니라 쿠키로 받음 — 가짜 문구 링크 방지)
   const flash = (await cookies()).get("order-flash")?.value ?? "";
@@ -253,6 +259,101 @@ export default async function OrderDetailView({
         order.items.some((i) => i.status === "PREPARING") && (
           <p className="mt-6 text-sm text-gray-500">상품 준비가 시작되어 직접 취소할 수 없어요. 취소를 원하시면 고객센터로 문의해 주세요.</p>
         )
+      )}
+
+      {/* 반품 진행 */}
+      {order.returns.length > 0 && (
+        <section className={box}>
+          <h2 className="font-bold text-gray-900">반품</h2>
+          <ul className="mt-2 space-y-3 text-sm">
+            {order.returns.map((r) => (
+              <li key={r.id} className="rounded-lg bg-gray-50 p-3">
+                <div className="flex flex-wrap justify-between gap-2">
+                  <span className="font-medium text-gray-900">
+                    {r.returnNo} · {RETURN_REASON_LABEL[r.reason]}
+                  </span>
+                  <span className="text-blue-700">{RETURN_STATUS_LABEL[r.status]}</span>
+                </div>
+                <p className="mt-1 text-gray-600">{r.items.map((i) => `${i.orderItem.styleName} (${i.orderItem.colorName}/${i.orderItem.sizeName})${i.inspection ? ` — 검수 ${RETURN_INSPECTION_LABEL[i.inspection]}` : ""}`).join(", ")}</p>
+                {r.pickupCourier && r.pickupTrackingNo && (
+                  <p className="mt-1 text-gray-600">
+                    회수 {r.pickupCourier.name} {formatTrackingNo(r.pickupTrackingNo)}{" "}
+                    <a href={trackingUrl(r.pickupCourier.trackingUrlTemplate, r.pickupTrackingNo)} target="_blank" rel="noopener noreferrer" className="underline">
+                      조회
+                    </a>
+                  </p>
+                )}
+                {r.refundAmount !== null && (
+                  <p className="mt-1 text-gray-800">
+                    환불 {formatPrice(r.refundAmount)}
+                    {r.returnShippingFee > 0 && <span className="text-gray-500"> (반품 배송비 {formatPrice(r.returnShippingFee)} 차감)</span>}
+                  </p>
+                )}
+                {r.memo && r.status === "REJECTED" && <p className="mt-1 text-red-600">{r.memo}</p>}
+                {(r.status === "REQUESTED" || r.status === "APPROVED") && (
+                  <form action={actions.cancelReturn} className="mt-2">
+                    <input type="hidden" name="orderNo" value={order.orderNo} />
+                    <input type="hidden" name="mode" value={guest ? "guest" : "member"} />
+                    <input type="hidden" name="returnNo" value={r.returnNo} />
+                    <button className="text-xs text-gray-600 underline">반품 철회</button>
+                  </form>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {/* 반품 신청 (배송 완료 상품) */}
+      {returnable.length > 0 && (
+        <section className={box}>
+          <details>
+            <summary className="cursor-pointer font-bold text-gray-900">반품 신청</summary>
+            <form action={actions.requestReturn} className="mt-3 space-y-2 text-sm">
+              <input type="hidden" name="orderNo" value={order.orderNo} />
+              <input type="hidden" name="mode" value={guest ? "guest" : "member"} />
+              {returnable.map((i) => (
+                <label key={i.id} className="flex items-center gap-2 text-gray-800">
+                  <input type="checkbox" name="orderItemId" value={i.id} defaultChecked={returnable.length === 1} className="accent-gray-900" />
+                  {i.styleName} ({i.colorName}/{i.sizeName}) × {i.quantity} · {formatPrice(i.payAmount)}
+                </label>
+              ))}
+              <select name="reason" required defaultValue="" className="w-full rounded-lg border border-gray-300 px-2 py-2">
+                <option value="" disabled>
+                  반품 사유
+                </option>
+                {Object.entries(RETURN_REASON_LABEL).map(([v, label]) => (
+                  <option key={v} value={v}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+              <textarea name="reasonText" maxLength={500} placeholder="자세한 내용 (선택)" className="w-full rounded-lg border border-gray-300 px-2 py-2" />
+              {payment?.method === "VIRTUAL_ACCOUNT" && (
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <select name="bankCode" required className="rounded-lg border border-gray-300 px-2 py-2" defaultValue="">
+                    <option value="" disabled>
+                      환불 은행
+                    </option>
+                    {BANK_OPTIONS.map((b) => (
+                      <option key={b.code} value={b.code}>
+                        {b.name}
+                      </option>
+                    ))}
+                  </select>
+                  <input name="accountNumber" required inputMode="numeric" placeholder="계좌번호 (숫자만)" className="rounded-lg border border-gray-300 px-2 py-2" />
+                  <input name="holderName" required placeholder="예금주" maxLength={30} className="rounded-lg border border-gray-300 px-2 py-2" />
+                </div>
+              )}
+              <ul className="list-disc pl-5 text-xs text-gray-500">
+                <li>단순 변심·사이즈: 배송 완료 후 7일 안, 반품 배송비(편도 {formatPrice(order.shippingPolicy.baseFee)}{order.shippingExtraFee > 0 ? ` + 제주·도서산간 ${formatPrice(order.shippingExtraFee)}` : ""})를 빼고 환불해요. 무료배송으로 받았는데 반품 뒤 남은 금액이 무료 기준보다 적어지면 처음 배송비도 빼요.</li>
+                <li>불량·오배송·파손: 배송 완료 후 30일 안, 반품 배송비 없음 (전부 반품하면 처음 배송비도 환불).</li>
+                <li>환불은 반품 상품이 도착해 검수를 마친 뒤 결제 수단으로 해요. 사용 흔적·훼손이 있으면 반품이 안 될 수 있어요.</li>
+              </ul>
+              <button className="w-full rounded-lg border border-gray-900 py-2 font-medium text-gray-900 hover:bg-gray-50">반품 신청</button>
+            </form>
+          </details>
+        </section>
       )}
 
       {/* 진행 기록 */}

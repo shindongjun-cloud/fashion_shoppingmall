@@ -380,6 +380,9 @@ export async function requestWithdrawal(
   // 결제했지만 아직 구매확정 전인 상품(결제 완료~배송 완료)이 있으면 탈퇴 불가: 배송·반품·환불이 남아 있음
   const inDelivery = await prisma.orderItem.findFirst({ where: { order: { customerId }, status: { in: ["PAID", "PREPARING", "SHIPPED", "DELIVERED"] } } });
   if (inDelivery) throw new CustomerError("배송 준비·배송 중이거나 구매확정 전인 주문이 있어요. 구매확정(또는 취소)한 뒤 탈퇴해 주세요.");
+  // 반품이 진행 중이거나 반품 환불이 끝나지 않았으면 탈퇴 불가 (회수·검수·환불이 남아 있음)
+  const openReturn = await prisma.returnRequest.findFirst({ where: { order: { customerId }, status: { in: ["REQUESTED", "APPROVED", "COLLECTING", "RECEIVED", "INSPECTED"] } } });
+  if (openReturn) throw new CustomerError("진행 중인 반품(회수·검수·환불)이 있어요. 반품이 끝난 뒤 탈퇴해 주세요.");
   // (더 구체적인 안내를 먼저: 입금 대기 주문도 재고를 잡고 있어서 아래 검사에 함께 걸림)
   const pending = await prisma.inventoryReservation.findFirst({ where: { order: { customerId }, status: "RESERVED" } });
   if (pending) throw new CustomerError("결제 대기 중인 주문이 있어요. 주문을 마치거나 취소한 뒤 탈퇴해 주세요.");

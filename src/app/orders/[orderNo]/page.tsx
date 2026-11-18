@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 import { getCurrentCustomer } from "@/lib/current-customer";
 import { loginPath } from "@/lib/safe-redirect";
 import OrderDetailView from "@/components/OrderDetailView";
-import { cancelOrderAction, changeAddressAction, changeAddressDirectAction, confirmPurchaseAction } from "../actions";
+import { cancelOrderAction, changeAddressAction, changeAddressDirectAction, confirmPurchaseAction, requestReturnAction, cancelReturnAction } from "../actions";
 
 export const dynamic = "force-dynamic";
 
@@ -18,7 +18,7 @@ export default async function OrderDetailPage({ params, searchParams }: PageProp
       orderNo={orderNo}
       notice={notice}
       flashId={e}
-      actions={{ cancel: cancelOrderAction, confirm: confirmPurchaseAction, changeAddress: changeAddressAction, changeAddressDirect: changeAddressDirectAction }}
+      actions={{ cancel: cancelOrderAction, confirm: confirmPurchaseAction, changeAddress: changeAddressAction, changeAddressDirect: changeAddressDirectAction, requestReturn: requestReturnAction, cancelReturn: cancelReturnAction }}
     />
   );
 }
