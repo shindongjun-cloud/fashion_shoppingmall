@@ -9,16 +9,16 @@
 
 표시: 키 칸에는 실제 제약(PK/FK/UK)만 적습니다.
 
-시스템 칸 설명(모든 테이블 공통):
+시스템 칸: **모든 테이블에 4개를 다 넣습니다**(사용자 결정, 기록 테이블도 예외 없음).
 
-| 시스템 칸 | 설명 |
-|---|---|
-| 생성일시 | 행을 만든 때 |
-| 생성자ID | 만든 회원·관리자·시스템의 ID |
-| 수정일시 | 마지막으로 고친 때 |
-| 수정자ID | 마지막으로 고친 사람의 ID |
+| 물리명 | 논리명 | 설명 |
+|---|---|---|
+| createdAt (CREATED_AT) | 생성일시 | 데이터가 처음 생성된 시간 |
+| createdBy (CREATED_BY) | 생성자 | 데이터를 생성한 사용자 |
+| updatedAt (UPDATED_AT) | 수정일시 | 마지막으로 수정된 시간 |
+| updatedBy (UPDATED_BY) | 수정자 | 마지막으로 수정한 사용자 |
 
-회원·관리자가 섞이므로 시스템 칸에는 FK가 없습니다.
+생성자·수정자는 회원·관리자·시스템이 섞이므로 FK가 없습니다.
 
 ---
 
@@ -103,10 +103,10 @@
 | | 고객 상태 | status | 정상 또는 개인정보 파기입니다. |
 | | 개인정보 파기 예정 일시 | piiPurgeScheduledAt | 매일 도는 작업이 이 시각이 지나면 개인정보를 지웁니다. |
 | | 개인정보 파기 일시 | piiPurgedAt | 실제로 지운 때입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 2. 회원 (Member)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -136,10 +136,10 @@
 | | 마지막 주문 일시 | lastOrderAt | 휴면 판단과 분석에 씁니다. |
 | | 휴면 예정 안내 일시 | dormantNoticeSentAt | 법적 의무인지 검증이 필요합니다(휴면 주제). |
 | | 휴면 전환 일시 | dormantAt | 휴면 주제에서 확정합니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 탈퇴 관련 칸 4개(요청 일시, 사유, 완료 일시, 재가입 제한 종료 일시)는 23번 회원 탈퇴 관리 테이블로 옮겼습니다.
 
@@ -164,10 +164,10 @@
 | | 회원 연결 일시 | linkedAt | 가져간 때입니다. |
 | | 회원 연결 방법 | linkMethod | 주문번호+비밀번호 또는 같은 브라우저입니다. |
 | | 비회원 상태 | status | 조회 가능, 잠금, 회원 연결, 파기 중 하나입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 ### 로그인·인증
 
@@ -194,10 +194,10 @@
 | FK | 잠금 해제 인증ID | unlockVerificationId | 어떤 인증으로 풀었는지 나타냅니다(7번 고객 인증 기록). |
 | | 소셜 연결 해제 일시 | disconnectedAt | 소셜 연결을 끊은 때입니다. |
 | | 로그인 수단 상태 | status | 사용, 잠금, 연결 해제 중 하나입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 5. 아이디 이력 (LoginIdHistory)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -214,10 +214,10 @@
 | | 변경 접속 IP | ipMasked | 계정 도용 확인에 씁니다. |
 | | 아이디 재사용 가능 일시 | reusableAt | 변경 전 아이디를 다시 쓸 수 있는 때(6개월 뒤)입니다. |
 | | 아이디 보류 조기 해제 일시 | releasedAt | 관리자가 보류를 일찍 푼 때입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 아이디 변경은 30일에 1번, 1년에 4번까지입니다. 이 테이블에서 변경 건수를 세서 확인합니다.
 
@@ -232,8 +232,10 @@
 | | 접속 IP 검색값 | ipHash | 같은 IP의 반복 시도를 셉니다. |
 | | 접속 IP | ipMasked | 일부를 가려서 저장합니다. |
 | | 조회 시도 일시 | attemptedAt | 시도한 때입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 7. 고객 인증 기록 (CustomerVerification)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -251,10 +253,10 @@
 | | 인증 완료 일시 | verifiedAt | 성공한 때입니다. |
 | | 인증 상태 | status | 요청, 성공, 실패, 만료 중 하나입니다. |
 | | 인증 접속 IP | ipMasked | 일부를 가려서 저장합니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 8. 회원 로그인 시도 기록 (MemberLoginAttempt): 기록 테이블
 | 키 | 논리명 | 물리명 | 설명 |
@@ -269,8 +271,10 @@
 | | 접속 IP | ipMasked | 일부를 가려서 저장합니다. |
 | | 접속 기기 정보 | userAgent | 새 기기 로그인 알림과 도용 확인에 씁니다. |
 | | 로그인 시도 일시 | attemptedAt | 시도한 때입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 ### 주소·사업자·보호자
 
@@ -291,10 +295,10 @@
 | | 공동현관 출입 방법 | entranceInfo | 암호화해서 저장합니다. |
 | | 배송지 마지막 사용 일시 | lastUsedAt | 최근 쓴 주소를 위에 보여 줍니다. |
 | | 배송지 상태 | status | 사용 또는 삭제입니다. 삭제하면 화면에서 숨깁니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 10. 사업자 (Business)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -313,10 +317,10 @@
 | | 사업자 확인 상태 | status | 확인 대기, 확인 완료, 확인 실패, 휴·폐업 중 하나입니다. |
 | | 사업자 진위확인 일시 | businessVerifiedAt | 국세청 확인을 마친 때입니다. |
 | | 휴·폐업 마지막 조회 일시 | closureCheckedAt | 주기적으로 다시 조회한 때입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 11. 사업장 주소 (BusinessAddress)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -332,10 +336,10 @@
 | | 사업장 기본 주소 | address1 | 도로명 주소입니다. |
 | | 사업장 상세 주소 | address2 | 나머지 주소입니다. |
 | | 사업장 주소 상태 | status | 사용 또는 삭제입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 12. 사업자 소속 회원 (BusinessMember)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -350,10 +354,10 @@
 | | 소속 거절 사유 | rejectReason | 회사 관리 담당이 거절한 이유입니다. |
 | | 소속 해제 일시 | removedAt | 퇴사 등으로 해제된 때입니다. |
 | | 소속 해제 사유 | removeReason | 퇴사, 회사 관리 담당이 해제, 탈퇴 중 하나입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 13. 사업자 대표자 (BusinessRepresentative)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -365,10 +369,10 @@
 | | 주 대표자 여부 | isPrimary | 회사마다 1명입니다. |
 | | 대표자 상태 | status | 재직 또는 퇴임입니다. |
 | | 대표자 퇴임 일시 | endedAt | 퇴임한 때입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 14. 법정대리인 가입 동의 (MemberGuardianConsent)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -388,10 +392,10 @@
 | | 법정대리인 동의 상태 | status | 유효, 종료, 철회 중 하나입니다. |
 | | 법정대리인 동의 종료 일시 | endedAt | 동의가 끝난 때입니다. |
 | | 법정대리인 동의 종료 사유 | endReason | 만 14세 도달(본인 동의를 다시 받음), 보호자 철회, 탈퇴 중 하나입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 ### 약관·환불·이력
 
@@ -411,10 +415,10 @@
 | | 약관 시행 일시 | effectiveAt | 효력이 생기는 때입니다. |
 | | 재동의 필요 여부 | isReconsentRequired | 기존 회원에게 다시 동의를 받아야 하는지입니다. |
 | | 약관 변경 요약 | changeSummary | 이전 버전과 무엇이 달라졌는지입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 16. 고객 약관 동의 이력 (CustomerConsent): 기록 테이블
 | 키 | 논리명 | 물리명 | 설명 |
@@ -428,8 +432,10 @@
 | | 동의 경로 | consentSource | 가입, 주문, 마이페이지, 재동의 안내 중 하나입니다. |
 | | 동의 접속 IP | ipMasked | 일부를 가려서 저장합니다. |
 | | 동의·철회 일시 | consentedAt | 동의하거나 철회한 때입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 미성년자 구매 때 받는 보호자 결제 동의는 이 테이블이 아니라 17번에 기록합니다. 동의하는 사람(보호자)과 단위(주문)가 다르고, 승인·거절·만료 절차가 있기 때문입니다.
 
@@ -454,10 +460,10 @@
 | | 보호자 성인 여부 | isGuardianAdult | 동의한 사람이 실제 성인인지 확인한 결과입니다. |
 | | 보호자 승인 금액 | approvedAmount | 보호자가 허락한 금액입니다. |
 | | 보호자 접속 IP | guardianIpMasked | 일부를 가려서 저장합니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 18. 고객 환불계좌 (CustomerRefundAccount)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -472,10 +478,10 @@
 | | 환불계좌 등록 경로 | registerSource | 가입, 마이페이지, 환불 요청 중 하나입니다. |
 | | 환불계좌 마지막 사용 일시 | lastUsedAt | 마지막으로 환불받은 때입니다. |
 | | 환불계좌 상태 | status | 사용, 확인 실패, 삭제 중 하나입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 19. 고객 정보 변경 이력 (CustomerChangeHistory): 기록 테이블
 | 키 | 논리명 | 물리명 | 설명 |
@@ -491,8 +497,10 @@
 | | 변경 경로 | changeChannel | 웹, 앱, 고객센터 중 하나입니다. |
 | | 정보 변경 일시 | changedAt | 바뀐 때입니다. |
 | | 변경 접속 IP | ipMasked | 일부를 가려서 저장합니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 ### 등급 (확정)
 
@@ -513,10 +521,10 @@
 | | 등급 정책 공지 일시 | announcedAt | 정책 변경을 회원에게 알린 때입니다. |
 | | 등급 정책 시행 일시 | effectiveAt | 적용이 시작되는 때입니다. |
 | | 등급 정책 변경 요약 | changeSummary | 이전 버전과 무엇이 달라졌는지입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 21. 등급 기준 (Grade)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -531,10 +539,10 @@
 | | 가입 기본 등급 여부 | isDefault | 본인인증한 신규 회원이 처음 받는 등급입니다(브론즈). |
 | | 등급 안내 문구 | gradeDescription | 마이페이지에 보여 줍니다. |
 | | 등급 아이콘 경로 | gradeIconUrl | 등급 배지 이미지입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 22. 등급 혜택 (GradeBenefit)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -549,10 +557,10 @@
 | | 혜택 안내 문구 | benefitDescription | 등급 안내 화면에 보여 줍니다. |
 | | 혜택 표시 순서 | displayOrder | 혜택을 보여 주는 순서입니다. |
 | | 등급 혜택 상태 | status | 사용 또는 중지입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 23. 회원 탈퇴 관리 (MemberWithdrawal)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -577,10 +585,10 @@
 | | 재가입 제한 검색값 파기 일시 | rejoinHashPurgedAt | 제한 기간이 끝나 해시를 지운 때입니다. |
 | | 처리자 구분 | processedByType | 회원 본인, 관리자(강제 탈퇴), 시스템(자동 완료) 중 하나입니다. |
 | | 처리자ID | processedById | 구분에 따라 회원ID 또는 관리자ID라서 FK가 없습니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 24. 관리자 지정 등급 (MemberGradeOverride)
 | 키 | 논리명 | 물리명 | 설명 |
@@ -593,10 +601,10 @@
 | | 등급 보장 종료 일시 | endAt | 보장이 끝나는 때입니다. |
 | | 관리자 지정 등급 상태 | status | 예정, 적용 중, 종료, 취소 중 하나입니다. |
 | | 등급 지정 취소 사유 | cancelReason | 기간 전에 취소한 이유입니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 지정한 관리자입니다. |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 25. 등급 산정 기록 (GradeEvaluation): 계산 근거
 | 키 | 논리명 | 물리명 | 설명 |
@@ -618,10 +626,10 @@
 | | 등급 적용 상태 | status | 적용 대기, 적용 완료, 적용 제외(유지이거나 보장 등급), 적용 실패 중 하나입니다. |
 | | 등급 적용 일시 | appliedAt | 회원 등급에 실제로 반영한 때입니다. |
 | | 적용 제외·실패 사유 | statusReason | 예: "관리자 보장 등급 VIP", "작업 중단". |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 #### 26. 회원 등급 변경 이력 (MemberGradeHistory): 실제 변화
 | 키 | 논리명 | 물리명 | 설명 |
@@ -638,10 +646,10 @@
 | | 등급 혜택 지급 상태 | status | 지급 대상 아님(강등 등), 지급 대기, 지급 완료, 지급 실패 중 하나입니다. |
 | | 등급 혜택 지급 일시 | benefitIssuedAt | 쿠폰을 실제로 준 때입니다. |
 | | 혜택 지급 실패 사유 | statusReason | 예: "쿠폰 정책 중지". 실패한 것은 다시 지급합니다. |
-| | 생성일시 | createdAt | 공통 |
-| | 생성자ID | createdById | 공통 |
-| | 수정일시 | updatedAt | 공통 |
-| | 수정자ID | updatedById | 공통 |
+| | 생성일시 | createdAt | 데이터가 처음 생성된 시간 |
+| | 생성자 | createdBy | 데이터를 생성한 사용자 |
+| | 수정일시 | updatedAt | 마지막으로 수정된 시간 |
+| | 수정자 | updatedBy | 마지막으로 수정한 사용자 |
 
 ---
 
