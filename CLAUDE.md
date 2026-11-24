@@ -33,7 +33,7 @@ Roadmap: 0 setup ✅ → 1 product list/detail ✅ → 2 cart ✅ → 3 DB (Pris
 | 문서 | 주문 도메인 피드백·답변 (보관) | `docs/order-feedback-2026-11-19.md` | 9d69050 |
 | 재설계 | 고객 v1 정의서(B안, 참고용 보관) | `docs/redesign/01-customer.md` | f16bf1c |
 | 재설계 | 고객 사용자 직접 진행 초안(26개 테이블) + 피드백 전 ERD | `docs/redesign/01-customer-draft-2026-11-23.md`, `docs/redesign/01-customer-erd.drawio` | ee8fac0, 6b754bf |
-| 재설계 | 1차 시도 보관: 고객 26 + 상품 26(가격·원가 설계, 답하지 못한 질문 목록 포함) | `docs/redesign/README.md`, `docs/redesign/02-product-draft-2026-11-24.md` | 이 절과 같은 커밋 |
+| 재설계 | 1차 시도 보관: 고객 26 + 상품 40(26개 첫 초안 + 40개 보강안 최종판) | `docs/redesign/README.md`, `docs/redesign/02-product-draft-2026-11-24.md`, `docs/redesign/02-product-v2-2026-11-24.md`, `docs/redesign/02-product-feedback2-answer-2026-11-24.md`, `docs/redesign/customer-product-tables-2026-11-24.pdf` | 65a0d62 + 정정 커밋 |
 | 재시작 | 선생님 9단계 방식으로 처음부터 다시 설계 시작 | `docs/design/README.md`, `docs/design/01-customer/01-design-methods.md` | 이 절과 같은 커밋 |
 
 현재 규모: 테이블 82 · 컬럼 889 · FK 124 · CHECK 315 · 트리거 217 · 자동 테스트 437개.
@@ -44,7 +44,7 @@ Roadmap: 0 setup ✅ → 1 product list/detail ✅ → 2 cart ✅ → 3 DB (Pris
 
 1. 먼저 `docs/design/README.md`(9단계, 진행 표, 기록 목록)를 읽습니다.
 2. 지금은 **고객 2단계** 중입니다. 첫 질문 "고객 테이블 설계하는 방법 모두"(처음부터 설계하는 경우)는 답해서 `docs/design/01-customer/01-design-methods.md`에 저장했습니다. 다음은 사용자가 "○번째 방법 자세히", "○번과 ○번 차이"를 묻거나 결정 지점 A부터 하나씩 정합니다.
-3. 재설계 1차 시도(고객 26·상품 26 테이블)는 `docs/redesign/`에 보관했습니다(`README.md`에 목록과 결정 지점 요약). 지우거나 고치지 않고 참고만 합니다. 상품 초안의 "답하지 못한 사용자 질문" 11개는 상품 도메인을 새로 설계할 때 다룹니다.
+3. 재설계 1차 시도(고객 26·상품 40 테이블)는 `docs/redesign/`에 보관했습니다(`README.md`에 목록과 결정 지점 요약). 지우거나 고치지 않고 참고만 합니다. 상품 최종판은 40개 정의서 `02-product-v2-2026-11-24.md`이고, 피드백 2차 답변 원문과 남은 것(14절)은 `02-product-feedback2-answer-2026-11-24.md`에 있습니다.
 4. 각 도메인 2단계 답변과 결정은 `docs/design/<번호>-<도메인>/`에 파일로 남기고, 진행 표를 갱신합니다.
 
 ### 재설계 진행 방식 (사용자가 정함, 항상 지킬 것)
